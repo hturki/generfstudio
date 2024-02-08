@@ -1,0 +1,1 @@
+FG_MASK = 'fg_mask'

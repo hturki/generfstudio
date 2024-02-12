@@ -187,10 +187,12 @@ class NerfactoSDSModel(Model):
         c2w = self.train_image_cameras[-1].camera_to_worlds
         cam_dist = c2w[:, 3].norm()
         elevation_rad = torch.arcsin((c2w[2, 3] / cam_dist))
-        azimuth_rad = torch.arcsin((c2w[1, 3] / (cam_dist * torch.cos(elevation_rad))))
+        azimuth_rad = torch.arctan2(c2w[1, 3], c2w[0, 3])
+        # azimuth_rad = torch.arcsin((c2w[1, 3] / (cam_dist * torch.cos(elevation_rad))))
         azimuth_rad_2 = torch.arccos((c2w[0, 3] / (cam_dist * torch.cos(elevation_rad))))
         elevation_deg = torch.rad2deg(elevation_rad)
         azimuth_deg = torch.rad2deg(azimuth_rad)
+
         CONSOLE.log(
             f"Cond image elevation {elevation_deg} azimuth {azimuth_deg} azimuth check {torch.rad2deg(azimuth_rad_2)}")
         self._diffusion_model.prepare_embeddings(self.train_image_filenames[-1], elevation_deg.item(),
@@ -524,14 +526,17 @@ class NerfactoSDSModel(Model):
             c2w = random_cameras.camera_to_worlds
             cam_dist = c2w[:, :, 3].norm(dim=-1)
             elevation_rad = torch.arcsin((c2w[:, 2, 3] / cam_dist))
-            azimuth_rad = torch.arcsin((c2w[:, 1, 3] / (cam_dist * torch.cos(elevation_rad))))
+            azimuth_rad = torch.arctan2(c2w[:, 1, 3], c2w[:, 0, 3])
+
+            # azimuth_rad = torch.arcsin((c2w[:, 1, 3] / (cam_dist * torch.cos(elevation_rad))))
 
             loss_dict["sds_loss"] = self.config.sds_loss_mult * self._diffusion_model(rgb, torch.rad2deg(elevation_rad),
                                                                                       torch.rad2deg(azimuth_rad))
             opacity = sds_outputs["accumulation"]
             rev_opacity = 1 - opacity
-            loss_dict["opacity_loss"] = -(
-                        opacity * torch.log(opacity + 1e-8) + rev_opacity * torch.log(rev_opacity + 1e-8)).mean()
+            loss_dict["opacity_loss"] = self.config.opacity_loss_mult * -(
+                    opacity * torch.log(opacity + 1e-5) + rev_opacity * torch.log(rev_opacity + 1e-5)).mean()
+
             if FG_MASK in batch:
                 loss_dict["fg_mask_loss"] = self.config.mask_loss_mult * F.mse_loss(outputs["accumulation"],
                                                                                     batch[FG_MASK].to(

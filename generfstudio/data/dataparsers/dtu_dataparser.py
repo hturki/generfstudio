@@ -2,26 +2,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type
+from typing import Type, Optional
 
+import cv2
+import numpy as np
 import torch
-
+from PIL import Image
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
-from nerfstudio.utils.io import load_from_json
+from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
 
+# OpenCV to OpenGL
+COORD_TRANS_WORLD = np.array(
+    [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]],
+)
+
+COORD_TRANS_CAM = np.array(
+    [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]],
+)
 
 @dataclass
 class DTUDataParserConfig(DataParserConfig):
-    """Scene dataset parser config"""
+    """Scene dataset parser config. Assumes Pixel-NeRF format"""
 
     _target: Type = field(default_factory=lambda: DTU)
     """target class to instantiate"""
     data: Path = Path("data/DTU")
     """Directory specifying location of data."""
-    """sub sampling validation images"""
+
+    scene_id: Optional[str] = "scan65"
+
+    train_split_fraction: float = 0.9
+    """The percentage of the dataset to use for training. Only used when using a single scene."""
+
     auto_orient: bool = True
 
 
@@ -33,98 +48,104 @@ class DTU(DataParser):
 
     def _generate_dataparser_outputs(self, split="train"):
 
-        # load meta data
-        meta = load_from_json(self.config.data / "meta_data.json")
-
-        indices = list(range(len(meta["frames"])))
-        # subsample to avoid out-of-memory for validation set
-        if split != "train" and self.config.skip_every_for_val_split >= 1:
-            indices = indices[:: self.config.skip_every_for_val_split]
+        if self.config.scene_id is not None:
+            scenes = [self.config.scene_id]
+        else:
+            with (self.config.data / f"new_{split}.lst").open() as f:
+                scenes = [line.strip() for line in f]
 
         image_filenames = []
-        depth_filenames = []
-        normal_filenames = []
-        transform = None
+        c2ws = []
         fx = []
         fy = []
         cx = []
         cy = []
-        camera_to_worlds = []
-        for i, frame in enumerate(meta["frames"]):
-            if i not in indices:
-                continue
+        for scene in scenes:
+            scene_image_filenames = sorted(list((self.config.data / scene / "image").iterdir()))
+            image_filenames += scene_image_filenames
 
-            image_filename = self.config.data / frame["rgb_path"]
-            depth_filename = frame.get("mono_depth_path")
-            normal_filename = frame.get("mono_normal_path")
+            all_cam = np.load(str(self.config.data / scene / 'cameras.npz'))
+            for scene_image_filename in scene_image_filenames:
+                index = int(scene_image_filename.stem)
+                P = all_cam["world_mat_" + str(index)][:3]
+                K, R, t = cv2.decomposeProjectionMatrix(P)[:3]
+                K = K / K[2, 2]
+                pose = np.eye(4, dtype=np.float32)
+                pose[:3, :3] = R.transpose()
+                pose[:3, 3] = (t[:3] / t[3])[:, 0]
 
-            intrinsics = torch.tensor(frame["intrinsics"])
-            camtoworld = torch.tensor(frame["camtoworld"])
+                scale_mtx = all_cam.get("scale_mat_" + str(index))
+                if scale_mtx is not None:
+                    norm_trans = scale_mtx[:3, 3:]
+                    norm_scale = np.diagonal(scale_mtx[:3, :3])[..., None]
 
-            # append data
-            image_filenames.append(image_filename)
-            if depth_filename is not None and normal_filename is not None:
-                depth_filenames.append(self.config.data / depth_filename)
-                normal_filenames.append(self.config.data / normal_filename)
-            fx.append(intrinsics[0, 0])
-            fy.append(intrinsics[1, 1])
-            cx.append(intrinsics[0, 2])
-            cy.append(intrinsics[1, 2])
-            camera_to_worlds.append(camtoworld)
+                    pose[:3, 3:] -= norm_trans
+                    pose[:3, 3:] /= norm_scale
 
-        fx = torch.stack(fx)
-        fy = torch.stack(fy)
-        cx = torch.stack(cx)
-        cy = torch.stack(cy)
-        c2w_colmap = torch.stack(camera_to_worlds)
-        camera_to_worlds = torch.stack(camera_to_worlds)
+                pose = (
+                        COORD_TRANS_WORLD
+                        @ pose
+                        @ COORD_TRANS_CAM
+                )
 
-        # Convert from COLMAP's/OPENCV's camera coordinate system to nerfstudio
-        camera_to_worlds[:, 0:3, 1:3] *= -1
+                c2ws.append(pose)
+
+                fx.append(K[0, 0])
+                fy.append(K[1, 1])
+                cx.append(K[0, 2])
+                cy.append(K[1, 2])
+
+        c2ws = torch.FloatTensor(c2ws)
+        fx = torch.FloatTensor(fx)
+        fy = torch.FloatTensor(fy)
+        cx = torch.FloatTensor(cx)
+        cy = torch.FloatTensor(cy)
 
         if self.config.auto_orient:
-            camera_to_worlds, transform = camera_utils.auto_orient_and_center_poses(
-                camera_to_worlds,
+            c2ws, transform = camera_utils.auto_orient_and_center_poses(
+                c2ws,
                 method="up",
                 center_method="none",
             )
 
-        # scene box from meta data
-        meta_scene_box = meta["scene_box"]
-        aabb = torch.tensor(meta_scene_box["aabb"], dtype=torch.float32)
-        scene_box = SceneBox(
-            aabb=aabb,
-        )
+        min_bounds = c2ws[:, :3, 3].min(dim=0)[0]
+        max_bounds = c2ws[:, :3, 3].max(dim=0)[0]
+        scene_box = SceneBox(aabb=torch.stack([min_bounds, max_bounds]))
 
-        height, width = meta["height"], meta["width"]
+        if self.config.scene_id is not None:
+            i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+            if split == "train":
+                indices = i_train
+            elif split in ["val", "test"]:
+                indices = i_eval
+            else:
+                raise ValueError(f"Unknown dataparser split {split}")
+
+            image_filenames = [image_filenames[i] for i in indices]
+
+            idx_tensor = torch.LongTensor(indices)
+            c2ws = c2ws[idx_tensor]
+            fx = fx[idx_tensor]
+            fy = fy[idx_tensor]
+            cx = cx[idx_tensor]
+            cy = cy[idx_tensor]
+
+        image_dims = [Image.open(x).size for x in image_filenames]
+
         cameras = Cameras(
             fx=fx,
             fy=fy,
             cx=cx,
             cy=cy,
-            height=height,
-            width=width,
-            camera_to_worlds=camera_to_worlds[:, :3, :4],
+            height=torch.LongTensor([x[1] for x in image_dims]),
+            width=torch.LongTensor([x[0] for x in image_dims]),
+            camera_to_worlds=c2ws[:, :3, :4],
             camera_type=CameraType.PERSPECTIVE,
         )
-
-        # TODO supports downsample
-        # cameras.rescale_output_resolution(scaling_factor=1.0 / self.config.downscale_factor)
-        if self.config.include_mono_prior:
-            assert meta["has_mono_prior"], f"no mono prior in {self.config.data}"
 
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            metadata={
-                "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
-                "normal_filenames": normal_filenames if len(normal_filenames) > 0 else None,
-                "transform": transform,
-                # required for normal maps, these are in colmap format so they require c2w before conversion
-                "camera_to_worlds": c2w_colmap if len(c2w_colmap) > 0 else None,
-                "include_mono_prior": self.config.include_mono_prior,
-                "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
-            },
         )
         return dataparser_outputs

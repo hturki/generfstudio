@@ -10,14 +10,18 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 )
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 
+from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
+
 
 @dataclass
 class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
-    inner: DataParserConfig = field(default_factory=lambda: BlenderDataParserConfig())
+    inner: DataParserConfig = field(default_factory=lambda: DTUDataParserConfig())
     """inner dataparser"""
-    top: int = 3
+
+    start: int = 2
+    end: int = 2
 
 @dataclass
 class SDS(DataParser):
@@ -28,13 +32,14 @@ class SDS(DataParser):
         if config.data != Path():
             config.inner.data = self.config.data
         self.inner: DataParser = config.inner.setup()
-        self.top = config.top
+        self.start = config.start
+        self.end = config.end
 
     def _generate_dataparser_outputs(self, split='train') -> DataparserOutputs:
         inner_outputs = self.inner.get_dataparser_outputs(split)
         if split == 'train':
-            train_image_filenames = inner_outputs.image_filenames[:self.top]
-            train_image_cameras = inner_outputs.cameras[:self.top]
+            train_image_filenames = inner_outputs.image_filenames[self.start:self.end+1]
+            train_image_cameras = inner_outputs.cameras[self.start:self.end+1]
             return DataparserOutputs(
                 image_filenames=train_image_filenames,
                 cameras=train_image_cameras,

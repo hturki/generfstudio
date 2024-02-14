@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple, Type, Optional, Any
+from typing import Dict, List, Literal, Tuple, Type
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -26,17 +26,14 @@ from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler, Uni
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, NormalsRenderer, RGBRenderer
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.model_components.shaders import NormalsShader
-from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps
-from nerfstudio.utils.rich_utils import CONSOLE
 from torch.nn import Parameter
 
-from generfstudio.diffusion.stable_zero123 import StableZero123
-from generfstudio.generfstudio_constants import FG_MASK
+from generfstudio.models.sds_model_base import SDSModelBaseConfig, SDSModelBase
 
 
 @dataclass
-class NerfactoSDSModelConfig(ModelConfig):
+class NerfactoSDSModelConfig(SDSModelBaseConfig):
     """Nerfacto Model Config"""
 
     _target: Type = field(default_factory=lambda: NerfactoSDSModel)
@@ -118,87 +115,13 @@ class NerfactoSDSModelConfig(ModelConfig):
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
     """Config of the camera optimizer to use"""
 
-    ########################### SDS ###################
-    guidance_scale: float = 3.0
-    """guidance scale for sds loss"""
-    diffusion_device: Optional[str] = None  # "cuda:1"
-    """device for diffusion model"""
 
-    diffusion_config: str = "/data/hturki/threestudio/load/zero123/sd-objaverse-finetune-c_concat-256.yaml"
-    diffusion_checkpoint_path: str = "/data/hturki/threestudio/load/zero123/stable_zero123.ckpt"
-
-    min_step_percent: Tuple[float, float] = (0.7, 0.3)
-    max_step_percent: Tuple[float, float] = (0.98, 0.8)
-    step_anneal_range: Tuple[int, int] = (50, 200)
-
-    random_camera_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
-    random_camera_batch_sizes: List[int] = field(default_factory=lambda: [12, 8, 4])
-    random_camera_resolution_milestones: List[int] = field(default_factory=lambda: [200, 300])
-
-    sds_loss_mult: float = 1e-4
-    """SDS loss multiplier."""
-
-    mask_loss_mult: float = 0.1
-
-    opacity_loss_mult: float = 5e-4
-
-
-class NerfactoSDSModel(Model):
-    """Nerfacto model
-
-    Args:
-        config: Nerfacto configuration to instantiate model
-    """
-
+class NerfactoSDSModel(SDSModelBase):
     config: NerfactoSDSModelConfig
-
-    def __init__(
-            self,
-            config: NerfactoSDSModelConfig,
-            metadata: Dict[str, Any],
-            **kwargs,
-    ) -> None:
-        self.prompt = config.prompt
-        self.cur_prompt = config.prompt
-        self.grad_scaler = kwargs["grad_scaler"]
-
-        self.train_sds = False
-        self.train_with_sds = False
-        self.iteration_index = 0
-
-        self.diffusion_device = (
-            torch.device(kwargs["device"]) if config.diffusion_device is None else torch.device(config.diffusion_device)
-        )
-
-        self.test_cameras = metadata.get('test_cameras', None)
-        self.train_image_filenames = metadata['train_image_filenames']
-        self.train_image_cameras = metadata['train_image_cameras']
-
-        super().__init__(config=config, **kwargs)
 
     def populate_modules(self):
         """Set the fields and modules."""
         super().populate_modules()
-
-        # Need to prefix with underscore or else viewer will throw an exception
-        self._diffusion_model = StableZero123(self.config.diffusion_checkpoint_path, self.config.diffusion_config,
-                                              self.config.guidance_scale).to(self.diffusion_device)
-
-        c2w = self.train_image_cameras[-1].camera_to_worlds
-        cam_dist = c2w[:, 3].norm()
-        elevation_rad = torch.arcsin((c2w[2, 3] / cam_dist))
-        azimuth_rad = torch.arctan2(c2w[1, 3], c2w[0, 3])
-        # azimuth_rad = torch.arcsin((c2w[1, 3] / (cam_dist * torch.cos(elevation_rad))))
-        azimuth_rad_2 = torch.arccos((c2w[0, 3] / (cam_dist * torch.cos(elevation_rad))))
-        elevation_deg = torch.rad2deg(elevation_rad)
-        azimuth_deg = torch.rad2deg(azimuth_rad)
-
-        CONSOLE.log(
-            f"Cond image elevation {elevation_deg} azimuth {azimuth_deg} azimuth check {torch.rad2deg(azimuth_rad_2)}")
-        self._diffusion_model.prepare_embeddings(self.train_image_filenames[-1], elevation_deg.item(),
-                                                 azimuth_deg.item())
-
-        ###################################################
 
         if self.config.disable_scene_contraction:
             scene_contraction = None
@@ -318,7 +241,7 @@ class NerfactoSDSModel(Model):
     def get_training_callbacks(
             self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
-        callbacks = []
+        callbacks = super().get_training_callbacks(training_callback_attributes)
         if self.config.use_proposal_weight_anneal:
             # anneal the weights of the proposal network before doing PDF sampling
             N = self.config.proposal_weights_anneal_max_num_iters
@@ -349,45 +272,14 @@ class NerfactoSDSModel(Model):
                     func=self.proposal_sampler.step_cb,
                 )
             )
-
-            def set_min_max_steps(step: int):
-                weight = (step - self.config.step_anneal_range[0]) / (
-                        self.config.step_anneal_range[1] - self.config.step_anneal_range[0])
-                weight = min(max(weight, 0), 1)
-                self._diffusion_model.set_min_max_steps((1 - weight) * self.config.min_step_percent[0] +
-                                                        weight * self.config.min_step_percent[1],
-                                                        (1 - weight) * self.config.max_step_percent[0] +
-                                                        weight * self.config.max_step_percent[1])
-
-            def update_random_camera_params(step: int):
-                index = self.config.random_camera_resolution_milestones.index(step)
-                self.random_camera_dim = self.config.random_camera_dims[index + 1]
-                self.random_camera_batch_size = self.config.random_camera_batch_sizes[index + 1]
-                CONSOLE.log(
-                    f"New camera resolution {self.random_camera_dim} and batch size {self.random_camera_batch_size} at step {step}")
-
-            callbacks += [
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                    func=set_min_max_steps,
-                    update_every_num_iters=1,
-                ),
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                    iters=tuple(self.config.random_camera_resolution_milestones),
-                    func=update_random_camera_params,
-                ),
-            ]
         return callbacks
 
-    # This is get_outputs_for_camera_ray_bundle but without the torch.no_grad annotation
-    # and only for outputs relevant to the loss function
-    def get_outputs_for_SDS(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
-        """Takes in camera parameters and computes the output of the model.
+    def get_random_camera_outputs(self, random_cameras: Cameras) -> Dict[str, torch.Tensor]:
+        camera_ray_bundle = random_cameras.generate_rays(
+            camera_indices=torch.arange(len(random_cameras)).view(self.random_camera_batch_size, 1))
 
-        Args:
-            camera_ray_bundle: ray bundle to calculate outputs over
-        """
+        # This is get_outputs_for_camera_ray_bundle but without the torch.no_grad annotation
+        # and only for outputs relevant to the loss function
         input_device = camera_ray_bundle.directions.device
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
         image_height, image_width = camera_ray_bundle.origins.shape[:2]
@@ -401,14 +293,18 @@ class NerfactoSDSModel(Model):
             ray_bundle = ray_bundle.to(self.device)
             outputs = self.forward(ray_bundle=ray_bundle)
             for output_name, output in outputs.items():  # type: ignore
-                if not isinstance(output, torch.Tensor) or output_name not in {'rgb', 'accumulation'}:
-                    # TODO: handle lists of tensors as well
+                if output_name not in {'rgb', 'accumulation'}:
                     continue
                 # move the chunk outputs from the model device back to the device of the inputs.
                 outputs_lists[output_name].append(output.to(input_device))
         outputs = {}
         for output_name, outputs_list in outputs_lists.items():
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+
+        # Shape this the way the diffusion model expects for SDS loss
+        outputs["rgb"] = outputs["rgb"].view(outputs["rgb"].shape[0], outputs["rgb"].shape[1],
+                                             self.random_camera_batch_size, 3).permute(2, 0, 1, 3)
+
         return outputs
 
     def get_outputs(self, ray_bundle: RayBundle):
@@ -506,41 +402,7 @@ class NerfactoSDSModel(Model):
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
 
-            ###############################################################################
-            ############################ SDS on test images ##################################
-
-            # Take random camera test indices
-            # We should do true random sampling, but this should be a decent distribution for now
-            random_indices = np.random.choice(len(self.test_cameras), self.random_camera_batch_size, replace=False)
-
-            # TODO: Might need adjustment for non-square cameras
-            random_cameras = self.test_cameras[torch.LongTensor(random_indices)].to(self.device)
-            random_cameras.rescale_output_resolution(scaling_factor=self.random_camera_dim / random_cameras.width)
-
-            camera_ray_bundle = random_cameras.generate_rays(
-                camera_indices=torch.arange(len(random_cameras)).view(self.random_camera_batch_size, 1))
-            sds_outputs = self.get_outputs_for_SDS(camera_ray_bundle)
-            rgb = sds_outputs["rgb"]
-            rgb = rgb.view(rgb.shape[0], rgb.shape[1], self.random_camera_batch_size, 3).permute(2, 0, 1, 3)
-
-            c2w = random_cameras.camera_to_worlds
-            cam_dist = c2w[:, :, 3].norm(dim=-1)
-            elevation_rad = torch.arcsin((c2w[:, 2, 3] / cam_dist))
-            azimuth_rad = torch.arctan2(c2w[:, 1, 3], c2w[:, 0, 3])
-
-            # azimuth_rad = torch.arcsin((c2w[:, 1, 3] / (cam_dist * torch.cos(elevation_rad))))
-
-            loss_dict["sds_loss"] = self.config.sds_loss_mult * self._diffusion_model(rgb, torch.rad2deg(elevation_rad),
-                                                                                      torch.rad2deg(azimuth_rad))
-            opacity = sds_outputs["accumulation"]
-            rev_opacity = 1 - opacity
-            loss_dict["opacity_loss"] = self.config.opacity_loss_mult * -(
-                    opacity * torch.log(opacity + 1e-5) + rev_opacity * torch.log(rev_opacity + 1e-5)).mean()
-
-            if FG_MASK in batch:
-                loss_dict["fg_mask_loss"] = self.config.mask_loss_mult * F.mse_loss(outputs["accumulation"],
-                                                                                    batch[FG_MASK].to(
-                                                                                        self.device))
+            loss_dict.update(self.get_sds_loss_dict(outputs, batch))
 
         return loss_dict
 

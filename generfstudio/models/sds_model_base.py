@@ -214,8 +214,11 @@ class SDSModelBase(Model):
             ).to(self.device)
         else:
             # Take random camera test indices
-            random_indices = np.random.choice(len(self.test_cameras), self.random_camera_batch_size, replace=False)
-            random_cameras = self.test_cameras[torch.LongTensor(random_indices)].to(self.device)
+            if len(self.test_cameras) <= self.random_camera_batch_size:
+                random_cameras = self.test_cameras
+            else:
+                random_indices = np.random.choice(len(self.test_cameras), self.random_camera_batch_size, replace=False)
+                random_cameras = self.test_cameras[torch.LongTensor(random_indices)].to(self.device)
 
         # TODO: Might need adjustment for non-square cameras
         random_cameras.rescale_output_resolution(scaling_factor=self.random_camera_dim / random_cameras.width)

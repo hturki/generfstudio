@@ -1,7 +1,6 @@
 """
 Generfstudio data configuration file.
 """
-from dataclasses import field
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
@@ -13,9 +12,14 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
+from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
+    NeighboringViewsDatamanager
+from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 from generfstudio.data.datasets.masked_dataset import MaskedDataset
+from generfstudio.data.datasets.neighboring_views_dataset import NeighboringViewsDataset
 from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
+from generfstudio.models.pixelnerf_model import PixelNeRFModelConfig
 from generfstudio.models.splatfacto_sds import SplatfactoSDSModelConfig
 
 nerfacto_sds_method = MethodSpecification(
@@ -107,13 +111,37 @@ splatfacto_sds_method = MethodSpecification(
                 "scheduler": None,
             },
             "rotation": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-            # "camera_opt": {
-            #     "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            #     "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
-            # },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
     ),
     description='Splatfacto with SDS loss',
+)
+
+pixelnerf_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="pixel-nerf",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=2000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000001,
+        mixed_precision=True,
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                dataparser=DTUDataParserConfig(scene_id=None),
+            ),
+            model=PixelNeRFModelConfig(),
+        ),
+        optimizers={
+            "fields": {
+                "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": None,
+            },
+        },
+        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+        vis="viewer",
+    ),
+    description='PixelNeRF',
 )

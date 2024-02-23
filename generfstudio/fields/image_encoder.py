@@ -18,27 +18,17 @@ class ImageEncoder(nn.Module):
         super().__init__()
         self.model = getattr(torchvision.models, backbone)(pretrained=pretrained)
         self.model.fc = nn.Sequential()
-        self.register_buffer("latent", torch.empty(1, 1), persistent=False)
         # self.latent (B, L)
         self.latent_size = latent_size
         if latent_size != 512:
             self.fc = nn.Linear(512, latent_size)
 
-    def index(self, uv, cam_z=None, image_size=(), z_bounds=()):
-        """
-        Params ignored (compatibility)
-        :param uv (B, N, 2) only used for shape
-        :return latent vector (B, L, N)
-        """
-        return self.latent.unsqueeze(-1).expand(-1, -1, uv.shape[1])
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         For extracting ResNet's features.
         :param x image (B, C, H, W)
         :return latent (B, latent_size)
         """
-        x = x.to(device=self.latent.device)
         x = self.model.conv1(x)
         x = self.model.bn1(x)
         x = self.model.relu(x)
@@ -55,5 +45,4 @@ class ImageEncoder(nn.Module):
         if self.latent_size != 512:
             x = self.fc(x)
 
-        self.latent = x  # (B, latent_size)
-        return self.latent
+        return x

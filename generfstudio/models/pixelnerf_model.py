@@ -1,222 +1,359 @@
-from dataclasses import field, dataclass
-from typing import Type, Tuple, List, Dict, Optional
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Union, Type, Literal, Any, Optional
 
 import numpy as np
 import torch
+from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.engine.callbacks import TrainingCallbackAttributes, TrainingCallback, TrainingCallbackLocation
+from nerfstudio.configs.config_utils import to_immutable_dict
+from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.field_components.field_heads import FieldHeadNames
-from nerfstudio.fields.density_fields import HashMLPDensityField
-from nerfstudio.model_components.losses import distortion_loss, interlevel_loss, scale_gradients_by_distance_squared
-from nerfstudio.model_components.ray_samplers import UniformSampler, ProposalNetworkSampler
-from nerfstudio.utils import colormaps
+from nerfstudio.model_components.losses import MSELoss
+from nerfstudio.model_components.ray_samplers import UniformSampler, PDFSampler
+from nerfstudio.model_components.renderers import (
+    AccumulationRenderer,
+    DepthRenderer,
+    RGBRenderer, )
+from nerfstudio.model_components.scene_colliders import NearFarCollider
+from nerfstudio.models.base_model import Model, ModelConfig
+from nerfstudio.utils import colormaps, misc
+from pytorch_msssim import SSIM
+from rich.console import Console
 from torch.nn import Parameter
+from torchmetrics import PeakSignalNoiseRatio
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from pynerf.models.pynerf_base_model import PixelNeRFBaseModelConfig, PixelNeRFBaseModel
-from pynerf.pynerf_constants import EXPLICIT_LEVEL, PixelNeRFFieldHeadNames, LEVEL_COUNTS, LEVELS
+from generfstudio.fields.image_encoder import ImageEncoder
+from generfstudio.fields.pixelnerf_field import PixelNeRFField
+from generfstudio.fields.spatial_encoder import SpatialEncoder
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, LATENT, \
+    LATENT_SCALING, GLOBAL_LATENT, ENCODER, NEIGHBORING_VIEW_COUNT, DEFAULT_SCENE_METADATA
+from generfstudio.pixelnerf_utils.pdf_and_depth_sampler import PDFAndDepthSampler
+
+CONSOLE = Console(width=120)
 
 
 @dataclass
-class PixelNeRFModelConfig(PixelNeRFBaseModelConfig):
+class PixelNeRFModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: PixelNeRFModel)
 
-    num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
-    """Number of samples per ray for each proposal network."""
-    num_nerf_samples_per_ray: int = 48
-    """Number of samples per ray for the nerf network."""
-    proposal_update_every: int = 5
-    """Sample every n steps after the warmup"""
-    proposal_warmup: int = 5000
-    """Scales n from 1 to proposal_update_every over this many steps"""
-    num_proposal_iterations: int = 2
-    """Number of proposal network iterations."""
-    use_same_proposal_network: bool = False
-    """Use the same proposal network. Otherwise use different ones."""
-    """Arguments for the proposal density fields."""
-    interlevel_loss_mult: float = 1.0
-    """Proposal loss multiplier."""
-    distortion_loss_mult: float = 0.002
-    """Distortion loss multiplier."""
-    use_proposal_weight_anneal: bool = True
-    """Whether to use proposal weight annealing."""
-    proposal_weights_anneal_slope: float = 10.0
-    """Slope of the annealing function for the proposal weights."""
-    proposal_weights_anneal_max_num_iters: int = 1000
-    """Max num iterations for the annealing function."""
-    use_single_jitter: bool = True
-    """Whether use single jitter or not for the proposal networks."""
-    use_gradient_scaling: bool = False
-    """Use gradient scaler where the gradients are lower for points closer to the camera."""
+    num_coarse_samples: int = 64
+    """Number of samples in coarse field evaluation"""
+    num_importance_samples: int = 32
+    """Number of samples in fine field evaluation"""
+    num_depth_samples: int = 16
 
-class PixelNeRFModel(PixelNeRFBaseModel):
+    background_color: Literal["random", "black", "white"] = "black"
+
+    combine_layer: int = 3
+    use_positional_encoding_xyz: bool = True
+    use_view_dirs: bool = True
+    normalize_z: bool = True
+    use_global_encoder: bool = False
+    freeze_encoder: bool = False
+    """Freeze encoder weights during training"""
+
+    default_scene_view_count: int = 3
+
+
+class PixelNeRFModel(Model):
     config: PixelNeRFModelConfig
+    """
+    PixelNeRF model.
+    """
+
+    def __init__(self, config: PixelNeRFModelConfig, metadata: Dict[str, Any], **kwargs) -> None:
+        self.near = metadata.get(NEAR, None)
+        self.far = metadata.get(FAR, None)
+        if self.near is not None or self.far is not None:
+            CONSOLE.log(f"Using near and far bounds {self.near} {self.far} from metadata")
+
+        self.default_scene = metadata[DEFAULT_SCENE_METADATA]
+
+        super().__init__(config=config, **kwargs)
 
     def populate_modules(self):
         """Set the fields and modules."""
         super().populate_modules()
 
-        self.density_fns = []
-        num_prop_nets = self.config.num_proposal_iterations
-        # Build the proposal network(s)
-        self.proposal_networks = torch.nn.ModuleList()
+        # # Disable the collider in Model since it will throw an exception when getting Cameras as the input
+        # self.collider = None
 
-        proposal_net_args_list = []
-        levels = [6, 8]
-        max_res = [512, 2048]
-        for i in range(num_prop_nets):
-            proposal_net_args_list.append({
-                'hidden_dim': 16,
-                'log2_hashmap_size': 19,
-                'num_levels': levels[i],
-                'base_res': self.config.base_resolution,
-                'max_res': max_res[i],
-                'use_linear': False
-            })
+        near = self.near if self.near is not None else self.config.collider_params["near_plane"]
+        far = self.far if self.far is not None else self.config.collider_params["far_plane"]
+        self.collider = NearFarCollider(near_plane=near, far_plane=far)
 
-        if self.config.use_same_proposal_network:
-            assert len(proposal_net_args_list) == 1, 'Only one proposal network is allowed.'
-            prop_net_args = proposal_net_args_list[0]
-            network = HashMLPDensityField(self.scene_box.aabb, spatial_distortion=self.scene_contraction,
-                                          **prop_net_args)
-            self.proposal_networks.append(network)
-            self.density_fns.extend([network.density_fn for _ in range(num_prop_nets)])
-        else:
-            for i in range(num_prop_nets):
-                prop_net_args = proposal_net_args_list[min(i, len(proposal_net_args_list) - 1)]
-                network = HashMLPDensityField(self.scene_box.aabb, spatial_distortion=self.scene_contraction,
-                                              **prop_net_args)
-                self.proposal_networks.append(network)
-            self.density_fns.extend([network.density_fn for network in self.proposal_networks])
+        self.encoder = SpatialEncoder()
 
-        # Samplers
-        update_schedule = lambda step: np.clip(
-            np.interp(step, [0, self.config.proposal_warmup], [0, self.config.proposal_update_every]),
-            1,
-            self.config.proposal_update_every,
-        )
+        if self.config.use_global_encoder:
+            self.global_encoder = ImageEncoder()
 
-        # Change proposal network initial sampler if uniform
-        initial_sampler = None  # None is for piecewise as default (see ProposalNetworkSampler)
-        if self.scene_contraction is None:
-            initial_sampler = UniformSampler(single_jitter=self.config.use_single_jitter)
+        self.field_coarse = PixelNeRFField(
+            encoder_latent_size=self.encoder.latent_size,
+            global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
+            combine_layer=self.config.combine_layer,
+            use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
+            use_view_dirs=self.config.use_view_dirs,
+            normalize_z=self.config.normalize_z,
+            freeze_encoder=self.config.freeze_encoder)
 
-        self.proposal_sampler = ProposalNetworkSampler(
-            num_nerf_samples_per_ray=self.config.num_nerf_samples_per_ray,
-            num_proposal_samples_per_ray=self.config.num_proposal_samples_per_ray,
-            num_proposal_network_iterations=self.config.num_proposal_iterations,
-            single_jitter=self.config.use_single_jitter,
-            update_sched=update_schedule,
-            initial_sampler=initial_sampler,
-        )
+        self.field_fine = PixelNeRFField(
+            encoder_latent_size=self.encoder.latent_size,
+            global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
+            combine_layer=self.config.combine_layer,
+            use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
+            use_view_dirs=self.config.use_view_dirs,
+            normalize_z=self.config.normalize_z,
+            freeze_encoder=self.config.freeze_encoder)
+
+        # samplers
+        self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
+        self.sampler_pdf = PDFAndDepthSampler(num_samples=self.config.num_importance_samples,
+                                              num_depth_samples=self.config.num_depth_samples)
+
+        # renderers
+        self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
+        self.renderer_accumulation = AccumulationRenderer()
+        self.renderer_depth = DepthRenderer(method='expected')
+
+        # losses
+        self.rgb_loss = MSELoss()
+
+        # metrics
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
+        self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
+
+        self.default_scene_metadata = {NEIGHBORING_VIEW_COUNT: self.config.default_scene_view_count}
+        self.default_scene_latents = None
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        param_groups = super().get_param_groups()
-        param_groups['proposal_networks'] = list(self.proposal_networks.parameters())
+        param_groups = {}
+        param_groups["fields"] = list(self.encoder.parameters()) + list(self.field_coarse.parameters()) + list(
+            self.field_fine.parameters())
+        if self.config.use_global_encoder:
+            param_groups["fields"] += list(self.global_encoder.parameters())
+
         return param_groups
 
-    def get_training_callbacks(
-            self, training_callback_attributes: TrainingCallbackAttributes
-    ) -> List[TrainingCallback]:
-        callbacks = []
-        if self.config.use_proposal_weight_anneal:
-            # anneal the weights of the proposal network before doing PDF sampling
-            N = self.config.proposal_weights_anneal_max_num_iters
+    @torch.no_grad()
+    def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
+        """Takes in a camera, generates the raybundle, and computes the output of the model.
+        Assumes a ray-based model.
 
-            def set_anneal(step):
-                # https://arxiv.org/pdf/2111.12077.pdf eq. 18
-                train_frac = np.clip(step / N, 0, 1)
-                bias = lambda x, b: (b * x) / ((b - 1) * x + 1)
-                anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
-                self.proposal_sampler.set_anneal(anneal)
+        Args:
+            camera: generates raybundle
+        """
+        if camera.metadata is not None and NEIGHBORING_VIEW_CAMERAS in camera.metadata:
+            ray_bundle_metadata = {}
 
-            callbacks.append(
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                    update_every_num_iters=1,
-                    func=set_anneal,
-                )
-            )
-            callbacks.append(
-                TrainingCallback(
-                    where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                    update_every_num_iters=1,
-                    func=self.proposal_sampler.step_cb,
-                )
-            )
-        return callbacks
+            ray_bundle_metadata[LATENT] = self._get_latents(camera.metadata[NEIGHBORING_VIEW_IMAGES])
+            del camera.metadata[NEIGHBORING_VIEW_IMAGES]
 
-    def get_outputs_inner(self, ray_bundle: RayBundle, explicit_level: Optional[int] = None):
-        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+            for key in [NEIGHBORING_VIEW_CAMERAS, NEIGHBORING_VIEW_COUNT]:
+                ray_bundle_metadata[key] = camera.metadata[key]
+                del camera.metadata[key]
+        else:
+            if self.default_scene_latents is None:
+                neighboring_views = np.linspace(0, len(self.default_scene.cameras) - 1,
+                                                self.config.default_scene_view_count, dtype=np.int32)
+                scene_dataset = InputDataset(self.default_scene)
+                neighboring_view_images = [scene_dataset.get_image_float32(i).to(self.device) for i in
+                                           neighboring_views]
+                self.default_scene_latents = self._get_latents(neighboring_view_images)
+                self.default_scene_metadata[NEIGHBORING_VIEW_CAMERAS] = self.default_scene.cameras[
+                    torch.LongTensor(neighboring_views)].to(self.device)
 
-        if explicit_level is not None:
-            if ray_samples.metadata is None:
-                ray_samples.metadata = {}
-            ray_samples.metadata[EXPLICIT_LEVEL] = explicit_level
+            ray_bundle_metadata = self.default_scene_metadata
+            ray_bundle_metadata[LATENT] = self.default_scene_latents
 
-        field_outputs = self.field(ray_samples)
-        if self.config.use_gradient_scaling:
-            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+        ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
+        return self.get_outputs_for_camera_ray_bundle(ray_bundle, ray_bundle_metadata)
 
-        weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+    def _get_latents(self, neighboring_view_images: List[torch.Tensor]) -> Tuple:
+        neighboring_view_images = torch.cat([x.permute(2, 0, 1).unsqueeze(0) for x in neighboring_view_images])
 
-        outputs = {
-            'rgb': self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights),
-            'depth': self.renderer_depth(weights=weights, ray_samples=ray_samples)
-        }
+        latent, latent_scaling = self.encoder(neighboring_view_images)
+        if self.config.use_global_encoder:
+            global_latent = self.global_encoder(neighboring_view_images)
+            latents = (latent, latent_scaling, global_latent)
+        else:
+            latents = (latent, latent_scaling)
+        return latents
 
-        weights_list.append(weights)
-        ray_samples_list.append(ray_samples)
+    @torch.no_grad()
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle,
+                                          ray_bundle_metadata: Dict = to_immutable_dict({})) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
 
-        if self.training:
-            outputs['weights_list'] = weights_list
-            outputs['ray_samples_list'] = ray_samples_list
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
 
-        if explicit_level is None:
-            for i in range(self.config.num_proposal_iterations):
-                outputs[f'prop_depth_{i}'] = self.renderer_depth(weights=weights_list[i],
-                                                                 ray_samples=ray_samples_list[i])
+        input_device = camera_ray_bundle.directions.device
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            # move the chunk inputs to the model device
+            ray_bundle = ray_bundle.to(self.device)
+            ray_bundle.metadata.update(ray_bundle_metadata)
+            outputs = self.forward(ray_bundle=ray_bundle)
+            for output_name, output in outputs.items():  # type: ignore
+                if not isinstance(output, torch.Tensor):
+                    # TODO: handle lists of tensors as well
+                    continue
+                # move the chunk outputs from the model device back to the device of the inputs.
+                outputs_lists[output_name].append(output.to(input_device))
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs
 
-            outputs['accumulation'] = self.renderer_accumulation(weights=weights)
+    def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+        if LATENT in ray_bundle.metadata:
+            latents = ray_bundle.metadata[LATENT]
+            del ray_bundle.metadata[LATENT]
+        else:
+            latents = self._get_latents(ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES])
+            del ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES]
 
-            if self.training:
-                outputs[LEVEL_COUNTS] = field_outputs[PixelNeRFFieldHeadNames.LEVEL_COUNTS]
-            else:
-                levels = field_outputs[PixelNeRFFieldHeadNames.LEVELS]
-                outputs[LEVELS] = self.renderer_level(weights=weights,
-                                                        semantics=levels.clamp(0, self.field.num_scales - 1))
+        if self.config.use_global_encoder:
+            latent, latent_scaling, global_latent = latents
+        else:
+            latent, latent_scaling = latents
+
+        neighboring_view_cameras = ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
+        del ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
+
+        neighboring_view_count = ray_bundle.metadata[NEIGHBORING_VIEW_COUNT]
+        del ray_bundle.metadata[NEIGHBORING_VIEW_COUNT]
+
+        ray_sample_metadata = {}
+        ray_sample_metadata[NEIGHBORING_VIEW_CAMERAS] = neighboring_view_cameras
+        ray_sample_metadata[NEIGHBORING_VIEW_COUNT] = neighboring_view_count
+        ray_sample_metadata[ENCODER] = self.encoder
+        ray_sample_metadata[LATENT] = latent
+        ray_sample_metadata[LATENT_SCALING] = latent_scaling
+        if self.config.use_global_encoder:
+            ray_sample_metadata[GLOBAL_LATENT] = global_latent
+
+        ray_samples_uniform = self.sampler_uniform(ray_bundle)
+        ray_samples_uniform.metadata.update(ray_sample_metadata)
+
+        outputs = {}
+
+        field_outputs_coarse = self.field_coarse.forward(ray_samples_uniform)
+        weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
+        rgb_coarse = self.renderer_rgb(
+            rgb=field_outputs_coarse[FieldHeadNames.RGB],
+            weights=weights_coarse,
+        )
+        outputs["rgb_coarse"] = rgb_coarse
+
+        depth_coarse = self.renderer_depth(weights_coarse, ray_samples_uniform)
+        outputs["depth_coarse"] = depth_coarse
+
+        # pdf sampling
+        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse, depth_coarse)
+        ray_samples_pdf.metadata.update(ray_sample_metadata)
+
+        field_outputs_fine = self.field_fine.forward(ray_samples_pdf)
+
+        weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
+        rgb_fine = self.renderer_rgb(
+            rgb=field_outputs_fine[FieldHeadNames.RGB],
+            weights=weights_fine,
+        )
+
+        outputs["rgb_fine"] = rgb_fine
+        accumulation_coarse = self.renderer_accumulation(weights_coarse)
+        outputs["accumulation_coarse"] = accumulation_coarse
+
+        accumulation_fine = self.renderer_accumulation(weights_fine)
+        outputs["accumulation_fine"] = accumulation_fine
+
+        if not self.training:
+            depth_fine = self.renderer_depth(weights_fine, ray_samples_pdf)
+            outputs["depth_fine"] = depth_fine
+            outputs["depth"] = depth_fine
 
         return outputs
 
-    def get_metrics_dict(self, outputs: Dict[str, any], batch: Dict[str, any]) -> Dict[str, torch.Tensor]:
-        metrics_dict = super().get_metrics_dict(outputs, batch)
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        # Scaling metrics by coefficients to create the losses.
+        device = outputs["rgb_coarse"].device
+        image = batch["image"].to(device)
+        coarse_pred, coarse_image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb_coarse"],
+            pred_accumulation=outputs["accumulation_coarse"],
+            gt_image=image,
+        )
+        fine_pred, fine_image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb_fine"],
+            pred_accumulation=outputs["accumulation_fine"],
+            gt_image=image,
+        )
 
-        if self.training:
-            metrics_dict['distortion'] = distortion_loss(outputs['weights_list'], outputs['ray_samples_list'])
-            metrics_dict['interlevel'] = interlevel_loss(outputs['weights_list'], outputs['ray_samples_list'])
+        rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
+        rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
 
-        return metrics_dict
-
-    def get_loss_dict_inner(self, outputs: Dict[str, any], batch: Dict[str, any],
-                            metrics_dict: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
-        loss_dict = super().get_loss_dict_inner(outputs, batch, metrics_dict)
-
-        if self.training:
-            loss_dict['interlevel_loss'] = self.config.interlevel_loss_mult * metrics_dict['interlevel']
-            loss_dict['distortion_loss'] = self.config.distortion_loss_mult * metrics_dict['distortion']
-
+        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+        loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
     def get_image_metrics_and_images(
             self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
+        image = batch["image"].to(outputs["rgb_coarse"].device)
+        image = self.renderer_rgb.blend_background(image)
+        rgb_coarse = outputs["rgb_coarse"]
+        rgb_fine = outputs["rgb_fine"]
+        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
+        acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
+        assert self.config.collider_params is not None
+        depth_coarse = colormaps.apply_depth_colormap(
+            outputs["depth_coarse"],
+            accumulation=outputs["accumulation_coarse"],
+            near_plane=self.config.collider_params["near_plane"],
+            far_plane=self.config.collider_params["far_plane"],
+        )
+        depth_fine = colormaps.apply_depth_colormap(
+            outputs["depth_fine"],
+            accumulation=outputs["accumulation_fine"],
+            near_plane=self.config.collider_params["near_plane"],
+            far_plane=self.config.collider_params["far_plane"],
+        )
 
-        for i in range(self.config.num_proposal_iterations):
-            key = f'prop_depth_{i}'
-            prop_depth_i = colormaps.apply_depth_colormap(
-                outputs[key],
-                accumulation=outputs['accumulation'],
-            )
-            images_dict[key] = prop_depth_i
+        combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)
+        combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
+        combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
 
+        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        image = torch.moveaxis(image, -1, 0)[None, ...]
+        rgb_coarse = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
+        rgb_fine = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
+
+        coarse_psnr = self.psnr(image, rgb_coarse)
+        fine_psnr = self.psnr(image, rgb_fine)
+        fine_ssim = self.ssim(image, rgb_fine)
+        fine_lpips = self.lpips(image, rgb_fine)
+        assert isinstance(fine_ssim, torch.Tensor)
+
+        metrics_dict = {
+            "psnr": float(fine_psnr.item()),
+            "coarse_psnr": float(coarse_psnr),
+            "fine_psnr": float(fine_psnr),
+            "fine_ssim": float(fine_ssim),
+            "fine_lpips": float(fine_lpips),
+        }
+        images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict

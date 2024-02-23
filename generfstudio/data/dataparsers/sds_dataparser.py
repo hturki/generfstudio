@@ -17,7 +17,7 @@ from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
-    inner: DataParserConfig = field(default_factory=lambda: DTUDataParserConfig())
+    inner: DataParserConfig = field(default_factory=lambda: BlenderDataParserConfig())
     """inner dataparser"""
 
     start: int = 2

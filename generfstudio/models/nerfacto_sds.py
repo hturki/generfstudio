@@ -275,8 +275,7 @@ class NerfactoSDSModel(SDSModelBase):
         return callbacks
 
     def get_random_camera_outputs(self, random_cameras: Cameras) -> Dict[str, torch.Tensor]:
-        camera_ray_bundle = random_cameras.generate_rays(
-            camera_indices=torch.arange(len(random_cameras)).view(self.random_camera_batch_size, 1))
+        camera_ray_bundle = random_cameras.generate_rays(camera_indices=torch.arange(len(random_cameras)).view(-1, 1))
 
         # This is get_outputs_for_camera_ray_bundle but without the torch.no_grad annotation
         # and only for outputs relevant to the loss function
@@ -293,7 +292,7 @@ class NerfactoSDSModel(SDSModelBase):
             ray_bundle = ray_bundle.to(self.device)
             outputs = self.forward(ray_bundle=ray_bundle)
             for output_name, output in outputs.items():  # type: ignore
-                if output_name not in {'rgb', 'accumulation'}:
+                if output_name not in {"rgb", "accumulation"}:
                     continue
                 # move the chunk outputs from the model device back to the device of the inputs.
                 outputs_lists[output_name].append(output.to(input_device))
@@ -301,9 +300,9 @@ class NerfactoSDSModel(SDSModelBase):
         for output_name, outputs_list in outputs_lists.items():
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
 
-        # Shape this the way the diffusion model expects for SDS loss
-        outputs["rgb"] = outputs["rgb"].view(outputs["rgb"].shape[0], outputs["rgb"].shape[1],
-                                             self.random_camera_batch_size, 3).permute(2, 0, 1, 3)
+        # Shape rgb the way the diffusion model expects for SDS loss
+        outputs["rgb"] = outputs["rgb"].view(outputs["rgb"].shape[0], outputs["rgb"].shape[1], len(random_cameras),
+                                             3).permute(2, 0, 1, 3)
 
         return outputs
 

@@ -63,10 +63,6 @@ def _ssim(img1, img2, window, window_size, channel, mask=None, size_average=True
         )
         return ssim_map
 
-    import pdb
-
-    pdb.set_trace
-
     if size_average:
         return ssim_map.mean()
     else:

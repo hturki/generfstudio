@@ -160,7 +160,7 @@ def get_data_from_str(input_str, nprc=None):
     ):
         vids.append(v)
 
-    vids = torch.stack(vids, dim=0).float()
+    vids = torch.stack(vids, dim=0)#.float()
 
     return vids
 
@@ -246,7 +246,7 @@ def compute_statistics(
     if only_ref:
         if not isvideo(videos_real):
             # if not is video we assume to have numpy arrays pf shape (n_vids, t, h, w, c) in range [0,255]
-            videos_real = torch.from_numpy(videos_real).permute(0, 4, 1, 2, 3).float()
+            videos_real = torch.from_numpy(videos_real).permute(0, 4, 1, 2, 3)#.float()
             print(videos_real.shape)
 
         if videos_real.shape[0] % bs == 0:
@@ -265,7 +265,7 @@ def compute_statistics(
     elif only_sample:
         if not isvideo(videos_fake):
             # if not is video we assume to have numpy arrays pf shape (n_vids, t, h, w, c) in range [0,255]
-            videos_fake = torch.from_numpy(videos_fake).permute(0, 4, 1, 2, 3).float()
+            videos_fake = torch.from_numpy(videos_fake).permute(0, 4, 1, 2, 3)#.float()
             print(videos_fake.shape)
 
         if videos_fake.shape[0] % bs == 0:
@@ -286,10 +286,10 @@ def compute_statistics(
     else:
         if not isvideo(videos_real):
             # if not is video we assume to have numpy arrays pf shape (n_vids, t, h, w, c) in range [0,255]
-            videos_real = torch.from_numpy(videos_real).permute(0, 4, 1, 2, 3).float()
+            videos_real = torch.from_numpy(videos_real).permute(0, 4, 1, 2, 3)#.float()
 
         if not isvideo(videos_fake):
-            videos_fake = torch.from_numpy(videos_fake).permute(0, 4, 1, 2, 3).float()
+            videos_fake = torch.from_numpy(videos_fake).permute(0, 4, 1, 2, 3)#.float()
 
         if videos_fake.shape[0] % bs == 0:
             n_secs = videos_fake.shape[0] // bs

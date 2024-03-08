@@ -1,6 +1,8 @@
 """
 Generfstudio data configuration file.
 """
+import faulthandler
+import signal
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
@@ -12,15 +14,19 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
+from generfstudio.adamw_optimizer_config import AdamWOptimizerConfig
 from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
     NeighboringViewsDatamanager
 from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 from generfstudio.data.datasets.masked_dataset import MaskedDataset
 from generfstudio.data.datasets.neighboring_views_dataset import NeighboringViewsDataset
+from generfstudio.models.mv_diffusion import MVDiffusionConfig
 from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
-from generfstudio.models.pixelnerf_model import PixelNeRFModelConfig
+from generfstudio.models.pixelnerf import PixelNeRFModelConfig
 from generfstudio.models.splatfacto_sds import SplatfactoSDSModelConfig
+
+faulthandler.register(signal.SIGUSR1)
 
 nerfacto_sds_method = MethodSpecification(
     config=TrainerConfig(
@@ -130,7 +136,8 @@ pixelnerf_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                dataparser=DTUDataParserConfig(scene_id=None),
+                dataparser=DTUDataParserConfig(scene_id=None, auto_orient=False, crop=None),
+                rays_per_image=128,
             ),
             model=PixelNeRFModelConfig(),
         ),
@@ -144,4 +151,82 @@ pixelnerf_method = MethodSpecification(
         vis="viewer",
     ),
     description='PixelNeRF',
+)
+
+mv_diffusion_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="mv-diffusion",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=2000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000001,
+        mixed_precision=True,
+        log_gradients=True,
+        gradient_accumulation_steps={
+            "cond_encoder": 64,
+            "fields": 64
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                neighboring_views_size=3,
+                image_batch_size=4,
+                dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
+            ),
+            model=MVDiffusionConfig(cond_only=True),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-9, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+        vis="viewer",
+    ),
+    description='Training a multi-view diffusion model',
+)
+
+mv_diffusion_ddp_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="mv-diffusion-ddp",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=2000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000001,
+        mixed_precision=True,
+        log_gradients=True,
+        gradient_accumulation_steps={
+            "cond_encoder": 32,
+            "fields": 32
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                neighboring_views_size=3,
+                image_batch_size=1,
+                dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
+            ),
+            model=MVDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-9, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+        vis="viewer",
+    ),
+    description='Training a multi-view diffusion model',
 )

@@ -36,7 +36,10 @@ include = ["extern*", "generfstudio*"]
 nerfacto_sds = 'generfstudio.generfstudio_method_config:nerfacto_sds_method'
 splatfacto_sds = 'generfstudio.generfstudio_method_config:splatfacto_sds_method'
 pixelnerf = 'generfstudio.generfstudio_method_config:pixelnerf_method'
+mv_diffusion = 'generfstudio.generfstudio_method_config:mv_diffusion_method'
+mv_diffusion_ddp_method = 'generfstudio.generfstudio_method_config:mv_diffusion_ddp_method'
 
 [project.entry-points.'nerfstudio.dataparser_configs']
 dtu-data = 'generfstudio.generfstudio_data_config:dtu_dataparser'
+r10k-data = 'generfstudio.generfstudio_data_config:r10k_dataparser'
 sds-data = 'generfstudio.generfstudio_data_config:sds_dataparser'

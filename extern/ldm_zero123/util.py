@@ -210,7 +210,7 @@ class AdamWwithEMAandWings(optim.Optimizer):
                             p, memory_format=torch.preserve_format
                         )
                     # Exponential moving average of parameter values
-                    state["param_exp_avg"] = p.detach().float().clone()
+                    state["param_exp_avg"] = p.detach().clone()#float().clone()
 
                 exp_avgs.append(state["exp_avg"])
                 exp_avg_sqs.append(state["exp_avg_sq"])
@@ -243,7 +243,8 @@ class AdamWwithEMAandWings(optim.Optimizer):
             cur_ema_decay = min(ema_decay, 1 - state["step"] ** -ema_power)
             for param, ema_param in zip(params_with_grad, ema_params_with_grad):
                 ema_param.mul_(cur_ema_decay).add_(
-                    param.float(), alpha=1 - cur_ema_decay
+                    param, alpha=1 - cur_ema_decay
+                    # param.float(), alpha=1 - cur_ema_decay
                 )
 
         return loss

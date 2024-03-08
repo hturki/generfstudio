@@ -1,52 +1,110 @@
-from collections import defaultdict
+from __future__ import annotations
+
+import random
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Generic, Type, Tuple, Dict, get_origin, get_args, ForwardRef, cast, Union, Literal
+from pathlib import Path
+from typing import Dict, ForwardRef, Generic, List, Literal, Tuple, Type, Union, cast, get_args, get_origin, \
+    Callable, Any, Optional
 
-import numpy as np
 import torch
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.data.datamanagers.base_datamanager import TDataset
-from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
+from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
+from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
+from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
+from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
 from nerfstudio.model_components.ray_generators import RayGenerator
 from nerfstudio.utils.misc import get_orig_class
+from torch.nn import Parameter
+from torch.utils.data import DistributedSampler, DataLoader
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEIGHBORING_VIEW_IMAGES, \
-    NEIGHBORING_VIEW_CAMERAS, NEIGHBORING_VIEW_COUNT
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, \
+    NEIGHBORING_VIEW_INDICES
+from generfstudio.generfstudio_utils import repeat_interleave
 
 
 @dataclass
-class NeighboringViewsDatamanagerConfig(FullImageDatamanagerConfig):
+class NeighboringViewsDatamanagerConfig(DataManagerConfig):
     _target: Type = field(default_factory=lambda: NeighboringViewsDatamanager)
+
+    dataparser: AnnotatedDataParserUnion = field(default_factory=NerfstudioDataParserConfig)
+
+    camera_res_scale_factor: float = 1.0
 
     image_batch_size: int = 4
 
-    rays_per_image_batch_size: int = 128
-
     neighboring_views_size: int = 3
 
+    rays_per_image: Optional[int] = None
 
-class NeighboringViewsDatamanager(FullImageDatamanager, Generic[TDataset]):
+    collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
+
+
+class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
+    """
+    A datamanager that outputs full images and cameras instead of raybundles. This makes the
+    datamanager more lightweight since we don't have to do generate rays. Useful for full-image
+    training e.g. rasterization pipelines
+    """
+
     config: NeighboringViewsDatamanagerConfig
+    train_dataset: TDataset
+    eval_dataset: TDataset
 
     def __init__(
             self,
-            config: FullImageDatamanagerConfig,
+            config: NeighboringViewsDatamanagerConfig,
             device: Union[torch.device, str] = "cpu",
             test_mode: Literal["test", "val", "inference"] = "val",
             world_size: int = 1,
             local_rank: int = 0,
             **kwargs,
     ):
-        super().__init__(config, device, test_mode, world_size, local_rank, **kwargs)
-        # self.cur_image_batch = None
-        # self.cur_image_data = None
-        # self.cur_neighbor_cameras = None
-        # self.cur_image_batch_rays = None
-        # self.cur_ray_batch_index = None
+        self.config = config
+        self.device = device
+        self.world_size = world_size
+        self.local_rank = local_rank
+        self.test_mode = test_mode
+        self.test_split = "test" if test_mode in ["test", "inference"] else "val"
+        self.dataparser_config = self.config.dataparser
+        if self.config.data is not None:
+            self.config.dataparser.data = Path(self.config.data)
+        else:
+            self.config.data = self.config.dataparser.data
+        self.dataparser = self.dataparser_config.setup()
+        if test_mode == "inference":
+            self.dataparser.downscale_factor = 1  # Avoid opening images
+        self.includes_time = self.dataparser.includes_time
+
+        self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
+        self.train_dataset = self.create_train_dataset()
+        assert self.train_dataset.cameras.distortion_params is None
+        self.eval_dataset = self.create_eval_dataset()
+        assert self.eval_dataset.cameras.distortion_params is None
+
+        self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
+
+        super().__init__()
+
+    def create_train_dataset(self) -> TDataset:
+        """Sets up the data loaders for training"""
+        return self.dataset_type(
+            dataparser_outputs=self.train_dataparser_outputs,
+            scale_factor=self.config.camera_res_scale_factor,
+            neighboring_views_size=self.config.neighboring_views_size
+        )
+
+    def create_eval_dataset(self) -> TDataset:
+        """Sets up the data loaders for evaluation"""
+        return self.dataset_type(
+            dataparser_outputs=self.dataparser.get_dataparser_outputs(split=self.test_split),
+            scale_factor=self.config.camera_res_scale_factor,
+            neighboring_views_size=self.config.neighboring_views_size
+        )
 
     @cached_property
     def dataset_type(self) -> Type[TDataset]:
@@ -73,75 +131,131 @@ class NeighboringViewsDatamanager(FullImageDatamanager, Generic[TDataset]):
                         return cast(Type[TDataset], value)
         return default
 
+    def get_datapath(self) -> Path:
+        return self.config.dataparser.data
+
     def setup_train(self):
         super().setup_train()
-        self.train_ray_generator = RayGenerator(self.train_dataset.cameras.to(self.device))
+        self.set_train_loader()
+        if self.config.rays_per_image is not None:
+            self.train_ray_generator = RayGenerator(self.train_dataset.cameras.to(self.device))
 
-    def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
-        if len(self.train_unseen_cameras) > self.config.image_batch_size:
-            cur_image_batch = torch.IntTensor(np.random.choice(len(self.train_unseen_cameras),
-                                                               self.config.image_batch_size, replace=False))
+    # def setup_eval(self):
+    #     """Sets up the data loader for evaluation"""
+
+    def set_train_loader(self):
+        assert self.config.image_batch_size % self.world_size == 0
+        batch_size = self.config.image_batch_size // self.world_size
+
+        if self.world_size > 1:
+            # if self.train_sampler is not None:
+            #     epoch = self.train_sampler.epoch
+            self.train_sampler = DistributedSampler(self.train_dataset, self.world_size, self.local_rank)
+            # if self.train_sampler is not None:
+            #     self.train_sampler.set_epoch(epoch)
+
+            self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size,
+                                               sampler=self.train_sampler, num_workers=0,
+                                               pin_memory=True, collate_fn=self.config.collate_fn)
         else:
-            cur_image_batch = torch.IntTensor(np.arange(len(self.train_unseen_cameras)))
+            self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True,
+                                               num_workers=4, pin_memory=True, collate_fn=self.config.collate_fn)
 
-        neighboring_view_indices = []
-        data_list = defaultdict(list)
-        ray_indices = []
-        for image_index in cur_image_batch:
-            image_data = self.cached_train[image_index]
-            height = self.train_dataset.cameras.height[image_index].item()
-            width = self.train_dataset.cameras.width[image_index].item()
-            pixels_x = torch.randint(0, width, (self.config.rays_per_image_batch_size,))
-            pixels_y = torch.randint(0, height, (self.config.rays_per_image_batch_size,))
-            ray_indices.append(torch.cat(
-                [torch.full_like(pixels_x, image_index).unsqueeze(-1), pixels_y.unsqueeze(-1), pixels_x.unsqueeze(-1)],
-                -1))
+        self.iter_train_dataloader = iter(self.train_dataloader)
 
-            for key, val in image_data.items():
-                if key == NEIGHBORING_VIEW_INDICES:
-                    assert len(val) >= self.config.neighboring_views_size
-                    neighboring_view_indices.append(np.random.choice(val, self.config.neighboring_views_size,
-                                                                     replace=False))
+    @property
+    def fixed_indices_eval_dataloader(self) -> List[Tuple[Cameras, Dict]]:
+        """
+        Pretends to be the dataloader for evaluation, it returns a list of (camera, data) tuples
+        """
+        image_indices = [i for i in range(len(self.eval_dataset))]
+        data = []
+        cameras = []
+        for i in image_indices:
+            data.append(self.eval_dataset[i])
+            data[i]["image"] = data[i]["image"].to(self.device)
+            cameras.append(self.eval_dataset.cameras[i: i + 1])
 
-                elif isinstance(val, torch.Tensor):
-                    # Ensure that the data is the same as the image dimensions
-                    assert val.shape[0] == height
-                    assert val.shape[1] == width
-                    data_list[key].append(val[pixels_y, pixels_x])
+        return list(zip(cameras, data))
 
-        data = {}
-        for key, val in data_list.items():
-            data[key] = torch.cat(val)
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Get the param groups for the data manager.
+        Returns:
+            A list of dictionaries containing the data manager's param groups.
+        """
+        return {}
 
-        ray_bundle = self.train_ray_generator(torch.cat(ray_indices))
-        neighboring_view_indices = torch.LongTensor(neighboring_view_indices).view(-1)
+    def get_train_rays_per_batch(self):
+        # TODO: fix this to be the resolution of the last image rendered
+        return 800 * 800
 
-        ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES] = \
-            [deepcopy(self.cached_train[x]["image"]).to(self.device) for x in neighboring_view_indices]
+    def next_train(self, step: int) -> Tuple[Union[Cameras, RayBundle], Dict]:
+        data = next(self.iter_train_dataloader, None)
+        if data is None:
+            # self.set_train_loader()
+            self.iter_train_dataloader = iter(self.train_dataloader)
+            data = next(self.iter_train_dataloader)
 
-        ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS] = self.train_dataset.cameras[neighboring_view_indices].to(
+        if self.config.rays_per_image is not None:
+            batch_size, height, width = data["image"].shape[:3]
+            batch_indices = repeat_interleave(torch.arange(batch_size), self.config.rays_per_image)
+            pixels_x = torch.randint(0, width, (batch_size * self.config.rays_per_image,))
+            pixels_y = torch.randint(0, height, (batch_size * self.config.rays_per_image,))
+
+            full_data = data
+            data = {}
+            for key, val in full_data.items():
+                if key in {NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_INDICES, "image_idx"}:
+                    data[key] = val
+                else:
+                    data[key] = val[batch_indices, pixels_y, pixels_x].to(self.device)
+
+            to_return = self.train_ray_generator(
+                torch.cat([repeat_interleave(data["image_idx"], self.config.rays_per_image).unsqueeze(-1),
+                           pixels_y.unsqueeze(-1), pixels_x.unsqueeze(-1)], -1))
+            # to_return.metadata[NEIGHBORING_VIEW_COUNT] = self.config.neighboring_views_size
+        else:
+            data["image"] = data["image"].to(self.device)
+            to_return = self.train_dataset.cameras[data["image_idx"]].to(self.device)
+            if to_return.metadata is None:
+                to_return.metadata = {}
+
+        to_return.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device)
+        del data[NEIGHBORING_VIEW_IMAGES]
+
+        to_return.metadata[NEIGHBORING_VIEW_CAMERAS] = self.train_dataset.cameras[data[NEIGHBORING_VIEW_INDICES]].to(
             self.device)
-        ray_bundle.metadata[NEIGHBORING_VIEW_COUNT] = self.config.neighboring_views_size
+        del data[NEIGHBORING_VIEW_INDICES]
 
-        return ray_bundle, data
+        return to_return, data
 
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
         raise Exception()
-        # camera, data = super().next_eval(step)
-        # return self.with_neighboring_views(camera, data)
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
-        camera, data = super().next_eval_image(step)
-        neighboring_view_indices = data[NEIGHBORING_VIEW_INDICES]
-        del data[NEIGHBORING_VIEW_INDICES]
-        random_indices = neighboring_view_indices if len(neighboring_view_indices) <= self.config.neighboring_views_size \
-            else np.random.choice(neighboring_view_indices, self.config.neighboring_views_size, replace=False)
-        random_images = [deepcopy(self.cached_eval[x]["image"]).to(self.device) for x in random_indices]
-        random_cameras = self.eval_dataset.cameras[torch.LongTensor(random_indices)].to(self.device)
+        """Returns the next evaluation batch
+
+        Returns a Camera instead of raybundle
+
+        TODO: Make sure this logic is consistent with the vanilladatamanager"""
+        image_idx = self.eval_unseen_cameras.pop(random.randint(0, len(self.eval_unseen_cameras) - 1))
+        # Make sure to re-populate the unseen cameras list if we have exhausted it
+        if len(self.eval_unseen_cameras) == 0:
+            self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
+
+        data = deepcopy(self.eval_dataset[image_idx])
+        data["image"] = data["image"].to(self.device)
+        assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
+        camera = self.eval_dataset.cameras[image_idx:image_idx + 1].to(self.device)
         if camera.metadata is None:
             camera.metadata = {}
-        camera.metadata[NEIGHBORING_VIEW_IMAGES] = random_images
-        camera.metadata[NEIGHBORING_VIEW_CAMERAS] = random_cameras
-        camera.metadata[NEIGHBORING_VIEW_COUNT] = self.config.neighboring_views_size
+
+        data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device).unsqueeze(0)
+        camera.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES]
+        # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
+
+        camera.metadata[NEIGHBORING_VIEW_CAMERAS] = self.eval_dataset.cameras[
+            data[NEIGHBORING_VIEW_INDICES].unsqueeze(0)].to(self.device)
+        del data[NEIGHBORING_VIEW_INDICES]
 
         return camera, data

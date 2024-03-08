@@ -87,28 +87,28 @@ class SpatialEncoder(nn.Module):
         self.index_padding = index_padding
         self.upsample_interp = upsample_interp
 
-    def index(self, latent: torch.Tensor, latent_scaling: torch.Tensor, uv: torch.Tensor,
-              image_size: torch.Tensor) -> torch.Tensor:
-        """
-        Get pixel-aligned image features at 2D image coordinates
-        :param uv (NS, N, 2) image points (x,y)
-        :return (B, L, N) L is latent size
-        """
-        scale = latent_scaling / image_size
-        uv = uv * scale - 1.0
+    # def index(self, latent: torch.Tensor, latent_scaling: torch.Tensor, uv: torch.Tensor,
+    #           image_size: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Get pixel-aligned image features at 2D image coordinates
+    #     :param uv (NS, N, 2) image points (x,y)
+    #     :return (B, L, N) L is latent size
+    #     """
+    #     scale = latent_scaling / image_size
+    #     uv = uv * scale - 1.0
+    #
+    #     uv = uv.unsqueeze(2)  # (NS, N, 1, 2)
+    #     samples = F.grid_sample(
+    #         latent,
+    #         uv,
+    #         align_corners=True,
+    #         mode=self.index_interp,
+    #         padding_mode=self.index_padding,
+    #     )
+    #
+    #     return samples[:, :, :, 0]  # (B, C, N)
 
-        uv = uv.unsqueeze(2)  # (NS, N, 1, 2)
-        samples = F.grid_sample(
-            latent,
-            uv,
-            align_corners=True,
-            mode=self.index_interp,
-            padding_mode=self.index_padding,
-        )
-
-        return samples[:, :, :, 0]  # (B, C, N)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         For extracting ResNet's features
         :param x image (NS, 3, H, W)
@@ -155,8 +155,4 @@ class SpatialEncoder(nn.Module):
             )
 
         latent = torch.cat(latents, dim=1)
-
-        latent_scaling = torch.FloatTensor([latent.shape[-1], latent.shape[-2]]).to(latent.device)
-        latent_scaling = latent_scaling / (latent_scaling - 1) * 2.0
-
-        return latent, latent_scaling
+        return latent

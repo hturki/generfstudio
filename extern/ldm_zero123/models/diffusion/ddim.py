@@ -223,7 +223,8 @@ class DDIMSampler(object):
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         # print(f"Running DDIM Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc="DDIM Sampler", total=total_steps)
+        iterator = time_range
+        # iterator = tqdm(time_range, desc="DDIM Sampler", total=total_steps)
 
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
@@ -337,7 +338,7 @@ class DDIMSampler(object):
         # current prediction for x_0
         pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
 
-        print(t, sqrt_one_minus_at, a_t)
+        # print(t, sqrt_one_minus_at, a_t)
 
         if quantize_denoised:
             pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)

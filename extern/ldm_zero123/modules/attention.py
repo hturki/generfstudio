@@ -168,7 +168,7 @@ class CrossAttention(nn.Module):
         h = self.heads
 
         q = self.to_q(x)
-        context = default(context, x)
+        context = default(context, x).to(self.to_k.weight.dtype)
         k = self.to_k(context)
         v = self.to_v(context)
 
@@ -232,7 +232,7 @@ class BasicTransformerBlock(nn.Module):
     def _forward(self, x, context=None):
         x = (
             self.attn1(
-                self.norm1(x), context=context if self.disable_self_attn else None
+                self.norm1(x.to(self.norm1.weight.dtype)), context=context if self.disable_self_attn else None
             )
             + x
         )

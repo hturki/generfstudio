@@ -244,8 +244,10 @@ class ResBlock(TimestepBlock):
             ),
         )
 
+        self.identity_skip = False
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
+            self.identity_skip = True
         elif use_conv:
             self.skip_connection = conv_nd(
                 dims, channels, self.out_channels, 3, padding=1
@@ -272,8 +274,8 @@ class ResBlock(TimestepBlock):
             x = self.x_upd(x)
             h = in_conv(h)
         else:
-            h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+            h = self.in_layers(x.to(self.in_layers[-1].weight.dtype))
+        emb_out = self.emb_layers(emb.to(self.emb_layers[-1].weight.dtype)).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
@@ -284,7 +286,7 @@ class ResBlock(TimestepBlock):
         else:
             h = h + emb_out
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+        return self.skip_connection(x if self.identity_skip else x.to(self.skip_connection.weight.dtype)) + h
 
 
 class AttentionBlock(nn.Module):
@@ -381,7 +383,8 @@ class QKVAttentionLegacy(nn.Module):
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight, dim=-1)
+        # weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
 
@@ -415,7 +418,8 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, length),
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight, dim=-1)
+        # weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
 

@@ -474,7 +474,7 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
             # [""] denotes condition dropout for ucg
             device = self.model.visual.conv1.weight.device
             return torch.zeros(1, 768, device=device)
-        return self.model.encode_image(self.preprocess(x)).float()
+        return self.model.encode_image(self.preprocess(x))#.float()
 
     def encode(self, im):
         return self(im).unsqueeze(1)
@@ -534,7 +534,7 @@ class FrozenCLIPImageMutliEmbedder(AbstractEncoder):
         batch_tokens = []
         for im in x:
             patches = self.preprocess(im.unsqueeze(0))
-            tokens = self.model.encode_image(patches).float()
+            tokens = self.model.encode_image(patches)#.float()
             for t in tokens:
                 if random.random() < 0.1:
                     t *= 0

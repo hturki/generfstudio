@@ -62,8 +62,6 @@ class StableZero123(nn.Module):
         super().__init__()
 
         config = OmegaConf.load(pretrained_config)
-        # TODO: seems it cannot load into fp16...
-        # self.weights_dtype = torch.float32
         self.model = load_model_from_config(
             config,
             pretrained_model_name_or_path,

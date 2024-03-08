@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union, Type, Literal, Any, Optional
 
+import math
 import numpy as np
 import torch
 from nerfstudio.cameras.cameras import Cameras
@@ -13,7 +14,7 @@ from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.model_components.losses import MSELoss
-from nerfstudio.model_components.ray_samplers import UniformSampler, PDFSampler
+from nerfstudio.model_components.ray_samplers import UniformSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
     DepthRenderer,
@@ -27,11 +28,15 @@ from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
+from generfstudio.fields.ibrnet_field import IBRNetField
 from generfstudio.fields.image_encoder import ImageEncoder
 from generfstudio.fields.pixelnerf_field import PixelNeRFField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, LATENT, \
-    LATENT_SCALING, GLOBAL_LATENT, ENCODER, NEIGHBORING_VIEW_COUNT, DEFAULT_SCENE_METADATA
+from generfstudio.fields.unet import UNet
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, \
+    IMAGE_FEATURES, \
+    FEATURE_SCALING, GLOBAL_LATENT, NEIGHBORING_VIEW_COUNT, DEFAULT_SCENE_METADATA
 from generfstudio.pixelnerf_utils.pdf_and_depth_sampler import PDFAndDepthSampler
 
 CONSOLE = Console(width=120)
@@ -57,6 +62,9 @@ class PixelNeRFModelConfig(ModelConfig):
     freeze_encoder: bool = False
     """Freeze encoder weights during training"""
 
+    image_encoder_type: Literal["unet", "resnet", "dino"] = "resnet"
+    pixelnerf_type: Literal["ibrnet", "pixelnerf"] = "ibrnet"
+
     default_scene_view_count: int = 3
 
 
@@ -80,35 +88,52 @@ class PixelNeRFModel(Model):
         """Set the fields and modules."""
         super().populate_modules()
 
-        # # Disable the collider in Model since it will throw an exception when getting Cameras as the input
-        # self.collider = None
-
         near = self.near if self.near is not None else self.config.collider_params["near_plane"]
         far = self.far if self.far is not None else self.config.collider_params["far_plane"]
         self.collider = NearFarCollider(near_plane=near, far_plane=far)
 
-        self.encoder = SpatialEncoder()
+        if self.config.image_encoder_type == "resnet":
+            assert not self.config.freeze_encoder
+            self.encoder = SpatialEncoder()
+            encoder_dim = self.encoder.latent_size
+        elif self.config.image_encoder_type == "unet":
+            assert not self.config.freeze_encoder
+            encoder_dim = 128
+            self.encoder = UNet(in_channels=3, n_classes=encoder_dim)
+        elif self.config.image_encoder_type == "dino":
+            assert self.config.freeze_encoder
+            self.encoder = DinoV2Encoder()
+            encoder_dim = self.encoder.out_feature_dim
+        else:
+            raise Exception(self.config.image_encoder_type)
 
-        if self.config.use_global_encoder:
-            self.global_encoder = ImageEncoder()
+        if self.config.pixelnerf_type == "ibrnet":
+            assert not self.config.use_global_encoder
+            self.field_coarse = IBRNetField(encoder_dim, 0)
+            self.field_fine = IBRNetField(encoder_dim, 0)
+        elif self.config.pixelnerf_type == "pixelnerf":
+            if self.config.use_global_encoder:
+                self.global_encoder = ImageEncoder()
 
-        self.field_coarse = PixelNeRFField(
-            encoder_latent_size=self.encoder.latent_size,
-            global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
-            combine_layer=self.config.combine_layer,
-            use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
-            use_view_dirs=self.config.use_view_dirs,
-            normalize_z=self.config.normalize_z,
-            freeze_encoder=self.config.freeze_encoder)
+            self.field_coarse = PixelNeRFField(
+                encoder_latent_size=encoder_dim,
+                global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
+                out_feature_dim=0,
+                combine_layer=self.config.combine_layer,
+                use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
+                use_view_dirs=self.config.use_view_dirs,
+                normalize_z=self.config.normalize_z)
 
-        self.field_fine = PixelNeRFField(
-            encoder_latent_size=self.encoder.latent_size,
-            global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
-            combine_layer=self.config.combine_layer,
-            use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
-            use_view_dirs=self.config.use_view_dirs,
-            normalize_z=self.config.normalize_z,
-            freeze_encoder=self.config.freeze_encoder)
+            self.field_fine = PixelNeRFField(
+                encoder_latent_size=encoder_dim,
+                global_encoder_latent_size=self.global_encoder.latent_size if self.config.use_global_encoder else 0,
+                out_feature_dim=0,
+                combine_layer=self.config.combine_layer,
+                use_positional_encoding_xyz=self.config.use_positional_encoding_xyz,
+                use_view_dirs=self.config.use_view_dirs,
+                normalize_z=self.config.normalize_z)
+        else:
+            raise Exception(self.config.pixelnerf_type)
 
         # samplers
         self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
@@ -133,10 +158,11 @@ class PixelNeRFModel(Model):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        param_groups["fields"] = list(self.encoder.parameters()) + list(self.field_coarse.parameters()) + list(
-            self.field_fine.parameters())
-        if self.config.use_global_encoder:
-            param_groups["fields"] += list(self.global_encoder.parameters())
+        param_groups["fields"] = list(self.field_coarse.parameters()) + list(self.field_fine.parameters())
+        if not self.config.freeze_encoder:
+            param_groups["fields"] += list(self.encoder.parameters())
+            if self.config.use_global_encoder:
+                param_groups["fields"] += list(self.global_encoder.parameters())
 
         return param_groups
 
@@ -151,12 +177,11 @@ class PixelNeRFModel(Model):
         if camera.metadata is not None and NEIGHBORING_VIEW_CAMERAS in camera.metadata:
             ray_bundle_metadata = {}
 
-            ray_bundle_metadata[LATENT] = self._get_latents(camera.metadata[NEIGHBORING_VIEW_IMAGES])
+            ray_bundle_metadata[IMAGE_FEATURES] = self._get_latents(camera.metadata[NEIGHBORING_VIEW_IMAGES])
             del camera.metadata[NEIGHBORING_VIEW_IMAGES]
 
-            for key in [NEIGHBORING_VIEW_CAMERAS, NEIGHBORING_VIEW_COUNT]:
-                ray_bundle_metadata[key] = camera.metadata[key]
-                del camera.metadata[key]
+            ray_bundle_metadata[NEIGHBORING_VIEW_CAMERAS] = camera.metadata[NEIGHBORING_VIEW_CAMERAS]
+            del camera.metadata[NEIGHBORING_VIEW_CAMERAS]
         else:
             if self.default_scene_latents is None:
                 neighboring_views = np.linspace(0, len(self.default_scene.cameras) - 1,
@@ -169,17 +194,24 @@ class PixelNeRFModel(Model):
                     torch.LongTensor(neighboring_views)].to(self.device)
 
             ray_bundle_metadata = self.default_scene_metadata
-            ray_bundle_metadata[LATENT] = self.default_scene_latents
+            ray_bundle_metadata[IMAGE_FEATURES] = self.default_scene_latents
 
         ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
         return self.get_outputs_for_camera_ray_bundle(ray_bundle, ray_bundle_metadata)
 
-    def _get_latents(self, neighboring_view_images: List[torch.Tensor]) -> Tuple:
-        neighboring_view_images = torch.cat([x.permute(2, 0, 1).unsqueeze(0) for x in neighboring_view_images])
+    def _get_latents(self, neighboring_view_images: torch.Tensor) -> Tuple:
+        latent = self.encoder(neighboring_view_images.view(-1, *neighboring_view_images.shape[2:]).permute(0, 3, 1, 2))
+        if self.config.freeze_encoder:
+            latent = latent.detach()
 
-        latent, latent_scaling = self.encoder(neighboring_view_images)
+        latent_scaling = torch.FloatTensor([latent.shape[-1], latent.shape[-2]]).to(latent.device)
+        latent_scaling = latent_scaling / (latent_scaling - 1) * 2.0
+
         if self.config.use_global_encoder:
             global_latent = self.global_encoder(neighboring_view_images)
+            if self.config.freeze_encoder:
+                global_latent = global_latent.detach()
+
             latents = (latent, latent_scaling, global_latent)
         else:
             latents = (latent, latent_scaling)
@@ -219,9 +251,9 @@ class PixelNeRFModel(Model):
         return outputs
 
     def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
-        if LATENT in ray_bundle.metadata:
-            latents = ray_bundle.metadata[LATENT]
-            del ray_bundle.metadata[LATENT]
+        if IMAGE_FEATURES in ray_bundle.metadata:
+            latents = ray_bundle.metadata[IMAGE_FEATURES]
+            del ray_bundle.metadata[IMAGE_FEATURES]
         else:
             latents = self._get_latents(ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES])
             del ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES]
@@ -234,15 +266,18 @@ class PixelNeRFModel(Model):
         neighboring_view_cameras = ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
         del ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
 
-        neighboring_view_count = ray_bundle.metadata[NEIGHBORING_VIEW_COUNT]
-        del ray_bundle.metadata[NEIGHBORING_VIEW_COUNT]
+        # neighboring_view_count = neighboring_view_cameras.shape[-1]
 
         ray_sample_metadata = {}
         ray_sample_metadata[NEIGHBORING_VIEW_CAMERAS] = neighboring_view_cameras
-        ray_sample_metadata[NEIGHBORING_VIEW_COUNT] = neighboring_view_count
-        ray_sample_metadata[ENCODER] = self.encoder
-        ray_sample_metadata[LATENT] = latent
-        ray_sample_metadata[LATENT_SCALING] = latent_scaling
+        # ray_sample_metadata[NEIGHBORING_VIEW_COUNT] = neighboring_view_count
+        ray_sample_metadata[IMAGE_FEATURES] = latent
+
+        # TODO: This assumes that all camera views have the same dimensions
+        width = neighboring_view_cameras.width[0, 0].item()
+        height = neighboring_view_cameras.height[0, 0].item()
+        ray_sample_metadata[FEATURE_SCALING] = latent_scaling / torch.FloatTensor([width, height]).to(self.device)
+
         if self.config.use_global_encoder:
             ray_sample_metadata[GLOBAL_LATENT] = global_latent
 
@@ -308,6 +343,11 @@ class PixelNeRFModel(Model):
 
         loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
+
+        for key, val in loss_dict.items():
+            if not math.isfinite(val):
+                raise Exception(f"Loss is not finite: {loss_dict}")
+
         return loss_dict
 
     def get_image_metrics_and_images(
@@ -323,14 +363,10 @@ class PixelNeRFModel(Model):
         depth_coarse = colormaps.apply_depth_colormap(
             outputs["depth_coarse"],
             accumulation=outputs["accumulation_coarse"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
         )
         depth_fine = colormaps.apply_depth_colormap(
             outputs["depth_fine"],
             accumulation=outputs["accumulation_fine"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
         )
 
         combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)

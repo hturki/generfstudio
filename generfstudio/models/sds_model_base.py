@@ -88,8 +88,9 @@ class SDSModelBase(Model):
         azimuth_deg = torch.rad2deg(azimuth_rad)
 
         CONSOLE.log(f"Cond image elevation {elevation_deg} azimuth {azimuth_deg}")
-        self._diffusion_model.prepare_embeddings(self.train_image_filenames[-1], elevation_deg.item(),
-                                                 azimuth_deg.item())
+        self._diffusion_model.prepare_embeddings(self.train_image_filenames[-1], 5, 0)
+                                                 # elevation_deg.item(),
+                                                 # azimuth_deg.item())
 
         self.random_camera_dim = self.config.random_camera_dims[0]
         self.random_camera_batch_size = self.config.random_camera_batch_sizes[0]

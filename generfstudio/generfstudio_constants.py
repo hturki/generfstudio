@@ -3,10 +3,9 @@ FAR = "far"
 
 FG_MASK = "fg_mask"
 
-ENCODER = "encoder"
 GLOBAL_LATENT = "global_latent"
-LATENT = "latent"
-LATENT_SCALING = "latent_scaling"
+IMAGE_FEATURES = "image_features"
+FEATURE_SCALING = "feature_scaling"
 NEIGHBORING_VIEW_INDICES = "neighboring_view_indices"
 NEIGHBORING_VIEW_IMAGES = "neighboring_view_images"
 NEIGHBORING_VIEW_CAMERAS = "neighboring_view_cameras"

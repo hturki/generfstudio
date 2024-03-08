@@ -388,7 +388,7 @@ class DDPM(pl.LightningModule):
         )
         noise = noise_like(x.shape, device, repeat_noise)
         # no noise when t == 0
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        nonzero_mask = (1 - (t == 0).to(x.dtype)).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
@@ -489,7 +489,7 @@ class DDPM(pl.LightningModule):
         if len(x.shape) == 3:
             x = x[..., None]
         x = rearrange(x, "b h w c -> b c h w")
-        x = x.to(memory_format=torch.contiguous_format).float()
+        x = x.to(memory_format=torch.contiguous_format) #.float()
         return x
 
     def shared_step(self, batch):
@@ -930,7 +930,7 @@ class LatentDiffusion(DDPM):
         uncond=0.05,
     ):
         x = super().get_input(batch, k)
-        T = batch["T"].to(memory_format=torch.contiguous_format).float()
+        T = batch["T"].to(memory_format=torch.contiguous_format) #.float()
 
         if bs is not None:
             x = x[:bs]
@@ -949,7 +949,7 @@ class LatentDiffusion(DDPM):
         random = torch.rand(x.size(0), device=x.device)
         prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
         input_mask = 1 - rearrange(
-            (random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1"
+            (random >= uncond).to(x.dtype) * (random < 3 * uncond).to(T.dtype), "n -> n 1 1 1"
         )
         null_prompt = self.get_learned_conditioning([""])
 
@@ -1114,7 +1114,7 @@ class LatentDiffusion(DDPM):
             #     c = self.get_learned_conditioning(c)
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
-                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c)) #.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
@@ -1129,7 +1129,7 @@ class LatentDiffusion(DDPM):
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
         if isinstance(cond, dict):
-            # hybrid case, cond is exptected to be a dict
+            # hybrid case, cond is expected to be a dict
             pass
         else:
             if not isinstance(cond, list):
@@ -1407,7 +1407,7 @@ class LatentDiffusion(DDPM):
         if noise_dropout > 0.0:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         # no noise when t == 0
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        nonzero_mask = (1 - (t == 0).to(x.dtype)).reshape(b, *((1,) * (len(x.shape) - 1)))
 
         if return_codebook_ids:
             return model_mean + nonzero_mask * (
@@ -1915,7 +1915,7 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def to_rgb(self, x):
-        x = x.float()
+        # x = x.float()
         if not hasattr(self, "colorize"):
             self.colorize = torch.randn(3, x.shape[1], 1, 1).to(x)
         x = nn.functional.conv2d(x, weight=self.colorize)
@@ -1998,7 +1998,7 @@ class LatentUpscaleDiffusion(LatentDiffusion):
             )
         x_low = batch[self.low_scale_key][:bs]
         x_low = rearrange(x_low, "b h w c -> b c h w")
-        x_low = x_low.to(memory_format=torch.contiguous_format).float()
+        x_low = x_low.to(memory_format=torch.contiguous_format)#.float()
         zx, noise_level = self.low_scale_model(x_low)
         all_conds = {"c_concat": [zx], "c_crossattn": [c], "c_adm": noise_level}
         # import pudb; pu.db
@@ -2247,7 +2247,7 @@ class LatentInpaintDiffusion(LatentDiffusion):
             cc = (
                 rearrange(batch[ck], "b h w c -> b c h w")
                 .to(memory_format=torch.contiguous_format)
-                .float()
+                # .float()
             )
             if bs is not None:
                 cc = cc[:bs]
@@ -2383,7 +2383,7 @@ class LatentInpaintDiffusion(LatentDiffusion):
         log["masked_image"] = (
             rearrange(batch["masked_image"], "b h w c -> b c h w")
             .to(memory_format=torch.contiguous_format)
-            .float()
+            # .float()
         )
         return log
 
@@ -2436,7 +2436,7 @@ class SimpleUpscaleDiffusion(LatentDiffusion):
             )
         x_low = batch[self.low_scale_key][:bs]
         x_low = rearrange(x_low, "b h w c -> b c h w")
-        x_low = x_low.to(memory_format=torch.contiguous_format).float()
+        x_low = x_low.to(memory_format=torch.contiguous_format)#.float()
 
         encoder_posterior = self.encode_first_stage(x_low)
         zx = self.get_first_stage_encoding(encoder_posterior).detach()
@@ -2575,7 +2575,7 @@ class MultiCatFrameDiffusion(LatentDiffusion):
         for i in range(n):
             x_low = cat_conds[:, :, :, 3 * i : 3 * (i + 1)]
             x_low = rearrange(x_low, "b h w c -> b c h w")
-            x_low = x_low.to(memory_format=torch.contiguous_format).float()
+            x_low = x_low.to(memory_format=torch.contiguous_format)#.float()
             encoder_posterior = self.encode_first_stage(x_low)
             zx = self.get_first_stage_encoding(encoder_posterior).detach()
             cats.append(zx)

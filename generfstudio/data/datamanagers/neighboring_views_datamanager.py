@@ -192,7 +192,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     def next_train(self, step: int) -> Tuple[Union[Cameras, RayBundle], Dict]:
         data = next(self.iter_train_dataloader, None)
         if data is None:
-            # self.set_train_loader()
             self.iter_train_dataloader = iter(self.train_dataloader)
             data = next(self.iter_train_dataloader)
 
@@ -213,7 +212,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             to_return = self.train_ray_generator(
                 torch.cat([repeat_interleave(data["image_idx"], self.config.rays_per_image).unsqueeze(-1),
                            pixels_y.unsqueeze(-1), pixels_x.unsqueeze(-1)], -1))
-            # to_return.metadata[NEIGHBORING_VIEW_COUNT] = self.config.neighboring_views_size
         else:
             data["image"] = data["image"].to(self.device)
             to_return = self.train_dataset.cameras[data["image_idx"]].to(self.device)

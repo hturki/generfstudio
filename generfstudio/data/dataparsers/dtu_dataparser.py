@@ -156,6 +156,7 @@ class DTU(DataParser):
                     method="up",
                     center_method="none",
                 )
+
                 min_bounds = scene_poses[:, :3, 3].min(dim=0)[0]
                 max_bounds = scene_poses[:, :3, 3].max(dim=0)[0]
 
@@ -220,12 +221,16 @@ class DTU(DataParser):
 
         if self.config.auto_orient:
             pose_scale_factors = torch.FloatTensor(pose_scale_factors)
+            # The poses seem to be identical across scenes in DTU anyways
             metadata[NEAR] = metadata[NEAR] / pose_scale_factors.max()
             metadata[FAR] = metadata[FAR] / pose_scale_factors.min()
             CONSOLE.log(
                 f"Scaled ray bounds {metadata[NEAR]} {metadata[FAR]} from pose_scale_factors {pose_scale_factors.min()} {pose_scale_factors.max()}")
 
         if neighboring_views is not None:
+            for image_filename, neighbors in zip(image_filenames, neighboring_views):
+                for neighbor in neighbors:
+                    assert image_filename.parent.parent == image_filenames[neighbor].parent.parent
             metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
 
         if (not get_default_scene) and self.config.scene_id is None:

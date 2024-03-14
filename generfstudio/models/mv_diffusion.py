@@ -3,15 +3,14 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Union, Type, Optional, Literal
+from typing import Dict, List, Tuple, Union, Type, Optional, Literal, Any
 
-import math
 import torch
 import torch.nn.functional as F
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
-from nerfstudio.model_components.ray_samplers import UniformLinDispPiecewiseSampler
+from nerfstudio.model_components.ray_samplers import UniformSampler, UniformLinDispPiecewiseSampler
 from nerfstudio.model_components.renderers import RGBRenderer, DepthRenderer, SemanticRenderer, AccumulationRenderer
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
@@ -31,7 +30,7 @@ from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.fields.unet import UNet
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR
 
 CONSOLE = Console(width=120)
 
@@ -65,85 +64,79 @@ class MVDiffusionConfig(ModelConfig):
     freeze_cond_image_encoder: bool = False
 
 
-def cartesian_to_spherical(xyz):
-    xy = xyz[:, 0] ** 2 + xyz[:, 1] ** 2
-    z = torch.sqrt(xy + xyz[:, 2] ** 2)
-    theta = torch.arctan2(torch.sqrt(xy), xyz[:, 2])  # for elevation angle defined from Z-axis down
-    azimuth = torch.arctan2(xyz[:, 1], xyz[:, 0])
-    return theta, azimuth, z
-
-
-def get_T(T_target, T_cond):
-    theta_cond, azimuth_cond, z_cond = cartesian_to_spherical(T_cond)
-    theta_target, azimuth_target, z_target = cartesian_to_spherical(T_target)
-
-    d_theta = theta_target - theta_cond
-    d_azimuth = (azimuth_target - azimuth_cond) % (2 * math.pi)
-    d_z = z_target - z_cond
-
-    d_T = torch.stack([d_theta, torch.sin(d_azimuth), torch.cos(d_azimuth), d_z], dim=-1)
-    return d_T
-
-
 class MVDiffusion(Model):
     config: MVDiffusionConfig
+
+    def __init__(self, config: MVDiffusionConfig, metadata: Dict[str, Any], **kwargs) -> None:
+        self.near = metadata.get(NEAR, None)
+        self.far = metadata.get(FAR, None)
+        if self.near is not None or self.far is not None:
+            CONSOLE.log(f"Using near and far bounds {self.near} {self.far} from metadata")
+
+        super().__init__(config=config, **kwargs)
 
     def populate_modules(self):
         """Set the fields and modules."""
         super().populate_modules()
         self.collider = None
 
-        config = OmegaConf.load(self.config.diffusion_config)
+        if not self.config.cond_only:
+            config = OmegaConf.load(self.config.diffusion_config)
 
-        # Need to prefix with underscore or else the nerfstudio viewer will throw an exception
-        self._model = instantiate_from_config(config.model)
-        self._model.cc_projection = None
+            # Need to prefix with underscore or else the nerfstudio viewer will throw an exception
+            self._model = instantiate_from_config(config.model)
+            self._model.cc_projection = None
 
-        if self.config.concat_crossattn_with_null_prompt:
-            self.cc_projection = nn.Linear(768 * 2, 768)
-            nn.init.eye_(list(self.cc_projection.parameters())[0][:768, :768])
-            nn.init.zeros_(list(self.cc_projection.parameters())[1])
+            if self.config.concat_crossattn_with_null_prompt:
+                self.cc_projection = nn.Linear(768 * 2, 768)
+                nn.init.eye_(list(self.cc_projection.parameters())[0][:768, :768])
+                nn.init.zeros_(list(self.cc_projection.parameters())[1])
 
-        old_state = torch.load(self.config.diffusion_checkpoint_path, map_location="cpu")
-        if "state_dict" in old_state:
-            CONSOLE.log("Found nested key 'state_dict' in checkpoint, loading this instead")
-            old_state = old_state["state_dict"]
+            old_state = torch.load(self.config.diffusion_checkpoint_path, map_location="cpu")
+            if "state_dict" in old_state:
+                CONSOLE.log("Found nested key 'state_dict' in checkpoint, loading this instead")
+                old_state = old_state["state_dict"]
 
-            # Check if we need to port weights from 4ch input to 8ch
-            in_filters_load = old_state["model.diffusion_model.input_blocks.0.0.weight"]
-            new_state = self._model.state_dict()
-            in_filters_current = new_state["model.diffusion_model.input_blocks.0.0.weight"]
-            in_shape = in_filters_current.shape
-            if in_shape != in_filters_load.shape:
-                input_keys = [
-                    "model.diffusion_model.input_blocks.0.0.weight",
-                    "model_ema.diffusion_modelinput_blocks00weight",
-                ]
+                # Check if we need to port weights from 4ch input to 8ch
+                in_filters_load = old_state["model.diffusion_model.input_blocks.0.0.weight"]
+                new_state = self._model.state_dict()
+                in_filters_current = new_state["model.diffusion_model.input_blocks.0.0.weight"]
+                in_shape = in_filters_current.shape
+                if in_shape != in_filters_load.shape:
+                    input_keys = [
+                        "model.diffusion_model.input_blocks.0.0.weight",
+                        "model_ema.diffusion_modelinput_blocks00weight",
+                    ]
 
-                for input_key in input_keys:
-                    if input_key not in old_state or input_key not in new_state:
-                        continue
-                    input_weight = new_state[input_key]
-                    if input_weight.size() != old_state[input_key].size():
-                        CONSOLE.log(f"Manual init: {input_key}")
-                        input_weight.zero_()
-                        input_weight[:, :old_state[input_key].shape[1], :, :].copy_(old_state[input_key])
-                        old_state[input_key] = torch.nn.parameter.Parameter(input_weight)
+                    for input_key in input_keys:
+                        if input_key not in old_state or input_key not in new_state:
+                            continue
+                        input_weight = new_state[input_key]
+                        if input_weight.size() != old_state[input_key].size():
+                            CONSOLE.log(f"Manual init: {input_key}")
+                            input_weight.zero_()
+                            input_weight[:, :old_state[input_key].shape[1], :, :].copy_(old_state[input_key])
+                            old_state[input_key] = torch.nn.parameter.Parameter(input_weight)
 
-            m, u = self._model.load_state_dict(old_state, strict=False)
+                m, u = self._model.load_state_dict(old_state, strict=False)
 
-            # if len(m) > 0:
-            #     CONSOLE.log("missing keys: \n", m)
-            # if len(u) > 0:
-            #     CONSOLE.log("unexpected keys: \n", u)
+                # if len(m) > 0:
+                #     CONSOLE.log("missing keys: \n", m)
+                # if len(u) > 0:
+                #     CONSOLE.log("unexpected keys: \n", u)
+
+                self.ddim_sampler = DDIMSampler(self._model)
+                self.register_buffer("null_prompt", self._model.get_learned_conditioning([""]).detach(),
+                                     persistent=False)
 
         if self.config.cond_image_encoder_type == "resnet":
             self.cond_image_encoder = SpatialEncoder()
             encoder_dim = self.cond_image_encoder.latent_size
+            self.cond_image_encoder = torch.compile(self.cond_image_encoder)
         elif self.config.cond_image_encoder_type == "unet":
             assert not self.config.freeze_cond_image_encoder
             encoder_dim = 128
-            self.cond_image_encoder = UNet(in_channels=3, n_classes=encoder_dim)
+            self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
         elif self.config.cond_image_encoder_type == "dino":
             assert self.config.freeze_cond_image_encoder
             self.cond_image_encoder = DinoV2Encoder()
@@ -161,14 +154,15 @@ class MVDiffusion(Model):
         else:
             raise Exception(self.config.pixelnerf_type)
 
-        self.ray_collider = NearFarCollider(0.1, 5)  # NearFarCollider(0.5, 1000)
+        near = self.near if self.near is not None else self.config.collider_params["near_plane"]
+        far = self.far if self.far is not None else self.config.collider_params["far_plane"]
+        self.ray_collider = NearFarCollider(near_plane=near, far_plane=far)
+
         self.ray_sampler = UniformLinDispPiecewiseSampler(num_samples=self.config.num_ray_samples)
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_depth = DepthRenderer(method="expected")
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_features = SemanticRenderer()
-
-        self.ddim_sampler = DDIMSampler(self._model)
 
         # metrics
         self.rgb_loss = MSELoss()
@@ -178,20 +172,23 @@ class MVDiffusion(Model):
         for p in self.lpips.parameters():
             p.requires_grad_(False)
 
-        self.register_buffer("null_prompt", self._model.get_learned_conditioning([""]).detach(), persistent=False)
-
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
         if not self.config.freeze_cond_image_encoder:
             param_groups["cond_encoder"] += list(self.cond_image_encoder.parameters())
-        param_groups["fields"] = list(self._model.parameters())
+
+        if not self.config.cond_only:
+            param_groups["fields"] = list(self._model.parameters())
 
         return param_groups
 
     def get_training_callbacks(
             self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
+        if self.config.cond_only:
+            return []
+
         def set_ema(step: int):
             if self._model.use_ema:
                 self._model.model_ema(self._model.model)
@@ -211,13 +208,14 @@ class MVDiffusion(Model):
             cond_features = cond_features.detach()
 
         feature_scaling = torch.FloatTensor([cond_features.shape[-1], cond_features.shape[-2]]).to(cond_features.device)
-        feature_scaling = 2.0 / feature_scaling / (feature_scaling - 1)
+        feature_scaling = feature_scaling / (feature_scaling - 1) * 2.0
         uv_scaling = feature_scaling / torch.FloatTensor([image_cond.shape[-1], image_cond.shape[-2]]).to(
             feature_scaling)
 
         target_cameras = deepcopy(cameras)
         target_cameras.metadata = {}
-        target_cameras.rescale_output_resolution(self._model.image_size / cameras.height[0, 0].item())
+        image_size = 32 if self.config.cond_only else self._model.image_size
+        target_cameras.rescale_output_resolution(image_size / cameras.height[0, 0].item())
 
         neighboring_view_cameras = cameras.metadata[NEIGHBORING_VIEW_CAMERAS]
         cam_cond = neighboring_view_cameras.camera_to_worlds.view(-1, 3, 4)
@@ -232,7 +230,7 @@ class MVDiffusion(Model):
             accumulations = []
 
         # cameras_per_chunk = self.config.eval_num_rays_per_chunk // (self._model.image_size * self._model.image_size)
-        cameras_per_chunk = 8
+        cameras_per_chunk = 1
         for start_index in range(0, len(target_cameras), cameras_per_chunk):
             end_index = min(start_index + cameras_per_chunk, len(target_cameras))
             chunk_indices = torch.arange(start_index, end_index).view(-1, 1)
@@ -258,13 +256,13 @@ class MVDiffusion(Model):
                 depths.append(self.renderer_depth(weights=weights, ray_samples=ray_samples))
                 accumulations.append(self.renderer_accumulation(weights=weights))
 
-        rgbs = torch.cat(rgbs).view(image_cond.shape[0], self._model.image_size, self._model.image_size, 3)
-        features = torch.cat(features).view(image_cond.shape[0], self._model.image_size, self._model.image_size, -1)
+        rgbs = torch.cat(rgbs).view(image_cond.shape[0], image_size, image_size, 3)
+        features = torch.cat(features).view(image_cond.shape[0], image_size, image_size, -1)
 
         if not self.training:
-            depths = torch.cat(depths).view(image_cond.shape[0], self._model.image_size, self._model.image_size, 1)
-            accumulations = torch.cat(accumulations).view(image_cond.shape[0], self._model.image_size,
-                                                          self._model.image_size, 1)
+            depths = torch.cat(depths).view(image_cond.shape[0], image_size, image_size, 1)
+            accumulations = torch.cat(accumulations).view(image_cond.shape[0], image_size,
+                                                          image_size, 1)
             return rgbs, features, depths, accumulations
 
         return rgbs, features
@@ -272,23 +270,17 @@ class MVDiffusion(Model):
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         cam_cond = cameras.metadata[NEIGHBORING_VIEW_CAMERAS].camera_to_worlds
         neighboring_view_count = cam_cond.shape[1]
-        # cam_cond = cam_cond.view(-1, cam_cond.shape[2], cam_cond.shape[3])
-        # T = get_T(repeat_interleave(cameras.camera_to_worlds[..., 3], neighboring_view_count), cam_cond[..., 3])
 
-        # Map images from [0, 1] to [-1, 1]
-
-        image_cond = cameras.metadata[NEIGHBORING_VIEW_IMAGES].permute(0, 1, 4, 2, 3)  # * 2 - 1
+        image_cond = cameras.metadata[NEIGHBORING_VIEW_IMAGES].permute(0, 1, 4, 2, 3)
         cond_features = self.get_cond_features(cameras, image_cond)
 
-        # Move to [-1, 1] for CLIP
-        image_cond = image_cond * 2 - 1
-
         outputs = {}
-        if not self.training:
+        is_training = (not torch.is_inference_mode_enabled()) and self.training
+        if not is_training:
             rgbs, features, depths, accumulations = cond_features
-            outputs["depth"] = depths.view(cam_cond.shape[0], self._model.image_size, self._model.image_size, 1)
-            outputs["accumulation"] = accumulations.view(cam_cond.shape[0], self._model.image_size,
-                                                         self._model.image_size, 1)
+            image_size = 32 if self.config.cond_only else self._model.image_size
+            outputs["depth"] = depths.view(cam_cond.shape[0], image_size, image_size, 1)
+            outputs["accumulation"] = accumulations.view(cam_cond.shape[0], image_size, image_size, 1)
         else:
             rgbs, features = cond_features
 
@@ -298,15 +290,15 @@ class MVDiffusion(Model):
             return outputs
 
         # Get CLIP embeddings for cross attention
+        # Move to [-1, 1] for CLIP
+        image_cond = image_cond * 2 - 1
         c_crossattn = self._model.get_learned_conditioning(image_cond.view(-1, *image_cond.shape[2:])).detach()
         c_crossattn = c_crossattn.view(-1, neighboring_view_count, c_crossattn.shape[-1])
 
         c_concat = torch.cat([rgbs.permute(0, 3, 1, 2), features.permute(0, 3, 1, 2)], 1)
-        # c_concat = self._model.encode_first_stage(image_cond[:, 0].to(self.device)).mode().detach()
 
-        if self.training:
+        if is_training:
             # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
-            # null_prompt = self._model.get_learned_conditioning([""]).detach()
             random_mask = torch.rand((image_cond.shape[0], 1, 1), device=image_cond.device)
             prompt_mask = random_mask < 2 * self.config.uncond
             input_mask = torch.logical_not(
@@ -321,7 +313,7 @@ class MVDiffusion(Model):
                 torch.cat([self.null_prompt.expand(c_crossattn.shape[0], c_crossattn.shape[1], -1), c_crossattn],
                           dim=-1))
 
-        if not self.training:
+        if not is_training:
             with self._model.ema_scope():
                 n_samples = 4
                 cond = {}
@@ -346,7 +338,7 @@ class MVDiffusion(Model):
 
         return outputs
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
         return self.get_outputs(camera)
 
@@ -355,7 +347,10 @@ class MVDiffusion(Model):
 
         image = batch["image"].to(self.device)
         cond_rgb = outputs["rgb"]
-        downsampled_image = F.interpolate(image.permute(0, 3, 1, 2), cond_rgb.shape[1:3]).permute(0, 2, 3, 1)
+        with torch.no_grad():
+            downsampled_image = F.interpolate(image.permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
+                                              antialias=True).permute(0, 2, 3, 1)
+
         metrics_dict = {
             "loss_cond_image": self.rgb_loss(downsampled_image, cond_rgb),
             "psnr_cond_image": self.psnr(downsampled_image, cond_rgb)
@@ -416,8 +411,8 @@ class MVDiffusion(Model):
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         image = batch["image"].to(outputs["rgb"].device)
         cond_rgb = outputs["rgb"]
-        downsampled_image = F.interpolate(image.unsqueeze(0).permute(0, 3, 1, 2), cond_rgb.shape[1:3]).permute(0, 2, 3,
-                                                                                                               1)
+        downsampled_image = F.interpolate(image.unsqueeze(0).permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
+                                          antialias=True).permute(0, 2, 3, 1)
         metrics_dict = {
             "psnr_cond_image": self.psnr(downsampled_image, cond_rgb)
         }

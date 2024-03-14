@@ -40,6 +40,8 @@ mv_diffusion = 'generfstudio.generfstudio_method_config:mv_diffusion_method'
 mv_diffusion_ddp_method = 'generfstudio.generfstudio_method_config:mv_diffusion_ddp_method'
 
 [project.entry-points.'nerfstudio.dataparser_configs']
+co3d-data = 'generfstudio.generfstudio_data_config:co3d_dataparser'
+dl3dv-data = 'generfstudio.generfstudio_data_config:dl3dv_dataparser'
 dtu-data = 'generfstudio.generfstudio_data_config:dtu_dataparser'
 r10k-data = 'generfstudio.generfstudio_data_config:r10k_dataparser'
 sds-data = 'generfstudio.generfstudio_data_config:sds_dataparser'

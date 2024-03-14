@@ -162,7 +162,7 @@ mv_diffusion_method = MethodSpecification(
         steps_per_eval_all_images=1000000,
         max_num_iterations=1000001,
         mixed_precision=True,
-        log_gradients=True,
+        log_gradients=False,
         gradient_accumulation_steps={
             "cond_encoder": 64,
             "fields": 64
@@ -174,12 +174,12 @@ mv_diffusion_method = MethodSpecification(
                 image_batch_size=4,
                 dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
             ),
-            model=MVDiffusionConfig(cond_only=True),
+            model=MVDiffusionConfig(),
         ),
         optimizers={
             "cond_encoder": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-9, warmup_steps=100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
@@ -201,16 +201,16 @@ mv_diffusion_ddp_method = MethodSpecification(
         steps_per_eval_all_images=1000000,
         max_num_iterations=1000001,
         mixed_precision=True,
-        log_gradients=True,
+        log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 32,
-            "fields": 32
+            "cond_encoder": 16,
+            "fields": 16
         },
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                 neighboring_views_size=3,
-                image_batch_size=1,
+                image_batch_size=16,
                 dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
             ),
             model=MVDiffusionConfig(),
@@ -218,7 +218,7 @@ mv_diffusion_ddp_method = MethodSpecification(
         optimizers={
             "cond_encoder": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-9, warmup_steps=100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),

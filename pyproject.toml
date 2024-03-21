@@ -32,16 +32,19 @@ disable = [
 [tool.setuptools.packages.find]
 include = ["extern*", "generfstudio*"]
 
-[project.entry-points.'nerfstudio.method_configs']
-nerfacto_sds = 'generfstudio.generfstudio_method_config:nerfacto_sds_method'
-splatfacto_sds = 'generfstudio.generfstudio_method_config:splatfacto_sds_method'
-pixelnerf = 'generfstudio.generfstudio_method_config:pixelnerf_method'
-mv_diffusion = 'generfstudio.generfstudio_method_config:mv_diffusion_method'
-mv_diffusion_ddp_method = 'generfstudio.generfstudio_method_config:mv_diffusion_ddp_method'
+[project.entry-points."nerfstudio.method_configs"]
+nerfacto_sds = "generfstudio.generfstudio_method_config:nerfacto_sds_method"
+splatfacto_sds = "generfstudio.generfstudio_method_config:splatfacto_sds_method"
+pixelnerf = "generfstudio.generfstudio_method_config:pixelnerf_method"
+mv_diffusion = "generfstudio.generfstudio_method_config:mv_diffusion_method"
+mv_diffusion_union = "generfstudio.generfstudio_method_config:mv_diffusion_union_method"
+mv_diffusion_ddp = "generfstudio.generfstudio_method_config:mv_diffusion_ddp_method"
+mv_diffusion_union_ddp = "generfstudio.generfstudio_method_config:mv_diffusion_union_ddp_method"
 
-[project.entry-points.'nerfstudio.dataparser_configs']
-co3d-data = 'generfstudio.generfstudio_data_config:co3d_dataparser'
-dl3dv-data = 'generfstudio.generfstudio_data_config:dl3dv_dataparser'
-dtu-data = 'generfstudio.generfstudio_data_config:dtu_dataparser'
-r10k-data = 'generfstudio.generfstudio_data_config:r10k_dataparser'
-sds-data = 'generfstudio.generfstudio_data_config:sds_dataparser'
+[project.entry-points."nerfstudio.dataparser_configs"]
+co3d-data = "generfstudio.generfstudio_data_config:co3d_dataparser"
+dl3dv-data = "generfstudio.generfstudio_data_config:dl3dv_dataparser"
+dtu-data = "generfstudio.generfstudio_data_config:dtu_dataparser"
+mvimgnet-data = "generfstudio.generfstudio_data_config:mvimgnet_dataparser"
+r10k-data = "generfstudio.generfstudio_data_config:r10k_dataparser"
+sds-data = "generfstudio.generfstudio_data_config:sds_dataparser"

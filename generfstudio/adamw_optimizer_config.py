@@ -7,8 +7,6 @@ from nerfstudio.engine.optimizers import OptimizerConfig
 
 @dataclass
 class AdamWOptimizerConfig(OptimizerConfig):
-    """Basic optimizer config with RAdam"""
-
     _target: Type = torch.optim.AdamW
     weight_decay: float = 0
     """The weight decay to use."""

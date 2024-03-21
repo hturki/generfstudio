@@ -1,5 +1,6 @@
 from typing import Tuple, Optional, Dict
 
+import math
 import torch
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RaySamples
@@ -14,6 +15,7 @@ from torch.nn import functional as F
 
 from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_CAMERAS, IMAGE_FEATURES, FEATURE_SCALING
 from generfstudio.generfstudio_utils import repeat_interleave, get_pixel_aligned_features
+from generfstudio.pixelnerf_utils.scaled_nerf_encoding import ScaledNeRFEncoding
 
 CONSOLE = Console(width=120)
 
@@ -23,10 +25,11 @@ class IBRNetField(Field):
     def __init__(
             self,
             in_feature_dim: int = 128,
-            out_feature_dim: int = 128
+            out_feature_dim: int = 128,
+            positional_encoding_scale_factor: float = math.pi,
     ) -> None:
         super().__init__()
-        self.inner = IBRNetInnerField(in_feature_dim, out_feature_dim)
+        self.inner = IBRNetInnerField(in_feature_dim, out_feature_dim, positional_encoding_scale_factor)
         self.out_feature_dim = out_feature_dim
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
@@ -58,12 +61,14 @@ class IBRNetInnerField(nn.Module):
     def __init__(
             self,
             in_feature_dim: int = 128,
-            out_feature_dim: int = 128
+            out_feature_dim: int = 128,
+            positional_encoding_scale_factor: float = math.pi,
     ) -> None:
         super().__init__()
 
-        self.position_encoding = NeRFEncoding(
-            in_dim=3, num_frequencies=6, min_freq_exp=0.0, max_freq_exp=5.0, include_input=True
+        self.position_encoding = ScaledNeRFEncoding(
+            in_dim=3, num_frequencies=6, min_freq_exp=0.0, max_freq_exp=5.0, scale=positional_encoding_scale_factor,
+            include_input=True
         )
         self.feature_pool_mlp = MLP(in_dim=self.position_encoding.get_out_dim() + 3 * in_feature_dim, num_layers=2,
                                     layer_width=256, out_dim=128 + 1, implementation="torch")

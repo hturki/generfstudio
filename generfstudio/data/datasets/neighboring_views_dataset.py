@@ -11,7 +11,15 @@ from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEIGHB
 class NeighboringViewsDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0,
                  neighboring_views_size: int = 3):
-        super().__init__(dataparser_outputs, scale_factor)
+        # super().__init__(dataparser_outputs, scale_factor)
+        # Skip the deepcopy to save time
+        self._dataparser_outputs = dataparser_outputs
+        self.scale_factor = scale_factor
+        self.scene_box = dataparser_outputs.scene_box
+        self.metadata = dataparser_outputs.metadata
+        self.cameras = dataparser_outputs.cameras
+        self.cameras.rescale_output_resolution(scaling_factor=scale_factor)
+        self.mask_color = dataparser_outputs.metadata.get("mask_color", None)
         self.neighboring_views = self.metadata[NEIGHBORING_VIEW_INDICES]
         self.neighboring_views_size = neighboring_views_size
 

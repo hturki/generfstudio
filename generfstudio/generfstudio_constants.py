@@ -1,5 +1,6 @@
 NEAR = "near"
 FAR = "far"
+POSENC_SCALE = "posenc_scale"
 
 FG_MASK = "fg_mask"
 

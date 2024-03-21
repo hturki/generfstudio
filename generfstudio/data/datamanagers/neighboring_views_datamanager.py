@@ -45,12 +45,6 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
 
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
-    """
-    A datamanager that outputs full images and cameras instead of raybundles. This makes the
-    datamanager more lightweight since we don't have to do generate rays. Useful for full-image
-    training e.g. rasterization pipelines
-    """
-
     config: NeighboringViewsDatamanagerConfig
     train_dataset: TDataset
     eval_dataset: TDataset
@@ -155,7 +149,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             #     self.train_sampler.set_epoch(epoch)
 
             self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size,
-                                               sampler=self.train_sampler, num_workers=0,
+                                               sampler=self.train_sampler, num_workers=4,
                                                pin_memory=True, collate_fn=self.config.collate_fn)
         else:
             self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True,
@@ -224,6 +218,8 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         to_return.metadata[NEIGHBORING_VIEW_CAMERAS] = self.train_dataset.cameras[data[NEIGHBORING_VIEW_INDICES]].to(
             self.device)
         del data[NEIGHBORING_VIEW_INDICES]
+
+        to_return.metadata["image"] = data["image"] # Used in mv_diffusion - we need to calculate within forward for DDP
 
         return to_return, data
 

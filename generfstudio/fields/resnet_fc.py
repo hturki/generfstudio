@@ -181,7 +181,7 @@ class ResnetFC(nn.Module):
         return out
 
 
-@torch.compile
+# @torch.compile
 def combine_interleaved(t: torch.Tensor, inner_dims=(1,), agg_type="average") -> torch.Tensor:
     if len(inner_dims) == 1 and inner_dims[0] == 1:
         return t

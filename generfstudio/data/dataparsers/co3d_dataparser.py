@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -9,6 +8,7 @@ from pathlib import Path
 from typing import List
 from typing import Type, Optional, Tuple
 
+import math
 import torch
 from PIL import Image
 from co3d.dataset.data_types import (
@@ -22,7 +22,8 @@ from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fractio
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
+    POSENC_SCALE
 from generfstudio.generfstudio_utils import central_crop_v2
 
 PYTORCH_3D_TO_OPEN_CV = torch.diag(torch.FloatTensor([-1, -1, 1, 1]))
@@ -47,7 +48,9 @@ class CO3DDataParserConfig(DataParserConfig):
 
     default_scene_id: str = "hydrant/437_62405_122559"
 
-    crop: Optional[Tuple[int, int]] = (256, 256)
+    crop: Optional[int] = 256
+
+    scale_near: Optional[float] = None
 
     eval_sequences_per_category: int = 1
 
@@ -70,7 +73,7 @@ class CO3DDataParserConfig(DataParserConfig):
 #                 meta={'frame_type': 'test_unseen', 'frame_splits': ['singlesequence_apple_test_0_unseen'],
 #                       'eval_batch_maps': []})
 def convert_scene_metadata(source: Path, dest: Path, frame_annotations: List[FrameAnnotation],
-                           crop: Optional[Tuple[int, int]]) -> None:
+                           crop: Optional[int]) -> None:
     frames = []
 
     for frame_annotation in sorted(frame_annotations, key=lambda x: x.frame_number):
@@ -88,21 +91,6 @@ def convert_scene_metadata(source: Path, dest: Path, frame_annotations: List[Fra
         # opencv -> opengl
         image_c2w[:, 1:3] *= -1
 
-        # image_c2w = GROUND_PLANE_Z @ image_c2w
-
-        # T_pytorch3d[:2] *= -1
-        # R_pytorch3d[:, :2] *= -1
-        # tvec = T_pytorch3d
-        # R = R_pytorch3d#.T
-        # # image_c2w = torch.cat([R, tvec.unsqueeze(-1)], 1)
-        #
-        # image_w2c = torch.eye(4)
-        # image_w2c[:3] = torch.cat([R, tvec.unsqueeze(-1)], 1)
-        # image_c2w = image_w2c.inverse()[:3]
-        #
-        # # opencv -> opengl
-        # image_c2w[:, 1:3] *= -1
-
         # Retype the image_size correctly and flip to width, height.
         image_size_wh = torch.IntTensor(frame_annotation.image.size).flip(dims=(0,))
 
@@ -119,12 +107,12 @@ def convert_scene_metadata(source: Path, dest: Path, frame_annotations: List[Fra
             cropped_image = central_crop_v2(image)
             image_cx -= ((image.size[0] - cropped_image.size[0]) / 2)
             image_cy -= ((image.size[1] - cropped_image.size[1]) / 2)
-            image_cx *= (crop[0] / cropped_image.size[0])
-            image_cy *= (crop[1] / cropped_image.size[1])
-            image_fx *= (crop[0] / cropped_image.size[0])
-            image_fy *= (crop[1] / cropped_image.size[1])
+            image_cx *= (crop / cropped_image.size[0])
+            image_cy *= (crop / cropped_image.size[1])
+            image_fx *= (crop / cropped_image.size[0])
+            image_fy *= (crop / cropped_image.size[1])
 
-            image = cropped_image.resize(crop, resample=Image.LANCZOS)
+            image = cropped_image.resize((crop, crop), resample=Image.LANCZOS)
             image_path = dest / "images" / image_path.name
             image_path.parent.mkdir(exist_ok=True, parents=True)
             image.save(image_path)
@@ -155,6 +143,10 @@ class CO3D(DataParser):
     config: CO3DDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}.pt"
+        if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
+            return torch.load(cached_path)
+
         if get_default_scene:
             scenes = [self.config.default_scene_id]
         elif self.config.scene_id is not None:
@@ -191,8 +183,7 @@ class CO3D(DataParser):
         to_convert = []
         with ThreadPoolExecutor(max_workers=self.config.conversion_threads) as executor:
             for scene in tqdm(scenes):
-                crop_dir = f"crop-{self.config.crop[0]}-{self.config.crop[1]}" if self.config.crop is not None else "crop-none"
-                dest = self.config.data / crop_dir / scene
+                dest = self.config.data / f"crop-{self.config.crop}" / scene
                 converted_metadata_path = dest / "metadata.json"
                 if not converted_metadata_path.exists():
                     category = dest.parent.name
@@ -214,9 +205,9 @@ class CO3D(DataParser):
             for task in tqdm(to_convert):
                 task.result()
 
+        bounds_skipped = 0
         for scene in tqdm(scenes):
-            crop_dir = f"crop-{self.config.crop[0]}-{self.config.crop[1]}" if self.config.crop is not None else "crop-none"
-            dest = self.config.data / crop_dir / scene
+            dest = self.config.data / f"crop-{self.config.crop}" / scene
             converted_metadata_path = dest / "metadata.json"
 
             if not converted_metadata_path.exists():
@@ -226,17 +217,39 @@ class CO3D(DataParser):
             with converted_metadata_path.open() as f:
                 frames = json.load(f)["frames"]
 
-            scene_index_start = len(image_filenames)
-            scene_index_end = scene_index_start + len(frames)
             if len(frames) < 4:
                 CONSOLE.log(f"Skipping {scene} as it has less than 3 frames")
                 continue
 
-            unscaled_c2ws = []
+            scene_c2ws = []
+            for scene_image_index, frame in enumerate(frames):
+                c2w = torch.FloatTensor(frame["transform_matrix"])
+                scene_c2ws.append(c2w)
+
+            scene_c2ws = torch.stack(scene_c2ws)
+            scene_c2ws, transform = camera_utils.auto_orient_and_center_poses(
+                scene_c2ws,
+                method="up",
+                center_method="none",
+            )
+
+            # https://github.com/facebookresearch/co3d/issues/18
+            cam_distances = scene_c2ws[:, :3, 3].norm(dim=-1)
+            min_cam_distance = cam_distances.min()
+            max_cam_distance = cam_distances.max()
+
+            if min_cam_distance < 1 or max_cam_distance > 100:
+                CONSOLE.log(
+                    f"Skipping {scene} as camera distances seem incorrect {min_cam_distance} {max_cam_distance}")
+                bounds_skipped += 1
+                continue
+
+            c2ws.append(scene_c2ws)
+
+            scene_index_start = len(image_filenames)
+            scene_index_end = scene_index_start + len(frames)
             for scene_image_index, frame in enumerate(frames):
                 image_filenames.append(frame["file_path"])
-                c2w = torch.FloatTensor(frame["transform_matrix"])
-                unscaled_c2ws.append(c2w)
                 width.append(frame["w"])
                 height.append(frame["h"])
                 fx.append(frame["fl_x"])
@@ -248,27 +261,20 @@ class CO3D(DataParser):
                     list(range(scene_index_start, scene_index_start + scene_image_index))
                     + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
 
-            unscaled_c2ws = torch.stack(unscaled_c2ws)
-            unscaled_c2ws, transform = camera_utils.auto_orient_and_center_poses(
-                unscaled_c2ws,
-                method="up",
-                center_method="none",
-            )
-            unscaled_c2ws = unscaled_c2ws[:, :3]
+            near = (min_cam_distance - 8)
+            near = max(near, 0.01)  # Some scenes seem to be closer than 8
 
-            pose_scale_factor = unscaled_c2ws[:, :3, 3].norm(dim=-1).max()
-            # https://github.com/facebookresearch/co3d/issues/18
-            near = (unscaled_c2ws[:, :3, 3].norm(dim=-1).min() - 8) / pose_scale_factor
-            # if near <= 0:
-            #     import pdb; pdb.set_trace()
-            near = max(near, 0.1 / pose_scale_factor)
+            if self.config.scale_near is not None:
+                pose_scale_factor = near / self.config.scale_near
+                scene_c2ws[:, :3, 3] /= pose_scale_factor
+                near = self.config.scale_near
+            else:
+                pose_scale_factor = 1
+
             min_near = min(near, min_near)
-            max_far = max((pose_scale_factor + 8) / pose_scale_factor, max_far)
-            unscaled_c2ws[:, :3, 3] /= pose_scale_factor
-            c2ws.append(unscaled_c2ws)
+            max_far = max(max_cam_distance + 8 / pose_scale_factor, max_far)
 
         c2ws = torch.cat(c2ws)
-
         width = torch.LongTensor(width)
         height = torch.LongTensor(height)
         fx = torch.FloatTensor(fx)
@@ -276,10 +282,7 @@ class CO3D(DataParser):
         cx = torch.FloatTensor(cx)
         cy = torch.FloatTensor(cy)
 
-        # min_bounds = c2ws[:, :3, 3].min(dim=0)[0]
-        # max_bounds = c2ws[:, :3, 3].max(dim=0)[0]
-        # scene_box = SceneBox(aabb=1.1 * torch.stack([min_bounds, max_bounds]))
-        scene_box = SceneBox(aabb=torch.FloatTensor([[-1.1, -1.1, -1.1], [1.1, 1.1, 1.1]]))
+        scene_box = SceneBox(aabb=torch.FloatTensor([[-max_far, -max_far, -max_far], [max_far, max_far, max_far]]))
 
         if self.config.scene_id is not None:
             i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
@@ -315,9 +318,12 @@ class CO3D(DataParser):
             camera_type=CameraType.PERSPECTIVE,
         )
 
+        CONSOLE.log(f"Skipped {bounds_skipped} out of {len(scenes)} scenes due to camera bounds")
+
         metadata = {
             NEAR: min_near,
             FAR: max_far,
+            POSENC_SCALE: 1 / max_far,
         }
 
         if neighboring_views is not None:
@@ -332,5 +338,8 @@ class CO3D(DataParser):
             scene_box=scene_box,
             metadata=metadata
         )
+
+        if (not get_default_scene) and self.config.scene_id is None:
+            torch.save(dataparser_outputs, cached_path)
 
         return dataparser_outputs

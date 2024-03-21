@@ -15,6 +15,7 @@ from nerfstudio.model_components.renderers import RGBRenderer, DepthRenderer, Se
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps
+from nerfstudio.utils.comms import get_world_size
 from omegaconf import OmegaConf
 from pytorch_msssim import SSIM
 from rich.console import Console
@@ -30,7 +31,8 @@ from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.fields.unet import UNet
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, \
+    POSENC_SCALE
 
 CONSOLE = Console(width=120)
 
@@ -70,6 +72,7 @@ class MVDiffusion(Model):
     def __init__(self, config: MVDiffusionConfig, metadata: Dict[str, Any], **kwargs) -> None:
         self.near = metadata.get(NEAR, None)
         self.far = metadata.get(FAR, None)
+        self.posenc_scale = metadata[POSENC_SCALE]
         if self.near is not None or self.far is not None:
             CONSOLE.log(f"Using near and far bounds {self.near} {self.far} from metadata")
 
@@ -132,11 +135,11 @@ class MVDiffusion(Model):
         if self.config.cond_image_encoder_type == "resnet":
             self.cond_image_encoder = SpatialEncoder()
             encoder_dim = self.cond_image_encoder.latent_size
-            self.cond_image_encoder = torch.compile(self.cond_image_encoder)
+            # self.cond_image_encoder = torch.compile(self.cond_image_encoder)
         elif self.config.cond_image_encoder_type == "unet":
             assert not self.config.freeze_cond_image_encoder
             encoder_dim = 128
-            self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
+            # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
         elif self.config.cond_image_encoder_type == "dino":
             assert self.config.freeze_cond_image_encoder
             self.cond_image_encoder = DinoV2Encoder()
@@ -145,12 +148,14 @@ class MVDiffusion(Model):
             raise Exception(self.config.cond_image_encoder_type)
 
         if self.config.pixelnerf_type == "ibrnet":
-            self.cond_feature_field = IBRNetInnerField(encoder_dim, 128)
+            self.cond_feature_field = IBRNetInnerField(encoder_dim, 128,
+                                                       positional_encoding_scale_factor=self.posenc_scale)
         elif self.config.pixelnerf_type == "pixelnerf":
             self.cond_feature_field = PixelNeRFInnerField(
                 encoder_latent_size=encoder_dim,
                 global_encoder_latent_size=0,
-                out_feature_dim=128)
+                out_feature_dim=128,
+                positional_encoding_scale_factor=self.posenc_scale)
         else:
             raise Exception(self.config.pixelnerf_type)
 
@@ -171,6 +176,13 @@ class MVDiffusion(Model):
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
         for p in self.lpips.parameters():
             p.requires_grad_(False)
+
+        if get_world_size() > 1:
+            CONSOLE.log("Using sync batchnorm for DDP")
+            self._model = nn.SyncBatchNorm.convert_sync_batchnorm(self._model)
+            self.cond_feature_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_feature_field)
+            if not self.config.freeze_cond_image_encoder:
+                self.cond_image_encoder = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_image_encoder)
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
@@ -313,12 +325,30 @@ class MVDiffusion(Model):
                 torch.cat([self.null_prompt.expand(c_crossattn.shape[0], c_crossattn.shape[1], -1), c_crossattn],
                           dim=-1))
 
-        if not is_training:
+        if is_training:
+            # Hack - we include the gt image in the forward loop, so that all model calculation is done in the
+            # forward call as expected in DDP
+            encoder_posterior = self._model.encode_first_stage(cameras.metadata["image"].permute(0, 3, 1, 2) * 2 - 1)
+            z = self._model.get_first_stage_encoding(encoder_posterior).detach()
+            t = torch.randint(0, self._model.num_timesteps, (z.shape[0],), device=self.device).long()
+            outputs["t"] = t
+            noise = torch.randn_like(z)
+            x_noisy = self._model.q_sample(x_start=z, t=t, noise=noise)
+
+            cond = {"c_crossattn": [c_crossattn], "c_concat": [c_concat]}
+            outputs["model_output"] = self._model.apply_model(x_noisy, t, cond)
+
+            if self._model.parameterization == "x0":
+                outputs["target"] = z
+            elif self._model.parameterization == "eps":
+                outputs["target"] = noise
+            else:
+                raise NotImplementedError()
+        else:
             with self._model.ema_scope():
                 n_samples = 4
-                cond = {}
-                cond["c_crossattn"] = [c_crossattn.expand(n_samples, -1, -1)]
-                cond["c_concat"] = [c_concat.expand(n_samples, -1, -1, -1)]
+                cond = {"c_crossattn": [c_crossattn.expand(n_samples, -1, -1)],
+                        "c_concat": [c_concat.expand(n_samples, -1, -1, -1)]}
                 samples_ddim, _ = self.ddim_sampler.sample(S=self.config.ddim_steps,
                                                            conditioning=cond,
                                                            batch_size=n_samples,
@@ -333,12 +363,9 @@ class MVDiffusion(Model):
                 outputs["samples"] = x_samples_ddim.permute(0, 2, 3, 1)
                 return outputs
 
-        outputs["c_crossattn"] = [c_crossattn]
-        outputs["c_concat"] = [c_concat]
-
         return outputs
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
         return self.get_outputs(camera)
 
@@ -359,26 +386,12 @@ class MVDiffusion(Model):
         if self.config.cond_only:
             return metrics_dict
 
-        encoder_posterior = self._model.encode_first_stage(image.permute(0, 3, 1, 2) * 2 - 1)
-        z = self._model.get_first_stage_encoding(encoder_posterior).detach()
-        t = torch.randint(0, self._model.num_timesteps, (z.shape[0],), device=self.device).long()
-        noise = torch.randn_like(z)
-        x_noisy = self._model.q_sample(x_start=z, t=t, noise=noise)
-
-        cond = {"c_crossattn": outputs["c_crossattn"], "c_concat": outputs["c_concat"]}
-        model_output = self._model.apply_model(x_noisy, t, cond)
-
-        if self._model.parameterization == "x0":
-            target = z
-        elif self._model.parameterization == "eps":
-            target = noise
-        else:
-            raise NotImplementedError()
-
+        model_output = outputs["model_output"]
+        target = outputs["target"]
         loss_simple = self._model.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         metrics_dict["loss_simple"] = loss_simple.mean()
 
-        logvar_t = self._model.logvar.to(self.device)[t]
+        logvar_t = self._model.logvar.to(self.device)[outputs["t"]]
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         metrics_dict["loss_base"] = loss.mean()
         if self._model.learn_logvar:
@@ -457,7 +470,5 @@ class MVDiffusion(Model):
             metrics_dict[f"{key}/mean"] = torch.FloatTensor(val).mean()
 
         images_dict["img"] = combined_rgb
-
-        # torch.cuda.empty_cache()
 
         return metrics_dict, images_dict

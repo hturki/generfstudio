@@ -1,25 +1,26 @@
 from __future__ import annotations
 
 import json
-import traceback
+import math
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, Optional, Tuple
 
-import cv2
 import numpy as np
 import torch
-from PIL import Image
-from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
 from nerfstudio.utils.rich_utils import CONSOLE
+from torch_scatter import scatter_min
+from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA
-from generfstudio.generfstudio_utils import central_crop_v2
+from generfstudio.data.dataparsers.dataparser_utils import convert_from_inner, get_xyz_in_camera
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
+    POSENC_SCALE
 
 
 @dataclass
@@ -40,9 +41,65 @@ class DL3DVDataParserConfig(DataParserConfig):
 
     default_scene_id: str = "4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"
 
-    crop: Optional[Tuple[int, int]] = (256, 256)
+    crop: Optional[int] = 256
+
+    scale_near: Optional[float] = None
 
     eval_scene_count: int = 50
+
+    neighbor_overlap_threshold: Optional[float] = 0.5
+
+    conversion_threads: int = 64
+
+
+def convert_scene_metadata(source: Path, dest: Path, crop: Optional[int]) -> None:
+    # Assuming this is from 1080p version of DL3DV and not 4K
+    inner = NerfstudioDataParserConfig(data=source, downscale_factor=4, load_3D_points=True, eval_mode="all").setup()
+    inner_outputs = inner.get_dataparser_outputs("train")
+    frames = convert_from_inner(inner_outputs, dest, crop)
+
+    # The inner data parser already orients the poses
+    # c2ws, transform = camera_utils.auto_orient_and_center_poses(
+    #     c2ws,
+    #     method="up",
+    #     center_method="none",
+    # )
+
+    metadata = {"frames": frames}
+
+    if "points3D_xyz" in inner_outputs.metadata:
+        xyz_in_camera, uv, is_valid_points, width, height = get_xyz_in_camera(inner_outputs, frames)
+
+        max_val = torch.finfo(torch.float32).max
+        frame_points = []
+        for frame_index, frame in enumerate(frames):
+            depth_map = torch.full((height[frame_index], width[frame_index]), max_val)
+            frame_valid_points = is_valid_points[frame_index]
+            u = torch.round(uv[frame_index, :, 0][frame_valid_points]).long()
+            v = torch.round(uv[frame_index, :, 1][frame_valid_points]).long()
+            z = -xyz_in_camera[frame_index, :, 2][frame_valid_points]
+            vals, indices = scatter_min(z, v * width[frame_index] + u, out=depth_map.view(-1))
+            valid_point_indices = torch.arange(frame_valid_points.shape[0])[frame_valid_points]
+            frame_points.append(torch.unique(valid_point_indices[indices[vals < max_val]]))
+
+        frame_intersections = torch.zeros(len(frames), len(frames))
+        for i in tqdm(range(len(frames))):
+            for j in range(i + 1, len(frames)):
+                intersection = np.intersect1d(frame_points[i].numpy(), frame_points[j].numpy())
+                frame_intersections[i][j] = 0 if len(frame_points[i]) == 0 else len(intersection) / len(frame_points[i])
+                frame_intersections[j][i] = 0 if len(frame_points[j]) == 0 else len(intersection) / len(frame_points[j])
+
+        torch.save(frame_intersections, dest / "overlap.pt")
+        depth = -xyz_in_camera[..., 2][is_valid_points]
+        metadata["near"] = depth.min().item()
+        metadata["far"] = depth.max().item()
+        points = inner_outputs.metadata["points3D_xyz"]
+        min_bounds = points.min(dim=0)[0]
+        max_bounds = points.max(dim=0)[0]
+        metadata["scene_box"] = torch.stack([min_bounds, max_bounds]).tolist()
+
+    with (dest / "metadata.json").open("w") as f:
+        json.dump(metadata, f, indent=4)
 
 
 @dataclass
@@ -51,88 +108,10 @@ class DL3DV(DataParser):
 
     config: DL3DVDataParserConfig
 
-    def convert_scene_metadata(self, source: Path, dest: Path) -> None:
-        # Assuming this is from 1080p version of DL3DV and not 4K
-
-        inner = NerfstudioDataParserConfig(data=source, downscale_factor=4, load_3D_points=False).setup()
-        inner_outputs = inner.get_dataparser_outputs("train")
-
-        frames = []
-        c2ws = []
-
-        # near = 1e10
-        # far = -1
-        # points = inner_outputs.metadata["points3D_xyz"]
-        # points = torch.cat([points, torch.ones_like(points[..., :1])], -1).T
-        # 
-        # c2ws = inner_outputs.cameras.camera_to_worlds
-        # rot = c2ws[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
-        # trans = -torch.bmm(rot, c2ws[:, :3, 3:])  # (B, 3, 1)
-        # w2cs = torch.cat((rot, trans), dim=-1)
-        # 
-        # points_in_camera = (w2cs @ points).transpose(1, 2)
-        # depths = -points_in_camera[..., 2]
-
-        for image_index, image_path in enumerate(inner_outputs.image_filenames):
-            image = Image.open(image_path)
-            camera = inner_outputs.cameras[image_index]
-            K = camera.get_intrinsics_matrices().numpy()
-            distortion_params = camera.distortion_params
-            distortion_params = np.array(
-                [distortion_params[0], distortion_params[1], distortion_params[4], distortion_params[5],
-                 distortion_params[2], distortion_params[3], 0, 0, ])
-            newK, roi = cv2.getOptimalNewCameraMatrix(K, distortion_params, image.size, 0)
-            image = cv2.undistort(np.asarray(image), K, distortion_params, None, newK)
-            x, y, w, h = roi
-            image = Image.fromarray(image[y: y + h, x: x + w])
-
-            image_fx = newK[0, 0]
-            image_fy = newK[1, 1]
-            image_cx = newK[0, 2]
-            image_cy = newK[1, 2]
-
-            if self.config.crop is not None:
-                cropped_image = central_crop_v2(image)
-                image_cx -= ((image.size[0] - cropped_image.size[0]) / 2)
-                image_cy -= ((image.size[1] - cropped_image.size[1]) / 2)
-                image_cx *= (self.config.crop[0] / cropped_image.size[0])
-                image_cy *= (self.config.crop[1] / cropped_image.size[1])
-                image_fx *= (self.config.crop[0] / cropped_image.size[0])
-                image_fy *= (self.config.crop[1] / cropped_image.size[1])
-                image = cropped_image.resize(self.config.crop, resample=Image.LANCZOS)
-
-            image_path = dest / "images" / image_path.name
-            image_path.parent.mkdir(exist_ok=True, parents=True)
-            image.save(image_path)
-
-            frames.append({
-                "file_path": str(image_path),
-                "w": image.size[0],
-                "h": image.size[1],
-                "fl_x": image_fx,
-                "fl_y": image_fy,
-                "cx": image_cx,
-                "cy": image_cy,
-            })
-
-            image_c2w = torch.eye(4)
-            image_c2w[:3] = camera.camera_to_worlds
-            c2ws.append(image_c2w)
-
-        c2ws = torch.stack(c2ws)
-        c2ws, _ = camera_utils.auto_orient_and_center_poses(
-            c2ws,
-            method="up",
-            center_method="none",
-        )
-
-        for frame, c2w in zip(frames, c2ws):
-            frame["transform_matrix"] = c2w.tolist()
-
-        with (dest / "metadata.json").open("w") as f:
-            json.dump({"frames": frames}, f, indent=4)
-
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{self.config.neighbor_overlap_threshold}.pt"
+        if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
+            return torch.load(cached_path)
 
         if get_default_scene:
             scenes = [self.config.default_scene_id]
@@ -140,7 +119,11 @@ class DL3DV(DataParser):
             scenes = [self.config.scene_id]
         else:
             scenes = []
-            for subdir in sorted((self.config.data / "original").iterdir()):
+            to_scan = self.config.data / "original"
+            if not to_scan.exists():
+                to_scan = self.config.data / f"crop-{self.config.crop}"
+                CONSOLE.log(f"Original dir not found, using {to_scan} instead")
+            for subdir in sorted((to_scan).iterdir()):
                 for scene_dir in sorted(subdir.iterdir()):
                     scenes.append(f"{scene_dir.parent.name}/{scene_dir.name}")
 
@@ -159,26 +142,79 @@ class DL3DV(DataParser):
         cy = []
         neighboring_views = []
 
-        for scene in scenes:
-            crop_dir = f"crop-{self.config.crop[0]}-{self.config.crop[1]}" if self.config.crop is not None else "crop-none"
-            dest = self.config.data / crop_dir / scene
+        with ProcessPoolExecutor(max_workers=self.config.conversion_threads) as executor:
+            convert_tasks = []
+            for scene in scenes:
+                source = self.config.data / "original" / scene
+                dest = self.config.data / f"crop-{self.config.crop}" / scene
+                converted_metadata_path = dest / "metadata.json"
+                if (source / "transforms.json").exists() and (not converted_metadata_path.exists()):
+                    convert_tasks.append(executor.submit(convert_scene_metadata, source, dest, self.config.crop))
+
+            for task in tqdm(convert_tasks):
+                task.result()
+
+        min_bounds = None
+        max_bounds = None
+        near = 1e10
+        far = -1
+        for scene in tqdm(scenes):
+            dest = self.config.data / f"crop-{self.config.crop}" / scene
             converted_metadata_path = dest / "metadata.json"
+
             if not converted_metadata_path.exists():
-                try:
-                    self.convert_scene_metadata(self.config.data / "original" / scene, dest)
-                except:
-                    traceback.print_exc()
-                    # import pdb; pdb.set_trace()
-                    continue
+                continue
+
+            # with converted_metadata_path.open() as f:
+            #     metadata = json.load(f)
+            #
+            # for frame in metadata["frames"]:
+            #     frame["file_path"] = frame["file_path"].replace("/crop-256-256/", "/crop-256/")
+            #
+            # with converted_metadata_path.open("w") as f:
+            #     json.dump(metadata, f, indent=4)
 
             with converted_metadata_path.open() as f:
-                frames = json.load(f)["frames"]
+                metadata = json.load(f)
+
+            frames = metadata["frames"]
+            if len(frames) < 4:
+                CONSOLE.log(f"Skipping {scene} as it has less than 3 frames")
+                continue
+
+            if self.config.neighbor_overlap_threshold is not None:
+                view_overlap_path = dest / "overlap.pt"
+                if not view_overlap_path.exists():
+                    CONSOLE.log(f"Skipping {scene} as it does not have point cloud")
+                    continue
+
+                frame_intersections = torch.load(view_overlap_path)
+
+            pose_scale_factor = 1
+            if "near" in metadata:
+                scene_near = max(metadata["near"], 0.01)
+                if self.config.scale_near is not None:
+                    pose_scale_factor = scene_near / self.config.scale_near
+
+                near = min(near, scene_near / pose_scale_factor)
+                far = max(far, metadata["far"] / pose_scale_factor)
+                current_scene_box = torch.FloatTensor(metadata["scene_box"]) / pose_scale_factor
+
+                if min_bounds is None:
+                    min_bounds, max_bounds = current_scene_box
+                else:
+                    min_bounds = torch.minimum(min_bounds, current_scene_box[0])
+                    max_bounds = torch.maximum(max_bounds, current_scene_box[1])
 
             scene_index_start = len(image_filenames)
             scene_index_end = scene_index_start + len(frames)
+
             for scene_image_index, frame in enumerate(frames):
                 image_filenames.append(frame["file_path"])
-                c2ws.append(torch.FloatTensor(frame["transform_matrix"]).unsqueeze(0))
+                c2w = torch.FloatTensor(frame["transform_matrix"])
+                c2w[:3, 3] /= pose_scale_factor
+
+                c2ws.append(c2w)
                 width.append(frame["w"])
                 height.append(frame["h"])
                 fx.append(frame["fl_x"])
@@ -186,11 +222,23 @@ class DL3DV(DataParser):
                 cx.append(frame["cx"])
                 cy.append(frame["cy"])
 
-                neighboring_views.append(
-                    list(range(scene_index_start, scene_index_start + scene_image_index))
-                    + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
+                if self.config.neighbor_overlap_threshold is not None:
+                    neighbors = (scene_index_start + torch.arange(len(frames))[
+                        frame_intersections[scene_image_index] > self.config.neighbor_overlap_threshold]).tolist()
+                    if len(neighbors) < 3:
+                        neighbors = list(range(max(scene_index_start, scene_index_start + scene_image_index - 3),
+                                               scene_index_start + scene_image_index)) + list(
+                            range(scene_index_start + scene_image_index,
+                                  min(scene_index_end, scene_index_start + scene_image_index + 3)))
+                        assert len(neighbors) >= 3, len(neighbors)
 
-        c2ws = torch.cat(c2ws)
+                    neighboring_views.append(neighbors)
+                else:
+                    neighboring_views.append(
+                        list(range(scene_index_start, scene_index_start + scene_image_index))
+                        + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
+
+        c2ws = torch.stack(c2ws)
         width = torch.LongTensor(width)
         height = torch.LongTensor(height)
         fx = torch.FloatTensor(fx)
@@ -198,8 +246,7 @@ class DL3DV(DataParser):
         cx = torch.FloatTensor(cx)
         cy = torch.FloatTensor(cy)
 
-        min_bounds = c2ws[:, :3, 3].min(dim=0)[0]
-        max_bounds = c2ws[:, :3, 3].max(dim=0)[0]
+        CONSOLE.log(f"Derived bounds: {min_bounds} {max_bounds}")
         scene_box = SceneBox(aabb=1.1 * torch.stack([min_bounds, max_bounds]))
 
         if self.config.scene_id is not None:
@@ -237,8 +284,9 @@ class DL3DV(DataParser):
         )
 
         metadata = {
-            NEAR: 0.01,
-            FAR: 5,
+            NEAR: near,
+            FAR: far,
+            POSENC_SCALE: 1 / (max_bounds - min_bounds).max(),
         }
 
         if neighboring_views is not None:
@@ -253,5 +301,8 @@ class DL3DV(DataParser):
             scene_box=scene_box,
             metadata=metadata
         )
+
+        if (not get_default_scene) and self.config.scene_id is None:
+            torch.save(dataparser_outputs, cached_path)
 
         return dataparser_outputs

@@ -74,15 +74,33 @@ class SpatialEncoder(nn.Module):
         norm_layer = get_norm_layer(norm_type)
 
         CONSOLE.log(f"Using torchvision {backbone} encoder")
-        self.model = getattr(torchvision.models, backbone)(
+        model = getattr(torchvision.models, backbone)(
             pretrained=pretrained, norm_layer=norm_layer
         )
 
-        self.model.fc = nn.Sequential()
-        self.model.avgpool = nn.Sequential()
-        self.latent_size = [0, 64, 128, 256, 512, 1024][num_layers]
+        self.conv1 = model.conv1
+        self.bn1 = model.bn1
+        self.relu = model.relu
 
         self.num_layers = num_layers
+        if self.num_layers > 1:
+            self.maxpool = model.maxpool
+            self.layer1 = model.layer1
+        if self.num_layers > 2:
+            self.layer2 = model.layer2
+        if self.num_layers > 3:
+            self.layer3 = model.layer3
+        if self.num_layers > 4:
+            self.layer4 = model.layer4
+
+        # self.model = getattr(torchvision.models, backbone)(
+        #     pretrained=pretrained, norm_layer=norm_layer
+        # )
+
+        # self.model.fc = nn.Sequential()
+        # self.model.avgpool = nn.Sequential()
+        self.latent_size = [0, 64, 128, 256, 512, 1024][num_layers]
+
         self.index_interp = index_interp
         self.index_padding = index_padding
         self.upsample_interp = upsample_interp
@@ -123,24 +141,24 @@ class SpatialEncoder(nn.Module):
                 recompute_scale_factor=True,
             )
 
-        x = self.model.conv1(x)
-        x = self.model.bn1(x)
-        x = self.model.relu(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
 
         latents = [x]
         if self.num_layers > 1:
             if self.use_first_pool:
-                x = self.model.maxpool(x)
-            x = self.model.layer1(x)
+                x = self.maxpool(x)
+            x = self.layer1(x)
             latents.append(x)
         if self.num_layers > 2:
-            x = self.model.layer2(x)
+            x = self.layer2(x)
             latents.append(x)
         if self.num_layers > 3:
-            x = self.model.layer3(x)
+            x = self.layer3(x)
             latents.append(x)
         if self.num_layers > 4:
-            x = self.model.layer4(x)
+            x = self.layer4(x)
             latents.append(x)
 
         align_corners = None if self.index_interp == "nearest" else True

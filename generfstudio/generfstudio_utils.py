@@ -18,7 +18,7 @@ def central_crop_v2(image: Image):
     assert new_image.size == (s, s), (image.size, (s, s), new_image.size)
     return new_image
 
-@torch.compile
+# @torch.compile
 def get_pixel_aligned_features(latent: torch.Tensor, uv: torch.Tensor, uv_scaling: torch.Tensor) -> torch.Tensor:
     """
     Get pixel-aligned image features at 2D image coordinates
@@ -34,7 +34,8 @@ def get_pixel_aligned_features(latent: torch.Tensor, uv: torch.Tensor, uv_scalin
     )
 
     return samples[:, :, :, 0].transpose(1, 2)  # (B, N, C)
-@torch.compile
+
+# @torch.compile
 def repeat_interleave(input: torch.Tensor, repeats: int) -> torch.Tensor:
     """
     Repeat interleave along axis 0

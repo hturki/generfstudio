@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import json
-import shutil
-import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type, Optional, Tuple
+from typing import Type, Optional
 
-import cv2
-import numpy as np
 import torch
 from PIL import Image
 from nerfstudio.cameras import camera_utils
@@ -17,10 +13,9 @@ from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
-from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA
+from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, POSENC_SCALE
 from generfstudio.generfstudio_utils import central_crop_v2
 
 
@@ -33,7 +28,7 @@ class R10KDataParserConfig(DataParserConfig):
     data: Path = Path("data/acid")
     """Directory specifying location of data."""
 
-    scene_id: Optional[str] = None  # "train/3f327a802a01c44b"
+    scene_id: Optional[str] = None  # "train/2ecba9802673be71"
 
     train_split_fraction: float = 0.9
     """The percentage of the dataset to use for training. Only used when using a single scene."""
@@ -42,93 +37,79 @@ class R10KDataParserConfig(DataParserConfig):
 
     default_scene_id: str = "train/3f327a802a01c44b"
 
-    crop: Optional[Tuple[int, int]] = (256, 256)
+    crop: Optional[int] = 256
+
+    scale_near: Optional[float] = None
 
     conversion_threads: int = 16
 
 
-def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop):
-    c2ws = []
+def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop: Optional[int]) -> bool:
+    w2cs = []
+    frames = []
 
-    if dest.exists():
-        with dest.open() as f:
-            frames = json.load(f)["frames"]
+    with source.open() as f:
+        url = f.readline()
 
-        with source.open() as f:
-            url = f.readline()
+        for line in f:
+            entry = line.strip().split()
+            timestamp = int(entry[0])
+            image_path = data / scene / f"{timestamp}.png"
+            if not image_path.exists():
+                return False
+            image = Image.open(image_path)
 
-            for line in f:
-                entry = line.strip().split()
-                image_c2w = torch.eye(4)
-                image_c2w[:3] = torch.FloatTensor([float(x) for x in entry[7:]]).view(3, 4)
-                # opencv -> opengl
-                image_c2w[:, 1:3] *= -1
-                c2ws.append(image_c2w)
-    else:
-        frames = []
+            image_fx, image_fy, image_cx, image_cy = [float(x) for x in entry[1:5]]
+            image_fx = image_fx * image.size[0]
+            image_fy = image_fy * image.size[1]
+            image_cx = image_cx * image.size[0]
+            image_cy = image_cy * image.size[1]
 
-        with source.open() as f:
-            url = f.readline()
+            if crop is not None:
+                image_path = data / f"crop-{crop}" / scene / image_path.name
+                image_path.parent.mkdir(exist_ok=True, parents=True)
+                cropped_image = central_crop_v2(image)
+                image_cx -= ((image.size[0] - cropped_image.size[0]) / 2)
+                image_cy -= ((image.size[1] - cropped_image.size[1]) / 2)
+                image_cx *= (crop / cropped_image.size[0])
+                image_cy *= (crop / cropped_image.size[1])
+                image_fx *= (crop / cropped_image.size[0])
+                image_fy *= (crop / cropped_image.size[1])
+                image = cropped_image.resize((crop, crop), resample=Image.LANCZOS)
+                image.save(image_path)
 
-            for line in f:
-                entry = line.strip().split()
-                timestamp = int(entry[0])
-                image_path = data / scene / f"{timestamp}.png"
-                if not image_path.exists():
-                    return False
-                image = Image.open(image_path)
+            frames.append({
+                "file_path": str(image_path),
+                "w": image.size[0],
+                "h": image.size[1],
+                "fl_x": image_fx,
+                "fl_y": image_fy,
+                "cx": image_cx,
+                "cy": image_cy,
+            })
 
-                image_fx, image_fy, image_cx, image_cy = [float(x) for x in entry[1:5]]
-                image_cx = image_cx * image.size[0]
-                image_cy = image_cy * image.size[1]
+            image_w2c = torch.eye(4)
+            image_w2c[:3] = torch.FloatTensor([float(x) for x in entry[7:]]).view(3, 4)
+            w2cs.append(image_w2c)
 
-                if crop is not None:
-                    image_path = data / f"crop-{crop[0]}-{crop[1]}" / scene / image_path.name
-                    image_path.parent.mkdir(exist_ok=True, parents=True)
-                    cropped_image = central_crop_v2(image)
-                    image_cx -= ((image.size[0] - cropped_image.size[0]) / 2)
-                    image_cy -= ((image.size[1] - cropped_image.size[1]) / 2)
-                    image_cx *= (crop[0] / cropped_image.size[0])
-                    image_cy *= (crop[1] / cropped_image.size[1])
-                    cropped_image.resize(crop, resample=Image.LANCZOS).save(image_path)
+    w2cs = torch.stack(w2cs)
 
-                frames.append({
-                    "file_path": str(image_path),
-                    "w": image.size[0],
-                    "h": image.size[1],
-                    "fl_x": image_fx * image.size[0],
-                    "fl_y": image_fy * image.size[1],
-                    "cx": image_cx,
-                    "cy": image_cy,
-                })
+    rot = w2cs[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
+    trans = -torch.bmm(rot, w2cs[:, :3, 3:])  # (B, 3, 1)
+    c2ws = torch.cat((rot, trans), dim=-1)
+    # opencv -> opengl
+    c2ws[:, :, 1:3] *= -1
 
-                image_c2w = torch.eye(4)
-                image_c2w[:3] = torch.FloatTensor([float(x) for x in entry[7:]]).view(3, 4)
-                # opencv -> opengl
-                image_c2w[:, 1:3] *= -1
-                c2ws.append(image_c2w)
+    c2ws_4x4 = torch.eye(4).unsqueeze(0).repeat(len(c2ws), 1, 1)
+    c2ws_4x4[:, :3] = c2ws
 
-    c2ws = torch.stack(c2ws)
-    try:
-        c2ws, transform = camera_utils.auto_orient_and_center_poses(
-            c2ws,
-            method="up",
-            center_method="none",
-        )
-    except:
-        import pdb; pdb.set_trace()
-    # min_bounds = c2ws[:, :, 3].min(dim=0)[0]
-    # max_bounds = c2ws[:, :, 3].max(dim=0)[0]
-    #
-    # origin = (max_bounds + min_bounds) * 0.5
-    # CONSOLE.print(f"Calculated origin for {scene}: {origin} {min_bounds} {max_bounds}")
-    #
-    # pose_scale_factor = ((max_bounds - min_bounds) * 0.5).norm().item()
-    # CONSOLE.print(f"Calculated pose scale factor for {scene}: {pose_scale_factor}")
+    c2ws, transform = camera_utils.auto_orient_and_center_poses(
+        c2ws_4x4,
+        method="up",
+        center_method="none",
+    )
 
     for frame, c2w in zip(frames, c2ws):
-        # c2w[:, 3] = (c2w[:, 3] - origin) / pose_scale_factor
-        # assert torch.logical_and(c2w >= -1, c2w <= 1).all(), c2w
         frame["transform_matrix"] = c2w.tolist()
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -145,6 +126,10 @@ class R10K(DataParser):
     config: R10KDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}.pt"
+        if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
+            return torch.load(cached_path)
+
         if get_default_scene:
             scenes = [self.config.default_scene_id]
         elif self.config.scene_id is not None:
@@ -173,48 +158,61 @@ class R10K(DataParser):
         cy = []
         neighboring_views = []
 
-        converting_scenes = {}
+        to_convert = []
         with ThreadPoolExecutor(max_workers=self.config.conversion_threads) as executor:
             for scene in scenes:
-                metadata_name = f"{scene}-{self.config.crop[0]}-{self.config.crop[1]}.json" \
-                    if self.config.crop is not None else f"{scene}.json"
+                metadata_name_bak = f"{scene}-{self.config.crop}-{self.config.crop}.json"
+                metadata_name = f"{scene}-{self.config.crop}.json" if self.config.crop is not None else f"{scene}.json"
+
                 nerfstudio_metadata_path = self.config.data / "nerfstudio" / metadata_name
+                nerfstudio_metadata_path_bak = self.config.data / "nerfstudio" / metadata_name_bak
+                if nerfstudio_metadata_path_bak.exists():
+                    nerfstudio_metadata_path_bak.rename(nerfstudio_metadata_path)
                 if not nerfstudio_metadata_path.exists():
-                    converting_scenes[scene] = executor.submit(convert_scene_metadata, scene,
-                                                               self.config.data / "metadata" / f"{scene}.txt",
-                                                               nerfstudio_metadata_path, self.config.data,
-                                                               self.config.crop)
+                    to_convert.append(executor.submit(convert_scene_metadata, scene,
+                                                      self.config.data / "metadata" / f"{scene}.txt",
+                                                      nerfstudio_metadata_path, self.config.data,
+                                                      self.config.crop))
+            for task in tqdm(to_convert):
+                task.result()
 
-            for scene in tqdm(scenes):
-                metadata_name = f"{scene}-{self.config.crop[0]}-{self.config.crop[1]}.json" \
-                    if self.config.crop is not None else f"{scene}.json"
-                nerfstudio_metadata_path = self.config.data / "nerfstudio" / metadata_name
-                if scene in converting_scenes:
-                    try:
-                        if not converting_scenes[scene].result():
-                            continue
-                    except:
-                        traceback.print_exc()
-                        import pdb; pdb.set_trace()
+        for scene in tqdm(scenes):
+            metadata_name = f"{scene}-{self.config.crop}.json" if self.config.crop is not None else f"{scene}.json"
+            nerfstudio_metadata_path = self.config.data / "nerfstudio" / metadata_name
 
-                with nerfstudio_metadata_path.open() as f:
-                    frames = json.load(f)["frames"]
+            if not nerfstudio_metadata_path.exists():
+                continue
 
-                scene_index_start = len(image_filenames)
-                scene_index_end = scene_index_start + len(frames)
-                for scene_image_index, frame in enumerate(frames):
-                    image_filenames.append(frame["file_path"])
-                    c2ws.append(torch.FloatTensor(frame["transform_matrix"]))
-                    width.append(frame["w"])
-                    height.append(frame["h"])
-                    fx.append(frame["fl_x"])
-                    fy.append(frame["fl_y"])
-                    cx.append(frame["cx"])
-                    cy.append(frame["cy"])
+            with nerfstudio_metadata_path.open() as f:
+                metadata = json.load(f)
 
-                    neighboring_views.append(
-                        list(range(scene_index_start, scene_index_start + scene_image_index))
-                        + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
+            for frame in metadata["frames"]:
+                frame["file_path"] = frame["file_path"].replace("/crop-256-256/", "/crop-256/")
+
+            with nerfstudio_metadata_path.open("w") as f:
+                json.dump(metadata, f, indent=4)
+
+            with nerfstudio_metadata_path.open() as f:
+                frames = json.load(f)["frames"]
+
+            if len(frames) < 4:
+                continue
+
+            scene_index_start = len(image_filenames)
+            scene_index_end = scene_index_start + len(frames)
+            for scene_image_index, frame in enumerate(frames):
+                image_filenames.append(frame["file_path"])
+                c2ws.append(torch.FloatTensor(frame["transform_matrix"]))
+                width.append(frame["w"])
+                height.append(frame["h"])
+                fx.append(frame["fl_x"])
+                fy.append(frame["fl_y"])
+                cx.append(frame["cx"])
+                cy.append(frame["cy"])
+
+                neighboring_views.append(
+                    list(range(scene_index_start, scene_index_start + scene_image_index))
+                    + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
 
         # if len(missing_scenes) > 0:
         #     for scene in missing_scenes:
@@ -230,6 +228,13 @@ class R10K(DataParser):
         fy = torch.FloatTensor(fy)
         cx = torch.FloatTensor(cx)
         cy = torch.FloatTensor(cy)
+
+        if self.config.scale_near is not None:
+            # Apparently R10K is scaled such that 1 is a reasonable near bound
+            pose_scale_factor = 1 / self.config.scale_near
+            c2ws[:, :3, 3] /= pose_scale_factor
+        else:
+            pose_scale_factor = 1
 
         min_bounds = c2ws[:, :3, 3].min(dim=0)[0]
         max_bounds = c2ws[:, :3, 3].max(dim=0)[0]
@@ -270,15 +275,16 @@ class R10K(DataParser):
         )
 
         metadata = {
-            NEAR: 1,
-            FAR: 200,
+            NEAR: 1 / pose_scale_factor,
+            FAR: 200 / pose_scale_factor,
+            POSENC_SCALE: pose_scale_factor / 200,
         }
 
         if neighboring_views is not None:
             metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
 
-        if (not get_default_scene) and self.config.scene_id is None:
-            metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
+        # if (not get_default_scene) and self.config.scene_id is None:
+        #     metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
 
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,
@@ -286,5 +292,8 @@ class R10K(DataParser):
             scene_box=scene_box,
             metadata=metadata
         )
+
+        if (not get_default_scene) and self.config.scene_id is None:
+            torch.save(dataparser_outputs, cached_path)
 
         return dataparser_outputs

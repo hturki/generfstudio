@@ -33,9 +33,8 @@ class PixelNeRFField(Field):
     ) -> None:
         super().__init__()
         self.inner = PixelNeRFInnerField(encoder_latent_size, global_encoder_latent_size, out_feature_dim,
-                                         combine_layer,
-                                         use_positional_encoding_xyz, positional_encoding_scale_factor, use_view_dirs,
-                                         normalize_z)
+                                         combine_layer, use_positional_encoding_xyz, positional_encoding_scale_factor,
+                                         use_view_dirs, normalize_z)
         self.out_feature_dim = out_feature_dim
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:

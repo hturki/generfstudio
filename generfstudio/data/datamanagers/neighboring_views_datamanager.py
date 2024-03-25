@@ -212,14 +212,18 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             if to_return.metadata is None:
                 to_return.metadata = {}
 
-        to_return.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device)
+        data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device)
+        self.randomize_background(data)
+
+        to_return.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES]
         del data[NEIGHBORING_VIEW_IMAGES]
 
         to_return.metadata[NEIGHBORING_VIEW_CAMERAS] = self.train_dataset.cameras[data[NEIGHBORING_VIEW_INDICES]].to(
             self.device)
         del data[NEIGHBORING_VIEW_INDICES]
 
-        to_return.metadata["image"] = data["image"] # Used in mv_diffusion - we need to calculate within forward for DDP
+        # Used in mv_diffusion - DDP expects us to do all differentiable model computation in the forward function
+        to_return.metadata["image"] = data["image"]
 
         return to_return, data
 
@@ -238,13 +242,15 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
         data = deepcopy(self.eval_dataset[image_idx])
-        data["image"] = data["image"].to(self.device)
+        data["image"] = data["image"].to(self.device).unsqueeze(0) # unsqueeze for randomize_background
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx:image_idx + 1].to(self.device)
         if camera.metadata is None:
             camera.metadata = {}
 
         data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device).unsqueeze(0)
+        self.randomize_background(data)
+        data["image"] = data["image"].to(self.device).squeeze(0)
         camera.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES]
         # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
 
@@ -253,3 +259,15 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         del data[NEIGHBORING_VIEW_INDICES]
 
         return camera, data
+
+    # Randomize background if there's an alpha component and make sure it's consistent across neighboring views
+    @staticmethod
+    def randomize_background(data: Dict) -> None:
+        if data["image"].shape[-1] == 4:
+            random_bg = torch.rand(data["image"].shape[0], 3, device=data["image"].device)
+            data["image"] = data["image"][..., :3] * data["image"][..., 3:] \
+                            + random_bg.view(data["image"].shape[0], 1, 1, 3) * (1 - data["image"][..., 3:])
+            data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES][..., :3] \
+                                            * data[NEIGHBORING_VIEW_IMAGES][..., 3:] \
+                                            + random_bg.view(data["image"].shape[0], 1, 1, 1, 3) \
+                                            * (1 - data[NEIGHBORING_VIEW_IMAGES][..., 3:])

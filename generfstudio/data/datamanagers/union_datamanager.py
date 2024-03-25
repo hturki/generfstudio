@@ -19,6 +19,8 @@ from generfstudio.data.datamanagers.neighboring_views_datamanager import Neighbo
     NeighboringViewsDatamanager
 from generfstudio.data.dataparsers.co3d_dataparser import CO3DDataParserConfig
 from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
+from generfstudio.data.dataparsers.mvimgnet_dataparser import MVImgNetDataParserConfig
+from generfstudio.data.dataparsers.objaverse_xl_dataparser import ObjaverseXLDataParserConfig
 from generfstudio.data.dataparsers.r10k_dataparser import R10KDataParserConfig
 from generfstudio.data.datasets.neighboring_views_dataset import NeighboringViewsDataset
 from generfstudio.data.datasets.union_dataset import UnionDataset
@@ -32,6 +34,7 @@ class DistributedSamplerWrapper:
         for delegate in self.delegates:
             delegate.set_epoch(step)
 
+
 class DataparserOutputsWrapper:
 
     def __init__(self, delegates: List[DataparserOutputs]):
@@ -42,7 +45,6 @@ class DataparserOutputsWrapper:
         self.delegates[0].save_dataparser_transform(path)
 
 
-
 @dataclass
 class UnionDatamanagerConfig(DataManagerConfig):
     _target: Type = field(default_factory=lambda: UnionDatamanager)
@@ -51,16 +53,26 @@ class UnionDatamanagerConfig(DataManagerConfig):
         _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
     ))
 
-    dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
-        DL3DVDataParserConfig(),
-        CO3DDataParserConfig(),
-        R10KDataParserConfig(),
-        R10KDataParserConfig(data=Path("data/r10k")),
-    ])
+    # Making this a config makes startup very slow
+    # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
+    #     DL3DVDataParserConfig(),
+    #     CO3DDataParserConfig(),
+    #     R10KDataParserConfig(),
+    #     R10KDataParserConfig(data=Path("data/r10k")),
+    # ])
+
+
+DATAPARSERS = [
+    DL3DVDataParserConfig(),
+    CO3DDataParserConfig(),
+    R10KDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+    R10KDataParserConfig(data=Path("data/r10k")),
+    MVImgNetDataParserConfig()
+]
 
 
 class UnionDatamanager(DataManager):
-
     config: UnionDatamanagerConfig
     train_dataset: TDataset
     eval_dataset: TDataset
@@ -75,7 +87,7 @@ class UnionDatamanager(DataManager):
             **kwargs,
     ):
         self.delegates = []
-        for dataparser in config.dataparsers:
+        for dataparser in DATAPARSERS:
             inner = deepcopy(config.inner)
             inner.dataparser = dataparser
             self.delegates.append(

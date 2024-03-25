@@ -123,7 +123,7 @@ class DL3DV(DataParser):
             if not to_scan.exists():
                 to_scan = self.config.data / f"crop-{self.config.crop}"
                 CONSOLE.log(f"Original dir not found, using {to_scan} instead")
-            for subdir in sorted((to_scan).iterdir()):
+            for subdir in sorted(to_scan.iterdir()):
                 for scene_dir in sorted(subdir.iterdir()):
                     scenes.append(f"{scene_dir.parent.name}/{scene_dir.name}")
 
@@ -164,15 +164,6 @@ class DL3DV(DataParser):
 
             if not converted_metadata_path.exists():
                 continue
-
-            # with converted_metadata_path.open() as f:
-            #     metadata = json.load(f)
-            #
-            # for frame in metadata["frames"]:
-            #     frame["file_path"] = frame["file_path"].replace("/crop-256-256/", "/crop-256/")
-            #
-            # with converted_metadata_path.open("w") as f:
-            #     json.dump(metadata, f, indent=4)
 
             with converted_metadata_path.open() as f:
                 metadata = json.load(f)

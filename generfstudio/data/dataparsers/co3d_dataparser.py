@@ -153,7 +153,11 @@ class CO3D(DataParser):
             scenes = [self.config.scene_id]
         else:
             scenes = []
-            for category_dir in sorted((self.config.data / "original").iterdir()):
+            to_scan = self.config.data / "original"
+            if not to_scan.exists():
+                to_scan = self.config.data / f"crop-{self.config.crop}"
+                CONSOLE.log(f"Original dir not found, using {to_scan} instead")
+            for category_dir in sorted(to_scan.iterdir()):
                 if category_dir.is_dir():
                     sequence_dirs = list(filter(lambda x: x.is_dir() and x.name not in {"eval_batches", "set_lists"},
                                                 sorted(category_dir.iterdir())))

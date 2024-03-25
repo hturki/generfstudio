@@ -184,15 +184,6 @@ class R10K(DataParser):
                 continue
 
             with nerfstudio_metadata_path.open() as f:
-                metadata = json.load(f)
-
-            for frame in metadata["frames"]:
-                frame["file_path"] = frame["file_path"].replace("/crop-256-256/", "/crop-256/")
-
-            with nerfstudio_metadata_path.open("w") as f:
-                json.dump(metadata, f, indent=4)
-
-            with nerfstudio_metadata_path.open() as f:
                 frames = json.load(f)["frames"]
 
             if len(frames) < 4:

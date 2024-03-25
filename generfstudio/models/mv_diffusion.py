@@ -10,12 +10,13 @@ import torch.nn.functional as F
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
-from nerfstudio.model_components.ray_samplers import UniformSampler, UniformLinDispPiecewiseSampler
+from nerfstudio.model_components.ray_samplers import UniformLinDispPiecewiseSampler
 from nerfstudio.model_components.renderers import RGBRenderer, DepthRenderer, SemanticRenderer, AccumulationRenderer
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps
 from nerfstudio.utils.comms import get_world_size
+from nerfstudio.utils.rich_utils import CONSOLE
 from omegaconf import OmegaConf
 from pytorch_msssim import SSIM
 from rich.console import Console
@@ -30,11 +31,8 @@ from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
 from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
-from generfstudio.fields.unet import UNet
 from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, \
     POSENC_SCALE
-
-CONSOLE = Console(width=120)
 
 
 @dataclass
@@ -237,9 +235,9 @@ class MVDiffusion(Model):
 
         rgbs = []
         features = []
+        accumulations = []
         if not self.training:
             depths = []
-            accumulations = []
 
         # cameras_per_chunk = self.config.eval_num_rays_per_chunk // (self._model.image_size * self._model.image_size)
         cameras_per_chunk = 1
@@ -263,21 +261,21 @@ class MVDiffusion(Model):
             weights = ray_samples.get_weights(sample_density)
             rgbs.append(self.renderer_rgb(rgb=sample_rgb, weights=weights))
             features.append(self.renderer_features(semantics=sample_features, weights=weights))
+            accumulations.append(self.renderer_accumulation(weights=weights))
 
             if not self.training:
                 depths.append(self.renderer_depth(weights=weights, ray_samples=ray_samples))
-                accumulations.append(self.renderer_accumulation(weights=weights))
 
         rgbs = torch.cat(rgbs).view(image_cond.shape[0], image_size, image_size, 3)
         features = torch.cat(features).view(image_cond.shape[0], image_size, image_size, -1)
-
+        accumulations = torch.cat(accumulations).view(image_cond.shape[0], image_size,
+                                                      image_size, 1)
         if not self.training:
             depths = torch.cat(depths).view(image_cond.shape[0], image_size, image_size, 1)
-            accumulations = torch.cat(accumulations).view(image_cond.shape[0], image_size,
-                                                          image_size, 1)
+
             return rgbs, features, depths, accumulations
 
-        return rgbs, features
+        return rgbs, features, accumulations
 
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         cam_cond = cameras.metadata[NEIGHBORING_VIEW_CAMERAS].camera_to_worlds
@@ -285,18 +283,18 @@ class MVDiffusion(Model):
 
         image_cond = cameras.metadata[NEIGHBORING_VIEW_IMAGES].permute(0, 1, 4, 2, 3)
         cond_features = self.get_cond_features(cameras, image_cond)
+        image_size = 32 if self.config.cond_only else self._model.image_size
 
         outputs = {}
         is_training = (not torch.is_inference_mode_enabled()) and self.training
         if not is_training:
             rgbs, features, depths, accumulations = cond_features
-            image_size = 32 if self.config.cond_only else self._model.image_size
-            outputs["depth"] = depths.view(cam_cond.shape[0], image_size, image_size, 1)
-            outputs["accumulation"] = accumulations.view(cam_cond.shape[0], image_size, image_size, 1)
+            outputs["depth"] = depths
         else:
-            rgbs, features = cond_features
+            rgbs, features, accumulations = cond_features
 
         outputs["rgb"] = rgbs
+        outputs["accumulation"] = accumulations
 
         if self.config.cond_only:
             return outputs
@@ -373,7 +371,12 @@ class MVDiffusion(Model):
         assert self.training
 
         image = batch["image"].to(self.device)
-        cond_rgb = outputs["rgb"]
+        cond_rgb, image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+
         with torch.no_grad():
             downsampled_image = F.interpolate(image.permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
                                               antialias=True).permute(0, 2, 3, 1)
@@ -423,6 +426,8 @@ class MVDiffusion(Model):
             self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         image = batch["image"].to(outputs["rgb"].device)
+        image = self.renderer_rgb.blend_background(image)
+
         cond_rgb = outputs["rgb"]
         downsampled_image = F.interpolate(image.unsqueeze(0).permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
                                           antialias=True).permute(0, 2, 3, 1)

@@ -28,11 +28,12 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from extern.ldm_zero123.models.diffusion.ddim import DDIMSampler
 from extern.ldm_zero123.util import instantiate_from_config
 from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
+from generfstudio.fields.dust3r_field import Dust3rField
 from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, \
-    POSENC_SCALE
+from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, NEAR, FAR, \
+    POSENC_SCALE, RGB, FEATURES, ACCUMULATION, DEPTH, NEIGHBOR_RESULTS, ALIGNMENT_LOSS
 
 
 @dataclass
@@ -57,11 +58,15 @@ class MVDiffusionConfig(ModelConfig):
     concat_crossattn_with_null_prompt: bool = False
 
     cond_image_encoder_type: Literal["unet", "resnet", "dino"] = "resnet"
-    pixelnerf_type: Literal["ibrnet", "pixelnerf"] = "pixelnerf"
+    pixelnerf_type: Literal["ibrnet", "pixelnerf", "dust3r"] = "pixelnerf"
 
     cond_only: bool = False
 
     freeze_cond_image_encoder: bool = False
+
+    dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    dust3r_alignment_iter: int = 30
+    dust3r_use_confidence_opacity: bool = False
 
 
 class MVDiffusion(Model):
@@ -154,6 +159,10 @@ class MVDiffusion(Model):
                 global_encoder_latent_size=0,
                 out_feature_dim=128,
                 positional_encoding_scale_factor=self.posenc_scale)
+        elif self.config.pixelnerf_type == "dust3r":
+            self.cond_feature_field = Dust3rField(checkpoint_path=self.config.dust3r_checkpoint_path,
+                                                  alignment_lr=self.config.dust3r_alignment_iter,
+                                                  use_confidence_opacity=self.config.dust3r_use_confidence_opacity)
         else:
             raise Exception(self.config.pixelnerf_type)
 
@@ -184,7 +193,11 @@ class MVDiffusion(Model):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
+        if self.config.pixelnerf_type != "dust3r":
+            param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
+        else:
+            param_groups["cond_encoder"] = []
+
         if not self.config.freeze_cond_image_encoder:
             param_groups["cond_encoder"] += list(self.cond_image_encoder.parameters())
 
@@ -211,24 +224,28 @@ class MVDiffusion(Model):
             ),
         ]
 
-    def get_cond_features(self, cameras: Cameras, image_cond: torch.Tensor):
-        neighboring_view_count = image_cond.shape[1]
-        cond_features = self.cond_image_encoder(image_cond.view(-1, *image_cond.shape[2:]))
+    def get_cond_features(self, cameras: Cameras, cond_rgbs: torch.Tensor):
+        neighbor_count = cond_rgbs.shape[1]
+        cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
         if self.config.freeze_cond_image_encoder:
             cond_features = cond_features.detach()
-
-        feature_scaling = torch.FloatTensor([cond_features.shape[-1], cond_features.shape[-2]]).to(cond_features.device)
-        feature_scaling = feature_scaling / (feature_scaling - 1) * 2.0
-        uv_scaling = feature_scaling / torch.FloatTensor([image_cond.shape[-1], image_cond.shape[-2]]).to(
-            feature_scaling)
 
         target_cameras = deepcopy(cameras)
         target_cameras.metadata = {}
         image_size = 32 if self.config.cond_only else self._model.image_size
         target_cameras.rescale_output_resolution(image_size / cameras.height[0, 0].item())
 
-        neighboring_view_cameras = cameras.metadata[NEIGHBORING_VIEW_CAMERAS]
-        cam_cond = neighboring_view_cameras.camera_to_worlds.view(-1, 3, 4)
+        neighbor_cameras = cameras.metadata[NEIGHBOR_CAMERAS]
+
+        if self.config.pixelnerf_type == "dust3r":
+            return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features)
+
+        feature_scaling = torch.FloatTensor([cond_features.shape[-1], cond_features.shape[-2]]).to(cond_features.device)
+        feature_scaling = feature_scaling / (feature_scaling - 1) * 2.0
+        uv_scaling = feature_scaling / torch.FloatTensor([cond_rgbs.shape[-1], cond_rgbs.shape[-2]]).to(
+            feature_scaling)
+
+        cam_cond = neighbor_cameras.camera_to_worlds.view(-1, 3, 4)
         rot = cam_cond[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
         trans = -torch.bmm(rot, cam_cond[:, :3, 3:])  # (B, 3, 1)
         cam_cond_w2c = torch.cat((rot, trans), dim=-1)
@@ -254,9 +271,9 @@ class MVDiffusion(Model):
 
             sample_density, sample_rgb, sample_features = self.cond_feature_field(
                 ray_samples, positions,
-                cond_features[start_index * neighboring_view_count:end_index * neighboring_view_count],
-                cam_cond_w2c[start_index * neighboring_view_count:end_index * neighboring_view_count],
-                neighboring_view_cameras[start_index:end_index], uv_scaling)
+                cond_features[start_index * neighbor_count:end_index * neighbor_count],
+                cam_cond_w2c[start_index * neighbor_count:end_index * neighbor_count],
+                neighbor_cameras[start_index:end_index], uv_scaling)
 
             weights = ray_samples.get_weights(sample_density)
             rgbs.append(self.renderer_rgb(rgb=sample_rgb, weights=weights))
@@ -266,35 +283,41 @@ class MVDiffusion(Model):
             if not self.training:
                 depths.append(self.renderer_depth(weights=weights, ray_samples=ray_samples))
 
-        rgbs = torch.cat(rgbs).view(image_cond.shape[0], image_size, image_size, 3)
-        features = torch.cat(features).view(image_cond.shape[0], image_size, image_size, -1)
-        accumulations = torch.cat(accumulations).view(image_cond.shape[0], image_size,
+        rgbs = torch.cat(rgbs).view(cond_rgbs.shape[0], image_size, image_size, 3)
+        features = torch.cat(features).view(cond_rgbs.shape[0], image_size, image_size, -1)
+        accumulations = torch.cat(accumulations).view(cond_rgbs.shape[0], image_size,
                                                       image_size, 1)
+        outputs = {
+            RGB: rgbs,
+            FEATURES: features,
+            ACCUMULATION: accumulations
+        }
+
         if not self.training:
-            depths = torch.cat(depths).view(image_cond.shape[0], image_size, image_size, 1)
+            depths = torch.cat(depths).view(cond_rgbs.shape[0], image_size, image_size, 1)
+            outputs[DEPTH] = depths
 
-            return rgbs, features, depths, accumulations
-
-        return rgbs, features, accumulations
+        return outputs
 
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        cam_cond = cameras.metadata[NEIGHBORING_VIEW_CAMERAS].camera_to_worlds
-        neighboring_view_count = cam_cond.shape[1]
+        cam_cond = cameras.metadata[NEIGHBOR_CAMERAS].camera_to_worlds
+        neighbor_count = cam_cond.shape[1]
 
-        image_cond = cameras.metadata[NEIGHBORING_VIEW_IMAGES].permute(0, 1, 4, 2, 3)
+        image_cond = cameras.metadata[NEIGHBOR_IMAGES].permute(0, 1, 4, 2, 3)
         cond_features = self.get_cond_features(cameras, image_cond)
-        image_size = 32 if self.config.cond_only else self._model.image_size
+        outputs = {
+            RGB: cond_features[RGB],
+            ACCUMULATION: cond_features[ACCUMULATION]
+        }
 
-        outputs = {}
         is_training = (not torch.is_inference_mode_enabled()) and self.training
         if not is_training:
-            rgbs, features, depths, accumulations = cond_features
-            outputs["depth"] = depths
-        else:
-            rgbs, features, accumulations = cond_features
+            outputs[DEPTH] = cond_features[DEPTH]
 
-        outputs["rgb"] = rgbs
-        outputs["accumulation"] = accumulations
+        if self.config.pixelnerf_type == "dust3r":
+            outputs[ALIGNMENT_LOSS] = cond_features[ALIGNMENT_LOSS]
+            if not is_training:
+                outputs[NEIGHBOR_RESULTS] = cond_features[NEIGHBOR_RESULTS]
 
         if self.config.cond_only:
             return outputs
@@ -303,9 +326,9 @@ class MVDiffusion(Model):
         # Move to [-1, 1] for CLIP
         image_cond = image_cond * 2 - 1
         c_crossattn = self._model.get_learned_conditioning(image_cond.view(-1, *image_cond.shape[2:])).detach()
-        c_crossattn = c_crossattn.view(-1, neighboring_view_count, c_crossattn.shape[-1])
+        c_crossattn = c_crossattn.view(-1, neighbor_count, c_crossattn.shape[-1])
 
-        c_concat = torch.cat([rgbs.permute(0, 3, 1, 2), features.permute(0, 3, 1, 2)], 1)
+        c_concat = torch.cat([cond_features[RGB].permute(0, 3, 1, 2), cond_features[FEATURES].permute(0, 3, 1, 2)], 1)
 
         if is_training:
             # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
@@ -372,8 +395,8 @@ class MVDiffusion(Model):
 
         image = batch["image"].to(self.device)
         cond_rgb, image = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=outputs["rgb"],
-            pred_accumulation=outputs["accumulation"],
+            pred_image=outputs[RGB],
+            pred_accumulation=outputs[ACCUMULATION],
             gt_image=image,
         )
 
@@ -385,6 +408,9 @@ class MVDiffusion(Model):
             "loss_cond_image": self.rgb_loss(downsampled_image, cond_rgb),
             "psnr_cond_image": self.psnr(downsampled_image, cond_rgb)
         }
+
+        if self.config.pixelnerf_type == "dust3r":
+            metrics_dict[ALIGNMENT_LOSS] = outputs[ALIGNMENT_LOSS]
 
         if self.config.cond_only:
             return metrics_dict
@@ -402,15 +428,16 @@ class MVDiffusion(Model):
 
         if self._model.original_elbo_weight > 0:
             loss_vlb = self._model.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-            loss_vlb = (self._model.lvlb_weights[t] * loss_vlb).mean()
+            loss_vlb = (self._model.lvlb_weights[outputs["t"]] * loss_vlb).mean()
             metrics_dict["loss_vlb"] = loss_vlb
 
         return metrics_dict
 
     def get_loss_dict(self, cond, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
-        loss_dict = {
-            "loss_cond_image": metrics_dict["loss_cond_image"],
-        }
+        loss_dict = {}
+
+        if self.config.pixelnerf_type == "dust3r":
+            loss_dict["loss_cond_image"] = metrics_dict["loss_cond_image"]
 
         if self.config.cond_only:
             return loss_dict
@@ -425,10 +452,10 @@ class MVDiffusion(Model):
     def get_image_metrics_and_images(
             self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        image = batch["image"].to(outputs["rgb"].device)
+        image = batch["image"].to(outputs[RGB].device)
         image = self.renderer_rgb.blend_background(image)
 
-        cond_rgb = outputs["rgb"]
+        cond_rgb = outputs[RGB]
         downsampled_image = F.interpolate(image.unsqueeze(0).permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
                                           antialias=True).permute(0, 2, 3, 1)
         metrics_dict = {
@@ -436,16 +463,23 @@ class MVDiffusion(Model):
         }
 
         cond_depth = colormaps.apply_depth_colormap(
-            outputs["depth"].squeeze(0),
-            accumulation=outputs["accumulation"].squeeze(0),
+            outputs[DEPTH].squeeze(0),
+            accumulation=outputs[ACCUMULATION].squeeze(0),
         )
 
         images_dict = {"cond_img": torch.cat([downsampled_image.squeeze(0), cond_rgb.squeeze(0), cond_depth], 1)}
 
+        if self.config.pixelnerf_type == "dust3r":
+            neighbor_depth = colormaps.apply_depth_colormap(
+                outputs[NEIGHBOR_RESULTS][DEPTH].squeeze(0),
+                accumulation=outputs[NEIGHBOR_RESULTS][ACCUMULATION].squeeze(0),
+            )
+            images_dict["dust3r_neighbors"] = torch.cat([outputs[NEIGHBOR_RESULTS][RGB].squeeze(0), neighbor_depth], 0)
+
         if self.config.cond_only:
             return metrics_dict, images_dict
 
-        rgb_row_1 = torch.cat([image, *batch[NEIGHBORING_VIEW_IMAGES].squeeze(0)], 1)
+        rgb_row_1 = torch.cat([image, *batch[NEIGHBOR_IMAGES].squeeze(0)], 1)
         rgb_row_2 = torch.cat([*outputs["samples"]], 1)
         combined_rgb = torch.cat([rgb_row_1, rgb_row_2], dim=0)
 

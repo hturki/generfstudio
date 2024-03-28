@@ -35,6 +35,7 @@ include = ["extern*", "generfstudio*"]
 [project.entry-points."nerfstudio.method_configs"]
 nerfacto_sds = "generfstudio.generfstudio_method_config:nerfacto_sds_method"
 splatfacto_sds = "generfstudio.generfstudio_method_config:splatfacto_sds_method"
+depth_gaussians = "generfstudio.generfstudio_method_config:depth_gaussians_method"
 pixelnerf = "generfstudio.generfstudio_method_config:pixelnerf_method"
 mv_diffusion = "generfstudio.generfstudio_method_config:mv_diffusion_method"
 mv_diffusion_union = "generfstudio.generfstudio_method_config:mv_diffusion_union_method"

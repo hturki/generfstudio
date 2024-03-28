@@ -1,10 +1,7 @@
 import torch
 import torch.nn.functional as F
-from rich.console import Console
 from torch import nn
 from transformers import Dinov2Backbone
-
-CONSOLE = Console(width=120)
 
 
 class DinoV2Encoder(nn.Module):

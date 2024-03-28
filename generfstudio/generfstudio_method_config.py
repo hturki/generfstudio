@@ -220,14 +220,14 @@ mv_diffusion_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 64,
-            "fields": 64
+            "cond_encoder": 16,
+            "fields": 16
         },
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                 neighboring_views_size=3,
-                image_batch_size=4,
+                image_batch_size=16,
                 dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
             ),
             model=MVDiffusionConfig(),

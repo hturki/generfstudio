@@ -5,19 +5,15 @@ import torch
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.field_components import MLP
-from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.base_field import Field
-from rich.console import Console
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_CAMERAS, IMAGE_FEATURES, FEATURE_SCALING
+from generfstudio.generfstudio_constants import NEIGHBOR_CAMERAS, IMAGE_FEATURES, FEATURE_SCALING
 from generfstudio.generfstudio_utils import repeat_interleave, get_pixel_aligned_features
 from generfstudio.pixelnerf_utils.scaled_nerf_encoding import ScaledNeRFEncoding
-
-CONSOLE = Console(width=120)
 
 
 class IBRNetField(Field):
@@ -33,7 +29,7 @@ class IBRNetField(Field):
         self.out_feature_dim = out_feature_dim
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
-        neighboring_cameras = ray_samples.metadata[NEIGHBORING_VIEW_CAMERAS]
+        neighboring_cameras = ray_samples.metadata[NEIGHBOR_CAMERAS]
 
         neighboring_c2w = neighboring_cameras.camera_to_worlds.view(-1, 3, 4)
         rot = neighboring_c2w[:, :3, :3].transpose(1, 2)  # (B, 3, 3)

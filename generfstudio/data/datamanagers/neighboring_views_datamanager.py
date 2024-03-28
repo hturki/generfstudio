@@ -22,8 +22,8 @@ from nerfstudio.utils.misc import get_orig_class
 from torch.nn import Parameter
 from torch.utils.data import DistributedSampler, DataLoader
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, \
-    NEIGHBORING_VIEW_INDICES
+from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, \
+    NEIGHBOR_INDICES
 from generfstudio.generfstudio_utils import repeat_interleave
 
 
@@ -198,7 +198,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             full_data = data
             data = {}
             for key, val in full_data.items():
-                if key in {NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_INDICES, "image_idx"}:
+                if key in {NEIGHBOR_IMAGES, NEIGHBOR_INDICES, "image_idx"}:
                     data[key] = val
                 else:
                     data[key] = val[batch_indices, pixels_y, pixels_x].to(self.device)
@@ -212,15 +212,15 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             if to_return.metadata is None:
                 to_return.metadata = {}
 
-        data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device)
+        data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device)
         self.randomize_background(data)
 
-        to_return.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES]
-        del data[NEIGHBORING_VIEW_IMAGES]
+        to_return.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
+        del data[NEIGHBOR_IMAGES]
 
-        to_return.metadata[NEIGHBORING_VIEW_CAMERAS] = self.train_dataset.cameras[data[NEIGHBORING_VIEW_INDICES]].to(
+        to_return.metadata[NEIGHBOR_CAMERAS] = self.train_dataset.cameras[data[NEIGHBOR_INDICES]].to(
             self.device)
-        del data[NEIGHBORING_VIEW_INDICES]
+        del data[NEIGHBOR_INDICES]
 
         # Used in mv_diffusion - DDP expects us to do all differentiable model computation in the forward function
         to_return.metadata["image"] = data["image"]
@@ -248,15 +248,15 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         if camera.metadata is None:
             camera.metadata = {}
 
-        data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES].to(self.device).unsqueeze(0)
+        data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device).unsqueeze(0)
         self.randomize_background(data)
         data["image"] = data["image"].to(self.device).squeeze(0)
-        camera.metadata[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES]
+        camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
 
-        camera.metadata[NEIGHBORING_VIEW_CAMERAS] = self.eval_dataset.cameras[
-            data[NEIGHBORING_VIEW_INDICES].unsqueeze(0)].to(self.device)
-        del data[NEIGHBORING_VIEW_INDICES]
+        camera.metadata[NEIGHBOR_CAMERAS] = self.eval_dataset.cameras[
+            data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
+        del data[NEIGHBOR_INDICES]
 
         return camera, data
 
@@ -267,7 +267,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             random_bg = torch.rand(data["image"].shape[0], 3, device=data["image"].device)
             data["image"] = data["image"][..., :3] * data["image"][..., 3:] \
                             + random_bg.view(data["image"].shape[0], 1, 1, 3) * (1 - data["image"][..., 3:])
-            data[NEIGHBORING_VIEW_IMAGES] = data[NEIGHBORING_VIEW_IMAGES][..., :3] \
-                                            * data[NEIGHBORING_VIEW_IMAGES][..., 3:] \
-                                            + random_bg.view(data["image"].shape[0], 1, 1, 1, 3) \
-                                            * (1 - data[NEIGHBORING_VIEW_IMAGES][..., 3:])
+            data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES][..., :3] \
+                                    * data[NEIGHBOR_IMAGES][..., 3:] \
+                                    + random_bg.view(data["image"].shape[0], 1, 1, 1, 3) \
+                                    * (1 - data[NEIGHBOR_IMAGES][..., 3:])

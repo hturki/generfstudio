@@ -1,13 +1,10 @@
 import functools
-from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 import torchvision
-from rich.console import Console
+from nerfstudio.utils.rich_utils import CONSOLE
 from torch import nn
-
-CONSOLE = Console(width=120)
 
 
 def get_norm_layer(norm_type="instance", group_norm_groups=32):

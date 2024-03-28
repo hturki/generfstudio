@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import math
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type, Optional, Tuple
+from typing import Type, Optional
 
 import numpy as np
 import torch
@@ -19,7 +18,7 @@ from torch_scatter import scatter_min
 from tqdm import tqdm
 
 from generfstudio.data.dataparsers.dataparser_utils import convert_from_inner, get_xyz_in_camera
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
     POSENC_SCALE
 
 
@@ -49,12 +48,12 @@ class DL3DVDataParserConfig(DataParserConfig):
 
     neighbor_overlap_threshold: Optional[float] = 0.5
 
-    conversion_threads: int = 64
+    conversion_threads: int = 96
 
 
 def convert_scene_metadata(source: Path, dest: Path, crop: Optional[int]) -> None:
-    # Assuming this is from 1080p version of DL3DV and not 4K
-    inner = NerfstudioDataParserConfig(data=source, downscale_factor=4, load_3D_points=True, eval_mode="all").setup()
+    # Assuming this is from 480p version of DL3DV and not 4K
+    inner = NerfstudioDataParserConfig(data=source, downscale_factor=8, load_3D_points=True, eval_mode="all").setup()
     inner_outputs = inner.get_dataparser_outputs("train")
     frames = convert_from_inner(inner_outputs, dest, crop)
 
@@ -67,7 +66,7 @@ def convert_scene_metadata(source: Path, dest: Path, crop: Optional[int]) -> Non
 
     metadata = {"frames": frames}
 
-    if "points3D_xyz" in inner_outputs.metadata:
+    if "points3D_xyz" in inner_outputs.metadata and inner_outputs.metadata["points3D_xyz"].shape[0] > 0:
         xyz_in_camera, uv, is_valid_points, width, height = get_xyz_in_camera(inner_outputs, frames)
 
         max_val = torch.finfo(torch.float32).max
@@ -98,8 +97,10 @@ def convert_scene_metadata(source: Path, dest: Path, crop: Optional[int]) -> Non
         max_bounds = points.max(dim=0)[0]
         metadata["scene_box"] = torch.stack([min_bounds, max_bounds]).tolist()
 
-    with (dest / "metadata.json").open("w") as f:
+    with (dest / "metadata.json.bak").open("w") as f:
         json.dump(metadata, f, indent=4)
+
+    (dest / "metadata.json.bak").rename(dest / "metadata.json")
 
 
 @dataclass
@@ -120,12 +121,18 @@ class DL3DV(DataParser):
         else:
             scenes = []
             to_scan = self.config.data / "original"
+            check_for_colmap = True
             if not to_scan.exists():
                 to_scan = self.config.data / f"crop-{self.config.crop}"
+                check_for_colmap = False
                 CONSOLE.log(f"Original dir not found, using {to_scan} instead")
             for subdir in sorted(to_scan.iterdir()):
                 for scene_dir in sorted(subdir.iterdir()):
-                    scenes.append(f"{scene_dir.parent.name}/{scene_dir.name}")
+                    if (not check_for_colmap) \
+                            or ((scene_dir / "transforms.json").exists() and (scene_dir / "colmap/sparse/0").exists()):
+                        scenes.append(f"{scene_dir.parent.name}/{scene_dir.name}")
+                    # else:
+                    #     CONSOLE.log(f"Skipping {scene_dir}: {(scene_dir / 'transforms.json').exists()} {(scene_dir / 'colmap/sparse/0').exists()}")
 
             if split == "train":
                 scenes = scenes[:-self.config.eval_scene_count]
@@ -144,11 +151,11 @@ class DL3DV(DataParser):
 
         with ProcessPoolExecutor(max_workers=self.config.conversion_threads) as executor:
             convert_tasks = []
-            for scene in scenes:
+            for scene in tqdm(scenes):
                 source = self.config.data / "original" / scene
                 dest = self.config.data / f"crop-{self.config.crop}" / scene
                 converted_metadata_path = dest / "metadata.json"
-                if (source / "transforms.json").exists() and (not converted_metadata_path.exists()):
+                if not converted_metadata_path.exists():
                     convert_tasks.append(executor.submit(convert_scene_metadata, source, dest, self.config.crop))
 
             for task in tqdm(convert_tasks):
@@ -201,7 +208,7 @@ class DL3DV(DataParser):
             scene_index_end = scene_index_start + len(frames)
 
             for scene_image_index, frame in enumerate(frames):
-                image_filenames.append(frame["file_path"])
+                image_filenames.append(dest / frame["file_path"])
                 c2w = torch.FloatTensor(frame["transform_matrix"])
                 c2w[:3, 3] /= pose_scale_factor
 
@@ -281,7 +288,7 @@ class DL3DV(DataParser):
         }
 
         if neighboring_views is not None:
-            metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
+            metadata[NEIGHBOR_INDICES] = neighboring_views
 
         if (not get_default_scene) and self.config.scene_id is None:
             metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)

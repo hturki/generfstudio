@@ -15,7 +15,7 @@ from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, POSENC_SCALE
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE
 from generfstudio.generfstudio_utils import central_crop_v2
 
 
@@ -272,7 +272,7 @@ class R10K(DataParser):
         }
 
         if neighboring_views is not None:
-            metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
+            metadata[NEIGHBOR_INDICES] = neighboring_views
 
         # if (not get_default_scene) and self.config.scene_id is None:
         #     metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)

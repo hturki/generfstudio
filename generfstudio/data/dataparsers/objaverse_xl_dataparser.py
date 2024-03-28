@@ -19,7 +19,7 @@ from torch_scatter import scatter_min
 from tqdm import tqdm
 
 from generfstudio.data.dataparsers.dataparser_utils import convert_from_inner, get_xyz_in_camera
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
     POSENC_SCALE
 
 
@@ -37,7 +37,7 @@ class ObjaverseXLDataParserConfig(DataParserConfig):
     train_split_fraction: float = 0.9
     """The percentage of the dataset to use for training. Only used when using a single scene."""
 
-    default_scene_id: str = "000/000012ec-fe38-56d8-a85d-88e3cbf7457d"
+    default_scene_id: str = "000/00003e32-f857-5921-a019-f56966f903f3"
 
     scale_near: Optional[float] = None
 
@@ -184,7 +184,7 @@ class ObjaverseXL(DataParser):
         }
 
         if neighboring_views is not None:
-            metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
+            metadata[NEIGHBOR_INDICES] = neighboring_views
 
         if (not get_default_scene) and self.config.scene_id is None:
             metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)

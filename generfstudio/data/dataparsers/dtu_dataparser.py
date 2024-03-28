@@ -16,7 +16,7 @@ from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA
 from generfstudio.generfstudio_utils import central_crop_v2
 
 # OpenCV to OpenGL
@@ -231,7 +231,7 @@ class DTU(DataParser):
             for image_filename, neighbors in zip(image_filenames, neighboring_views):
                 for neighbor in neighbors:
                     assert image_filename.parent.parent == image_filenames[neighbor].parent.parent
-            metadata[NEIGHBORING_VIEW_INDICES] = neighboring_views
+            metadata[NEIGHBOR_INDICES] = neighboring_views
 
         if (not get_default_scene) and self.config.scene_id is None:
             metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)

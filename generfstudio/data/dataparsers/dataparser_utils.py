@@ -46,7 +46,7 @@ def convert_from_inner(inner_outputs: DataparserOutputs, dest: Path, crop: Optio
         image.save(image_path)
 
         frames.append({
-            "file_path": str(image_path),
+            "file_path": f"images/{image_path.name}",
             "transform_matrix": camera.camera_to_worlds.tolist(),
             "w": image.size[0],
             "h": image.size[1],

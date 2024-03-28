@@ -22,8 +22,8 @@ from nerfstudio.model_components.renderers import (
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
+from nerfstudio.utils.rich_utils import CONSOLE
 from pytorch_msssim import SSIM
-from rich.console import Console
 from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -34,12 +34,9 @@ from generfstudio.fields.image_encoder import ImageEncoder
 from generfstudio.fields.pixelnerf_field import PixelNeRFField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.fields.unet import UNet
-from generfstudio.generfstudio_constants import NEIGHBORING_VIEW_IMAGES, NEIGHBORING_VIEW_CAMERAS, NEAR, FAR, \
-    IMAGE_FEATURES, \
-    FEATURE_SCALING, GLOBAL_LATENT, NEIGHBORING_VIEW_COUNT, DEFAULT_SCENE_METADATA
+from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, NEAR, FAR, \
+    IMAGE_FEATURES, FEATURE_SCALING, GLOBAL_LATENT, DEFAULT_SCENE_METADATA
 from generfstudio.pixelnerf_utils.pdf_and_depth_sampler import PDFAndDepthSampler
-
-CONSOLE = Console(width=120)
 
 
 @dataclass
@@ -153,7 +150,7 @@ class PixelNeRFModel(Model):
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
-        self.default_scene_metadata = {NEIGHBORING_VIEW_COUNT: self.config.default_scene_view_count}
+        self.default_scene_metadata = {}
         self.default_scene_latents = None
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -174,23 +171,22 @@ class PixelNeRFModel(Model):
         Args:
             camera: generates raybundle
         """
-        if camera.metadata is not None and NEIGHBORING_VIEW_CAMERAS in camera.metadata:
+        if camera.metadata is not None and NEIGHBOR_CAMERAS in camera.metadata:
             ray_bundle_metadata = {}
 
-            ray_bundle_metadata[IMAGE_FEATURES] = self._get_latents(camera.metadata[NEIGHBORING_VIEW_IMAGES])
-            del camera.metadata[NEIGHBORING_VIEW_IMAGES]
+            ray_bundle_metadata[IMAGE_FEATURES] = self._get_latents(camera.metadata[NEIGHBOR_IMAGES])
+            del camera.metadata[NEIGHBOR_IMAGES]
 
-            ray_bundle_metadata[NEIGHBORING_VIEW_CAMERAS] = camera.metadata[NEIGHBORING_VIEW_CAMERAS]
-            del camera.metadata[NEIGHBORING_VIEW_CAMERAS]
+            ray_bundle_metadata[NEIGHBOR_CAMERAS] = camera.metadata[NEIGHBOR_CAMERAS]
+            del camera.metadata[NEIGHBOR_CAMERAS]
         else:
             if self.default_scene_latents is None:
                 neighboring_views = np.linspace(0, len(self.default_scene.cameras) - 1,
                                                 self.config.default_scene_view_count, dtype=np.int32)
                 scene_dataset = InputDataset(self.default_scene)
-                neighboring_view_images = [scene_dataset.get_image_float32(i).to(self.device) for i in
-                                           neighboring_views]
-                self.default_scene_latents = self._get_latents(neighboring_view_images)
-                self.default_scene_metadata[NEIGHBORING_VIEW_CAMERAS] = self.default_scene.cameras[
+                neighbor_images = [scene_dataset.get_image_float32(i).to(self.device) for i in neighboring_views]
+                self.default_scene_latents = self._get_latents(neighbor_images)
+                self.default_scene_metadata[NEIGHBOR_CAMERAS] = self.default_scene.cameras[
                     torch.LongTensor(neighboring_views)].to(self.device)
 
             ray_bundle_metadata = self.default_scene_metadata
@@ -199,8 +195,8 @@ class PixelNeRFModel(Model):
         ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
         return self.get_outputs_for_camera_ray_bundle(ray_bundle, ray_bundle_metadata)
 
-    def _get_latents(self, neighboring_view_images: torch.Tensor) -> Tuple:
-        latent = self.encoder(neighboring_view_images.view(-1, *neighboring_view_images.shape[2:]).permute(0, 3, 1, 2))
+    def _get_latents(self, neighbor_images: torch.Tensor) -> Tuple:
+        latent = self.encoder(neighbor_images.view(-1, *neighbor_images.shape[2:]).permute(0, 3, 1, 2))
         if self.config.freeze_encoder:
             latent = latent.detach()
 
@@ -208,7 +204,7 @@ class PixelNeRFModel(Model):
         latent_scaling = latent_scaling / (latent_scaling - 1) * 2.0
 
         if self.config.use_global_encoder:
-            global_latent = self.global_encoder(neighboring_view_images)
+            global_latent = self.global_encoder(neighbor_images)
             if self.config.freeze_encoder:
                 global_latent = global_latent.detach()
 
@@ -255,27 +251,24 @@ class PixelNeRFModel(Model):
             latents = ray_bundle.metadata[IMAGE_FEATURES]
             del ray_bundle.metadata[IMAGE_FEATURES]
         else:
-            latents = self._get_latents(ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES])
-            del ray_bundle.metadata[NEIGHBORING_VIEW_IMAGES]
+            latents = self._get_latents(ray_bundle.metadata[NEIGHBOR_IMAGES])
+            del ray_bundle.metadata[NEIGHBOR_IMAGES]
 
         if self.config.use_global_encoder:
             latent, latent_scaling, global_latent = latents
         else:
             latent, latent_scaling = latents
 
-        neighboring_view_cameras = ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
-        del ray_bundle.metadata[NEIGHBORING_VIEW_CAMERAS]
-
-        # neighboring_view_count = neighboring_view_cameras.shape[-1]
+        neighbor_cameras = ray_bundle.metadata[NEIGHBOR_CAMERAS]
+        del ray_bundle.metadata[NEIGHBOR_CAMERAS]
 
         ray_sample_metadata = {}
-        ray_sample_metadata[NEIGHBORING_VIEW_CAMERAS] = neighboring_view_cameras
-        # ray_sample_metadata[NEIGHBORING_VIEW_COUNT] = neighboring_view_count
+        ray_sample_metadata[NEIGHBOR_CAMERAS] = neighbor_cameras
         ray_sample_metadata[IMAGE_FEATURES] = latent
 
         # TODO: This assumes that all camera views have the same dimensions
-        width = neighboring_view_cameras.width[0, 0].item()
-        height = neighboring_view_cameras.height[0, 0].item()
+        width = neighbor_cameras.width[0, 0].item()
+        height = neighbor_cameras.height[0, 0].item()
         ray_sample_metadata[FEATURE_SCALING] = latent_scaling / torch.FloatTensor([width, height]).to(self.device)
 
         if self.config.use_global_encoder:

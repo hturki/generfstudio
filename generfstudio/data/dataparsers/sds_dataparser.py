@@ -76,7 +76,6 @@ class SDS(DataParser):
             if self.config.init_with_depth:
                 model = load_model(self.config.dust3r_checkpoint_path, "cuda")
                 images = load_images([str(x) for x in train_image_filenames], size=224)
-                import pdb; pdb.set_trace()
 
                 has_alpha = False # np.asarray(Image.open(train_image_filenames[0])).shape[-1] == 4
                 if has_alpha:

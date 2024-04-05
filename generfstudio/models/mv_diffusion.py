@@ -19,7 +19,6 @@ from nerfstudio.utils.comms import get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
 from omegaconf import OmegaConf
 from pytorch_msssim import SSIM
-from rich.console import Console
 from torch import nn
 from torch.nn import Parameter, MSELoss
 from torchmetrics import PeakSignalNoiseRatio
@@ -65,6 +64,7 @@ class MVDiffusionConfig(ModelConfig):
     freeze_cond_image_encoder: bool = False
 
     dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    dust3r_alignment_lr: int = 0.02
     dust3r_alignment_iter: int = 30
     dust3r_use_confidence_opacity: bool = False
 
@@ -161,7 +161,10 @@ class MVDiffusion(Model):
                 positional_encoding_scale_factor=self.posenc_scale)
         elif self.config.pixelnerf_type == "dust3r":
             self.cond_feature_field = Dust3rField(checkpoint_path=self.config.dust3r_checkpoint_path,
-                                                  alignment_lr=self.config.dust3r_alignment_iter,
+                                                  in_feature_dim=encoder_dim,
+                                                  out_feature_dim=128,
+                                                  alignment_lr=self.config.dust3r_alignment_lr,
+                                                  alignment_iter=self.config.dust3r_alignment_iter,
                                                   use_confidence_opacity=self.config.dust3r_use_confidence_opacity)
         else:
             raise Exception(self.config.pixelnerf_type)
@@ -193,10 +196,7 @@ class MVDiffusion(Model):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        if self.config.pixelnerf_type != "dust3r":
-            param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
-        else:
-            param_groups["cond_encoder"] = []
+        param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
 
         if not self.config.freeze_cond_image_encoder:
             param_groups["cond_encoder"] += list(self.cond_image_encoder.parameters())
@@ -285,8 +285,7 @@ class MVDiffusion(Model):
 
         rgbs = torch.cat(rgbs).view(cond_rgbs.shape[0], image_size, image_size, 3)
         features = torch.cat(features).view(cond_rgbs.shape[0], image_size, image_size, -1)
-        accumulations = torch.cat(accumulations).view(cond_rgbs.shape[0], image_size,
-                                                      image_size, 1)
+        accumulations = torch.cat(accumulations).view(cond_rgbs.shape[0], image_size, image_size, 1)
         outputs = {
             RGB: rgbs,
             FEATURES: features,
@@ -436,7 +435,7 @@ class MVDiffusion(Model):
     def get_loss_dict(self, cond, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         loss_dict = {}
 
-        if self.config.pixelnerf_type == "dust3r":
+        if self.config.pixelnerf_type != "dust3r":
             loss_dict["loss_cond_image"] = metrics_dict["loss_cond_image"]
 
         if self.config.cond_only:

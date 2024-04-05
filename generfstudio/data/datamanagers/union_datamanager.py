@@ -14,6 +14,7 @@ from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManag
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from torch.nn import Parameter
 from torch.utils.data import DistributedSampler
+from tqdm import tqdm
 
 from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
     NeighboringViewsDatamanager
@@ -55,10 +56,12 @@ class UnionDatamanagerConfig(DataManagerConfig):
 
     # Making this a config makes startup very slow
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
-    #     DL3DVDataParserConfig(),
-    #     CO3DDataParserConfig(),
-    #     R10KDataParserConfig(),
-    #     R10KDataParserConfig(data=Path("data/r10k")),
+    # DL3DVDataParserConfig(),
+    # CO3DDataParserConfig(),
+    # R10KDataParserConfig(),
+    # ObjaverseXLDataParserConfig(),
+    # R10KDataParserConfig(data=Path("data/r10k")),
+    # MVImgNetDataParserConfig()
     # ])
 
 
@@ -66,10 +69,18 @@ DATAPARSERS = [
     DL3DVDataParserConfig(),
     CO3DDataParserConfig(),
     R10KDataParserConfig(),
-    ObjaverseXLDataParserConfig(),
+    MVImgNetDataParserConfig(),
     R10KDataParserConfig(data=Path("data/r10k")),
-    MVImgNetDataParserConfig()
 ]
+
+# DATAPARSERS = [
+#     DL3DVDataParserConfig(),
+#     CO3DDataParserConfig(),
+#     R10KDataParserConfig(),
+#     ObjaverseXLDataParserConfig(),
+#     R10KDataParserConfig(data=Path("data/r10k")),
+#     MVImgNetDataParserConfig()
+# ]
 
 
 class UnionDatamanager(DataManager):
@@ -87,7 +98,7 @@ class UnionDatamanager(DataManager):
             **kwargs,
     ):
         self.delegates = []
-        for dataparser in DATAPARSERS:
+        for dataparser in tqdm(DATAPARSERS):
             inner = deepcopy(config.inner)
             inner.dataparser = dataparser
             self.delegates.append(
@@ -102,29 +113,8 @@ class UnionDatamanager(DataManager):
         self.train_dataset = self.create_train_dataset()
         self.eval_dataset = self.create_eval_dataset()
 
-        # self.config = config
-        # self.device = device
         self.world_size = world_size
-        # self.local_rank = local_rank
         self.test_mode = test_mode
-        # self.test_split = "test" if test_mode in ["test", "inference"] else "val"
-        # # self.dataparser_config = self.config.dataparser
-        # # if self.config.data is not None:
-        # #     self.config.dataparser.data = Path(self.config.data)
-        # # else:
-        # #     self.config.data = self.config.dataparser.data
-        # self.dataparser = self.dataparser_config.setup()
-        # if test_mode == "inference":
-        #     self.dataparser.downscale_factor = 1  # Avoid opening images
-        # self.includes_time = self.dataparser.includes_time
-        #
-        # self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
-        # self.train_dataset = self.create_train_dataset()
-        # assert self.train_dataset.cameras.distortion_params is None
-        # self.eval_dataset = self.create_eval_dataset()
-        # assert self.eval_dataset.cameras.distortion_params is None
-        #
-        # self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
         super().__init__()
 

@@ -44,6 +44,8 @@ class Dust3rField(nn.Module):
     def __init__(
             self,
             checkpoint_path: str,
+            in_feature_dim: int = 512,
+            out_feature_dim: int = 128,
             image_dim: int = 224,
             project_features: bool = True,
             alignment_iter: int = 300,
@@ -53,12 +55,15 @@ class Dust3rField(nn.Module):
     ) -> None:
         super().__init__()
         self.model = load_model(checkpoint_path, "cpu")
+        for p in self.model.parameters():
+            p.requires_grad_(False)
         self.image_dim = image_dim
         self.project_features = project_features
         self.alignment_iter = alignment_iter
         self.alignment_lr = alignment_lr
         self.alignment_schedule = alignment_schedule
         self.use_confidence_opacity = use_confidence_opacity
+        self.feature_layer = nn.Linear(in_feature_dim, out_feature_dim)
 
     @torch.cuda.amp.autocast(enabled=False)
     def splat_gaussians(self, camera: Cameras, xyz: torch.Tensor, scales: torch.Tensor, conf: torch.Tensor,
@@ -80,62 +85,36 @@ class Dust3rField(nn.Module):
             16,
         )
 
-        # if radii.sum() == 0:
-        #     rgbs.append(torch.zeros(target_cameras.height[i], target_cameras.width[i], 3, devices=xys.device))
-        #     accumulations.append(torch.zeros(target_cameras.height[i], target_cameras.width[i], 1, devices=xys.device))
-        # assert (num_tiles_hit > 0).any()
+        inputs = [rgbs]
+        if features is not None:
+            inputs.append(features.float())
+        if return_depth:
+            inputs.append(depths.unsqueeze(-1))
 
-        pixel_rgb, alpha = rasterize_gaussians(
+        inputs = torch.cat(inputs, -1)
+
+        splat_results, alpha = rasterize_gaussians(
             xys,
             depths,
             radii,
             conics,
             num_tiles_hit,
-            rgbs,
+            inputs,
             conf,
             camera.height[0].item(),
             camera.width[0].item(),
-            16,
-            background=torch.zeros(3, device=xys.device),
+            8,
+            background=torch.zeros(inputs.shape[-1], device=xys.device),
             return_alpha=True,
         )
 
-        outputs = {RGB: pixel_rgb, ACCUMULATION: alpha.unsqueeze(-1)}
+        outputs = {RGB: splat_results[..., :3], ACCUMULATION: alpha.unsqueeze(-1)}
 
         if features is not None:
-            pixel_features = rasterize_gaussians(
-                xys,
-                depths,
-                radii,
-                conics,
-                num_tiles_hit,
-                features.float(),
-                conf,
-                camera.height[0].item(),
-                camera.width[0].item(),
-                8,
-                background=torch.zeros(features.shape[-1], device=xys.device),
-                return_alpha=False,
-            )
-            outputs[FEATURES] = pixel_features
+            outputs[FEATURES] = splat_results[..., 3:3 + features.shape[-1]]
 
         if return_depth:
-            depth = rasterize_gaussians(
-                xys,
-                depths,
-                radii,
-                conics,
-                num_tiles_hit,
-                depths.unsqueeze(-1),
-                conf,
-                camera.height[0].item(),
-                camera.width[0].item(),
-                16,
-                background=torch.zeros(1, device=xys.device),
-                return_alpha=False,
-            )
-
-            outputs[DEPTH] = depth
+            outputs[DEPTH] = splat_results[..., -1:]
 
         return outputs
 
@@ -145,7 +124,12 @@ class Dust3rField(nn.Module):
             cond_rgbs = F.interpolate(cond_rgbs.view(-1, *cond_rgbs.shape[2:]), self.image_dim, mode="bilinear")
             cond_rgbs = cond_rgbs.view(len(target_cameras), -1, *cond_rgbs.shape[1:])
             cond_rgbs_duster_input = cond_rgbs * 2 - 1
-            cond_features = F.interpolate(cond_features, self.image_dim, mode="bilinear")
+
+            # bilinear interpolation can be expensive for high-dimensional features
+            b, d, h, w = cond_features.shape
+            cond_features = cond_features.permute(0, 2, 3, 1)
+            cond_features = self.feature_layer(cond_features.view(-1, d)).view(b, h, w, -1)
+            cond_features = F.interpolate(cond_features.permute(0, 3, 1, 2), self.image_dim)
             cond_features = cond_features.view(len(target_cameras), -1, *cond_features.shape[1:])
 
         neighbor_cameras = deepcopy(neighbor_cameras)
@@ -223,7 +207,8 @@ class Dust3rField(nn.Module):
             for j in range(len(neighbor_cameras[i])):
                 image_xyz = pts3d[j].detach().view(-1, 3)
                 image_rgb = cond_rgbs[i, j].permute(1, 2, 0).view(-1, 3)
-                image_features = cond_features[i, j].permute(1, 2, 0).view(-1, cond_features.shape[2])
+                image_features = cond_features[i, j].permute(1, 2, 0)
+                image_features = image_features.view(-1, image_features.shape[-1])
                 pixel_area = neighbor_cameras[i].generate_rays(camera_indices=j).pixel_area.view(-1, 1)
 
                 scene_xyz.append(image_xyz)

@@ -13,6 +13,8 @@ from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
+from nerfstudio.utils.comms import get_rank, get_world_size
+from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
 from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE
@@ -126,7 +128,9 @@ class R10K(DataParser):
     config: R10KDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}.pt"
+        rank = get_rank()
+        world_size = get_world_size()
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{rank}-{world_size}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -136,17 +140,25 @@ class R10K(DataParser):
             scenes = [self.config.scene_id]
         else:
             scenes = []
+            check_for_source = (self.config.data / "train").exists()
+            if not check_for_source:
+                CONSOLE.log(f"Original dir not found")
+
             for dir in ["train", "test", "validation"]:
                 if (self.config.data / "metadata" / dir).exists():
                     for file in sorted((self.config.data / "metadata" / dir).iterdir()):
                         scene = f"{dir}/{file.stem}"
-                        if (self.config.data / scene).exists():
+                        if (not check_for_source) or (self.config.data / scene).exists():
                             scenes.append(scene)
 
             if split == "train":
                 scenes = scenes[:-self.config.eval_scene_count]
+                scenes = scenes[rank::world_size]
             else:
                 scenes = scenes[-self.config.eval_scene_count:]
+
+            if split != "train" and rank > 0:
+                scenes = scenes[:1]
 
         image_filenames = []
         c2ws = []
@@ -161,13 +173,9 @@ class R10K(DataParser):
         to_convert = []
         with ThreadPoolExecutor(max_workers=self.config.conversion_threads) as executor:
             for scene in scenes:
-                metadata_name_bak = f"{scene}-{self.config.crop}-{self.config.crop}.json"
                 metadata_name = f"{scene}-{self.config.crop}.json" if self.config.crop is not None else f"{scene}.json"
-
                 nerfstudio_metadata_path = self.config.data / "nerfstudio" / metadata_name
-                nerfstudio_metadata_path_bak = self.config.data / "nerfstudio" / metadata_name_bak
-                if nerfstudio_metadata_path_bak.exists():
-                    nerfstudio_metadata_path_bak.rename(nerfstudio_metadata_path)
+
                 if not nerfstudio_metadata_path.exists():
                     to_convert.append(executor.submit(convert_scene_metadata, scene,
                                                       self.config.data / "metadata" / f"{scene}.txt",

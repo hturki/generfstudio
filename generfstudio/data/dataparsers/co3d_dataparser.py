@@ -19,6 +19,7 @@ from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
+from nerfstudio.utils.comms import get_world_size, get_rank
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
@@ -143,7 +144,9 @@ class CO3D(DataParser):
     config: CO3DDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}.pt"
+        rank = get_rank()
+        world_size = get_world_size()
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{rank}-{world_size}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -163,11 +166,15 @@ class CO3D(DataParser):
                                                 sorted(category_dir.iterdir())))
                     if split == "train":
                         sequence_dirs = sequence_dirs[:-self.config.eval_sequences_per_category]
+                        sequence_dirs = sequence_dirs[rank::world_size]
                     else:
                         sequence_dirs = sequence_dirs[-self.config.eval_sequences_per_category:]
 
                     for sequence_dir in sequence_dirs:
                         scenes.append(f"{sequence_dir.parent.name}/{sequence_dir.name}")
+
+            if split != "train" and rank > 0:
+                scenes = scenes[:1]
 
         image_filenames = []
         c2ws = []
@@ -333,8 +340,8 @@ class CO3D(DataParser):
         if neighboring_views is not None:
             metadata[NEIGHBOR_INDICES] = neighboring_views
 
-        if (not get_default_scene) and self.config.scene_id is None:
-            metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
+        # if (not get_default_scene) and self.config.scene_id is None:
+        #     metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
 
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,

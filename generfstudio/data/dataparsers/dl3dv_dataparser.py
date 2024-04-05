@@ -13,6 +13,7 @@ from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserCo
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import get_train_eval_split_fraction
+from nerfstudio.utils.comms import get_rank, get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
 from torch_scatter import scatter_min
 from tqdm import tqdm
@@ -110,7 +111,9 @@ class DL3DV(DataParser):
     config: DL3DVDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{self.config.neighbor_overlap_threshold}.pt"
+        rank = get_rank()
+        world_size = get_world_size()
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{self.config.neighbor_overlap_threshold}-{rank}-{world_size}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -136,8 +139,12 @@ class DL3DV(DataParser):
 
             if split == "train":
                 scenes = scenes[:-self.config.eval_scene_count]
+                scenes = scenes[rank::world_size]
             else:
                 scenes = scenes[-self.config.eval_scene_count:]
+
+            if split != "train" and rank > 0:
+                scenes = scenes[:1]
 
         image_filenames = []
         c2ws = []
@@ -290,8 +297,8 @@ class DL3DV(DataParser):
         if neighboring_views is not None:
             metadata[NEIGHBOR_INDICES] = neighboring_views
 
-        if (not get_default_scene) and self.config.scene_id is None:
-            metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
+        # if (not get_default_scene) and self.config.scene_id is None:
+        #     metadata[DEFAULT_SCENE_METADATA] = self._generate_dataparser_outputs(split, get_default_scene=True)
 
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,

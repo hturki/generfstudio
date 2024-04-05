@@ -76,9 +76,13 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
 
         self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
         self.train_dataset = self.create_train_dataset()
-        assert self.train_dataset.cameras.distortion_params is None
+        self.train_cameras = self.train_dataparser_outputs.cameras
+        assert self.train_cameras.distortion_params is None
+
+        self.eval_dataparser_outputs = self.dataparser.get_dataparser_outputs(split=self.test_split)
         self.eval_dataset = self.create_eval_dataset()
-        assert self.eval_dataset.cameras.distortion_params is None
+        self.eval_cameras = self.train_dataparser_outputs.cameras
+        assert self.eval_cameras.distortion_params is None
 
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
@@ -95,7 +99,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     def create_eval_dataset(self) -> TDataset:
         """Sets up the data loaders for evaluation"""
         return self.dataset_type(
-            dataparser_outputs=self.dataparser.get_dataparser_outputs(split=self.test_split),
+            dataparser_outputs=self.eval_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
             neighboring_views_size=self.config.neighboring_views_size
         )
@@ -132,7 +136,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         super().setup_train()
         self.set_train_loader()
         if self.config.rays_per_image is not None:
-            self.train_ray_generator = RayGenerator(self.train_dataset.cameras.to(self.device))
+            self.train_ray_generator = RayGenerator(self.train_cameras.to(self.device))
 
     # def setup_eval(self):
     #     """Sets up the data loader for evaluation"""
@@ -141,19 +145,23 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         assert self.config.image_batch_size % self.world_size == 0
         batch_size = self.config.image_batch_size // self.world_size
 
+        # do the sharding at the dataparser level for CPU memory efficiency
+        # if self.world_size > 1:
+        #     # if self.train_sampler is not None:
+        #     #     epoch = self.train_sampler.epoch
+        #     self.train_sampler = DistributedSampler(self.train_dataset, self.world_size, self.local_rank)
+        #     # if self.train_sampler is not None:
+        #     #     self.train_sampler.set_epoch(epoch)
+        #
+        #     self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size,
+        #                                        sampler=self.train_sampler, num_workers=0,
+        #                                        pin_memory=True, collate_fn=self.config.collate_fn)
+        # else:
         if self.world_size > 1:
-            # if self.train_sampler is not None:
-            #     epoch = self.train_sampler.epoch
+            # define train sampler to keep nerfstudio happy
             self.train_sampler = DistributedSampler(self.train_dataset, self.world_size, self.local_rank)
-            # if self.train_sampler is not None:
-            #     self.train_sampler.set_epoch(epoch)
-
-            self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size,
-                                               sampler=self.train_sampler, num_workers=4,
-                                               pin_memory=True, collate_fn=self.config.collate_fn)
-        else:
-            self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True,
-                                               num_workers=4, pin_memory=True, collate_fn=self.config.collate_fn)
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True,
+                                           num_workers=4, pin_memory=True, collate_fn=self.config.collate_fn)
 
         self.iter_train_dataloader = iter(self.train_dataloader)
 
@@ -168,7 +176,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         for i in image_indices:
             data.append(self.eval_dataset[i])
             data[i]["image"] = data[i]["image"].to(self.device)
-            cameras.append(self.eval_dataset.cameras[i: i + 1])
+            cameras.append(self.eval_cameras[i: i + 1])
 
         return list(zip(cameras, data))
 
@@ -208,7 +216,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
                            pixels_y.unsqueeze(-1), pixels_x.unsqueeze(-1)], -1))
         else:
             data["image"] = data["image"].to(self.device)
-            to_return = self.train_dataset.cameras[data["image_idx"]].to(self.device)
+            to_return = self.train_cameras[data["image_idx"]].to(self.device)
             if to_return.metadata is None:
                 to_return.metadata = {}
 
@@ -218,7 +226,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         to_return.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         del data[NEIGHBOR_IMAGES]
 
-        to_return.metadata[NEIGHBOR_CAMERAS] = self.train_dataset.cameras[data[NEIGHBOR_INDICES]].to(
+        to_return.metadata[NEIGHBOR_CAMERAS] = self.train_cameras[data[NEIGHBOR_INDICES]].to(
             self.device)
         del data[NEIGHBOR_INDICES]
 
@@ -242,9 +250,9 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
         data = deepcopy(self.eval_dataset[image_idx])
-        data["image"] = data["image"].to(self.device).unsqueeze(0) # unsqueeze for randomize_background
-        assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
-        camera = self.eval_dataset.cameras[image_idx:image_idx + 1].to(self.device)
+        data["image"] = data["image"].to(self.device).unsqueeze(0)  # unsqueeze for randomize_background
+        assert len(self.eval_cameras.shape) == 1, "Assumes single batch dimension"
+        camera = self.eval_cameras[image_idx:image_idx + 1].to(self.device)
         if camera.metadata is None:
             camera.metadata = {}
 
@@ -254,7 +262,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
 
-        camera.metadata[NEIGHBOR_CAMERAS] = self.eval_dataset.cameras[
+        camera.metadata[NEIGHBOR_CAMERAS] = self.eval_cameras[
             data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
         del data[NEIGHBOR_INDICES]
 

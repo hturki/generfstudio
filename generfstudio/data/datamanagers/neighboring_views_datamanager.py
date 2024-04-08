@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import random
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
+from itertools import cycle
 from pathlib import Path
 from typing import Dict, ForwardRef, Generic, List, Literal, Tuple, Type, Union, cast, get_args, get_origin, \
     Callable, Any, Optional
@@ -43,6 +45,8 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
 
     collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
 
+    train_chunks: int = 10
+
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     config: NeighboringViewsDatamanagerConfig
@@ -74,9 +78,13 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.dataparser.downscale_factor = 1  # Avoid opening images
         self.includes_time = self.dataparser.includes_time
 
-        self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
-        self.train_dataset = self.create_train_dataset()
-        self.train_cameras = self.train_dataparser_outputs.cameras
+        if world_size > 1:
+            self.load_train_chunk_executor = ThreadPoolExecutor(max_workers=1)
+            self.chunk_index = cycle(range(self.config.train_chunks))
+            self.load_train_chunk_future = self.load_train_chunk_executor.submit(
+                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), self.config.train_chunks)
+
+        self.set_train_data()
         assert self.train_cameras.distortion_params is None
 
         self.eval_dataparser_outputs = self.dataparser.get_dataparser_outputs(split=self.test_split)
@@ -87,6 +95,17 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
         super().__init__()
+
+    def set_train_data(self):
+        if self.world_size > 1:
+            self.train_dataparser_outputs = self.load_train_chunk_future.result()
+            self.load_train_chunk_future = self.load_train_chunk_executor.submit(
+                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), self.config.train_chunks)
+        else:
+            self.train_dataparser_outputs = self.dataparser.get_dataparser_outputs(split="train")
+
+        self.train_dataset = self.create_train_dataset()
+        self.train_cameras = self.train_dataparser_outputs.cameras
 
     def create_train_dataset(self) -> TDataset:
         """Sets up the data loaders for training"""
@@ -194,7 +213,12 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     def next_train(self, step: int) -> Tuple[Union[Cameras, RayBundle], Dict]:
         data = next(self.iter_train_dataloader, None)
         if data is None:
-            self.iter_train_dataloader = iter(self.train_dataloader)
+            if self.world_size > 1:
+                self.set_train_data()
+                self.setup_train()
+            else:
+                self.iter_train_dataloader = iter(self.train_dataloader)
+
             data = next(self.iter_train_dataloader)
 
         if self.config.rays_per_image is not None:

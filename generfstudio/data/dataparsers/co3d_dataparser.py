@@ -143,10 +143,10 @@ class CO3D(DataParser):
 
     config: CO3DDataParserConfig
 
-    def _generate_dataparser_outputs(self, split="train", get_default_scene=False):
+    def _generate_dataparser_outputs(self, split="train", chunk_index=None, num_chunks=None, get_default_scene=False):
         rank = get_rank()
         world_size = get_world_size()
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{rank}-{world_size}.pt"
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{rank}-{world_size}-{chunk_index}-{num_chunks}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -167,6 +167,8 @@ class CO3D(DataParser):
                     if split == "train":
                         sequence_dirs = sequence_dirs[:-self.config.eval_sequences_per_category]
                         sequence_dirs = sequence_dirs[rank::world_size]
+                        if chunk_index is not None:
+                            sequence_dirs = sequence_dirs[chunk_index::num_chunks]
                     else:
                         sequence_dirs = sequence_dirs[-self.config.eval_sequences_per_category:]
 

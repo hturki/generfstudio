@@ -9,7 +9,6 @@ from typing import Dict, List, Literal, Tuple, Union, Type
 import torch
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from torch.nn import Parameter
@@ -65,22 +64,22 @@ class UnionDatamanagerConfig(DataManagerConfig):
     # ])
 
 
-DATAPARSERS = [
-    DL3DVDataParserConfig(),
-    CO3DDataParserConfig(),
-    R10KDataParserConfig(),
-    MVImgNetDataParserConfig(),
-    R10KDataParserConfig(data=Path("data/r10k")),
-]
-
 # DATAPARSERS = [
 #     DL3DVDataParserConfig(),
 #     CO3DDataParserConfig(),
 #     R10KDataParserConfig(),
-#     ObjaverseXLDataParserConfig(),
+#     MVImgNetDataParserConfig(),
 #     R10KDataParserConfig(data=Path("data/r10k")),
-#     MVImgNetDataParserConfig()
 # ]
+
+DATAPARSERS = [
+    DL3DVDataParserConfig(),
+    CO3DDataParserConfig(),
+    R10KDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+    R10KDataParserConfig(data=Path("data/r10k")),
+    MVImgNetDataParserConfig()
+]
 
 
 class UnionDatamanager(DataManager):

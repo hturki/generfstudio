@@ -9,11 +9,14 @@ import numpy as np
 import torch
 from PIL import Image
 
+from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
+
 try:
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
     from dust3r.image_pairs import make_pairs
-    from dust3r.inference import inference, load_model
+    from dust3r.inference import inference
     from dust3r.utils.image import load_images
+    from dust3r.model import AsymmetricCroCo3DStereo
 except:
     pass
 
@@ -36,6 +39,7 @@ class SDSDataParserConfig(DataParserConfig):
     image_cond_override: Optional[Path] = None
 
     init_with_depth: bool = True
+    use_global_optimizer: bool = True
 
     dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
 
@@ -74,30 +78,57 @@ class SDS(DataParser):
             }
 
             if self.config.init_with_depth:
-                model = load_model(self.config.dust3r_checkpoint_path, "cuda")
-                images = load_images([str(x) for x in train_image_filenames], size=224)
-
-                has_alpha = False # np.asarray(Image.open(train_image_filenames[0])).shape[-1] == 4
-                if has_alpha:
-                    masks = [torch.BoolTensor(np.asarray(Image.open(x).resize((224, 224), Image.NEAREST))[..., 3] > 0)
-                             for x in train_image_filenames]
-
-                pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
-                output = inference(pairs, model, "cuda", batch_size=1)
-                scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer)
-
                 c2ws = torch.eye(4).unsqueeze(0).repeat(len(train_image_cameras), 1, 1)
                 c2ws[:, :3] = train_image_cameras.camera_to_worlds
                 c2ws[:, :, 1:3] *= -1  # opengl to opencv
 
                 cameras = deepcopy(train_image_cameras)
                 cameras.rescale_output_resolution(224 / torch.maximum(cameras.width, cameras.height))
-                scene.preset_pose(c2ws)
-                scene.preset_focal(cameras.fx) # Assume fx and fy are almost equal
-                scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.01)
 
-                pts3d = scene.get_pts3d()
+                model = AsymmetricCroCo3DStereo.from_pretrained(self.config.dust3r_checkpoint_path).cuda()
 
+                images = load_images([str(x) for x in train_image_filenames], size=224)
+                has_alpha = False  # np.asarray(Image.open(train_image_filenames[0])).shape[-1] == 4
+                if has_alpha:
+                    masks = [torch.BoolTensor(np.asarray(Image.open(x).resize((224, 224), Image.NEAREST))[..., 3] > 0)
+                             for x in train_image_filenames]
+
+                if self.config.use_global_optimizer:
+                    with torch.no_grad():
+                        view1 = {"img": [], "idx": [], "instance": []}
+                        view2 = {"img": [], "idx": [], "instance": []}
+                        for first in range(len(images)):
+                            for second in range(len(images)):
+                                if first == second:
+                                    continue
+                                view1["img"].append(images[first]["img"][0])
+                                view2["img"].append(images[second]["img"][0])
+                                view1["idx"].append(first)
+                                view1["instance"].append(str(first))
+                                view2["idx"].append(second)
+                                view2["instance"].append(str(second))
+
+                        view1["img"] = torch.stack(view1["img"]).cuda()
+                        view2["img"] = torch.stack(view2["img"]).cuda()
+
+                        pred1, pred2 = model(view1, view2)
+                        cameras = cameras.to("cuda")
+                        scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, c2ws.cuda(), cameras.fx, cameras.fy,
+                                                          cameras.cx, cameras.cy, cameras.shape[0] - 1,
+                                                          pnp_method="pytorch3d")
+                        pts3d = scene.depth_to_pts3d()
+                else:
+                    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+                    output = inference(pairs, model, "cuda", batch_size=1)
+                    scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer,
+                                           optimize_pp=True)
+                    scene.preset_pose(c2ws)
+                    scene.preset_focal(cameras.fx)  # Assume fx and fy are almost equal
+                    scene.preset_principal_point(cameras.cx)  # Assume cx and cy are almost equal
+                    scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.01)
+                    pts3d = scene.get_pts3d()
+                
+                
                 xyz = []
                 rgb = []
                 scales = []
@@ -106,7 +137,7 @@ class SDS(DataParser):
                     image_xyz = pts3d[i].detach().view(-1, 3)
                     image_rgb = images[i]["img"].squeeze(0).permute(1, 2, 0).detach().view(-1, 3).to(image_xyz.device)
                     pixel_area = cameras.generate_rays(camera_indices=i).pixel_area.view(-1, 1).to(image_xyz.device)
-                    confidence = torch.log(scene.im_conf[i].detach().view(-1, 1)).clamp_max(1)
+                    # confidence = torch.log(scene.im_conf[i].detach().view(-1, 1)).clamp_max(1)
 
                     if has_alpha:
                         mask = masks[i].view(-1)
@@ -122,12 +153,12 @@ class SDS(DataParser):
                     distances = (image_xyz - camera_pos.to(image_xyz.device)).norm(dim=-1, keepdim=True)
                     scales.append(pixel_area.to(distances.device) * distances)
 
-                    confs.append(confidence)
+                    # confs.append(confidence)
 
                 metadata["points3D_xyz"] = torch.cat(xyz)
                 metadata["points3D_rgb"] = ((torch.cat(rgb) / 2 + 0.5) * 255).byte()
                 metadata["points3D_scale"] = torch.cat(scales)
-                metadata["points3D_conf"] = torch.cat(confs)
+                # metadata["points3D_conf"] = torch.cat(confs)
 
             return DataparserOutputs(
                 image_filenames=train_image_filenames,

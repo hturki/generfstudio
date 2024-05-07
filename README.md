@@ -13,7 +13,7 @@ cd generfstudio
 pip install -e .
 ```
 
-## 2. Install additional dependences
+## 2. Install additional dependencies
 
 ```bash
 pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch

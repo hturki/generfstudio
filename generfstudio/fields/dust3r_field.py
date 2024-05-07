@@ -1,3 +1,4 @@
+from collections import defaultdict
 from copy import deepcopy
 from typing import Optional
 
@@ -5,15 +6,18 @@ import numpy as np
 import torch
 from gsplat import project_gaussians, rasterize_gaussians
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.utils import profiler
 from torch import nn
 from torch.nn import functional as F
 
+from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 from generfstudio.generfstudio_constants import RGB, FEATURES, ACCUMULATION, ALIGNMENT_LOSS, NEIGHBOR_RESULTS, DEPTH
 
 try:
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+    from dust3r.model import AsymmetricCroCo3DStereo
     from dust3r.image_pairs import make_pairs
-    from dust3r.inference import inference, load_model
+    from dust3r.inference import inference
 except:
     pass
 
@@ -43,28 +47,35 @@ class Dust3rField(nn.Module):
 
     def __init__(
             self,
-            checkpoint_path: str,
+            model_name: str,
             in_feature_dim: int = 512,
             out_feature_dim: int = 128,
             image_dim: int = 224,
             project_features: bool = True,
+            min_conf_thr: int = 3,
+            pnp_method: str = "pytorch3d",
+            use_elem_wise_pt_conf: bool = False,
             alignment_iter: int = 300,
             alignment_lr: float = 0.01,
             alignment_schedule: str = "cosine",
             use_confidence_opacity: bool = False,
     ) -> None:
         super().__init__()
-        self.model = load_model(checkpoint_path, "cpu")
+        self.model = AsymmetricCroCo3DStereo.from_pretrained(model_name)
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.image_dim = image_dim
         self.project_features = project_features
+        self.min_conf_thr = min_conf_thr
+        self.pnp_method = pnp_method
+        self.use_elem_wise_pt_conf = use_elem_wise_pt_conf
         self.alignment_iter = alignment_iter
         self.alignment_lr = alignment_lr
         self.alignment_schedule = alignment_schedule
         self.use_confidence_opacity = use_confidence_opacity
         self.feature_layer = nn.Linear(in_feature_dim, out_feature_dim)
 
+    @profiler.time_function
     @torch.cuda.amp.autocast(enabled=False)
     def splat_gaussians(self, camera: Cameras, xyz: torch.Tensor, scales: torch.Tensor, conf: torch.Tensor,
                         w2c: torch.Tensor, projmat: torch.Tensor, rgbs: torch.Tensor, features: Optional[torch.Tensor],
@@ -118,6 +129,7 @@ class Dust3rField(nn.Module):
 
         return outputs
 
+    @profiler.time_function
     def forward(self, target_cameras: Cameras, neighbor_cameras: Cameras, cond_rgbs: torch.Tensor,
                 cond_features: torch.Tensor):
         with torch.no_grad():
@@ -135,7 +147,9 @@ class Dust3rField(nn.Module):
         neighbor_cameras = deepcopy(neighbor_cameras)
         neighbor_cameras.rescale_output_resolution(self.image_dim / neighbor_cameras.height[0, 0].item())
 
-        neighbor_c2ws = torch.eye(4).view(1, 1, 4, 4).repeat(neighbor_cameras.shape[0], neighbor_cameras.shape[1], 1, 1)
+        neighbor_c2ws = torch.eye(4, device=neighbor_cameras.device).view(1, 1, 4, 4).repeat(neighbor_cameras.shape[0],
+                                                                                             neighbor_cameras.shape[1],
+                                                                                             1, 1)
         neighbor_c2ws[:, :, :3] = neighbor_cameras.camera_to_worlds
         neighbor_c2ws[:, :, :, 1:3] *= -1  # opengl to opencv (what dust3r expects)
 
@@ -178,57 +192,113 @@ class Dust3rField(nn.Module):
                                                   neighbor_fovy.view(-1, 1)).view(neighbor_w2cs.shape)
 
         alignment_loss = 0
+        with profiler.time_function("dust3r_for_all_cameras"), torch.no_grad():
+            with profiler.time_function("dust3r_load_images"):
+                view1 = {"img": [], "idx": [], "instance": []}
+                view2 = {"img": [], "idx": [], "instance": []}
+                for i in range(len(target_cameras)):
+                    for first in range(len(cond_rgbs_duster_input[i])):
+                        for second in range(len(cond_rgbs_duster_input[i])):
+                            if first == second:
+                                continue
+                            view1["img"].append(cond_rgbs_duster_input[i, first])
+                            view2["img"].append(cond_rgbs_duster_input[i, second])
+                            view_idx_first = i * len(cond_rgbs_duster_input[i]) + first
+                            view1["idx"].append(view_idx_first)
+                            view1["instance"].append(str(view_idx_first))
+                            view_idx_second = i * len(cond_rgbs_duster_input[i]) + second
+                            view2["idx"].append(view_idx_second)
+                            view2["instance"].append(str(view_idx_second))
+
+                view1["img"] = torch.stack(view1["img"])
+                view2["img"] = torch.stack(view2["img"])
+
+            pred1, pred2 = self.model(view1, view2)
+            scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, neighbor_c2ws.view(-1, 4, 4),
+                                              neighbor_cameras.fx.view(-1, 1), neighbor_cameras.fy.view(-1, 1),
+                                              neighbor_cameras.cx.view(-1, 1), neighbor_cameras.cy.view(-1, 1),
+                                              cond_rgbs_duster_input.shape[1] - 1, min_conf_thr=self.min_conf_thr,
+                                              pnp_method=self.pnp_method,
+                                              use_elem_wise_pt_conf=self.use_elem_wise_pt_conf)
+            pts3d = scene.pts3d_world().float()
+            depth = scene.depth().float()
+            camera_indices = torch.cat(
+                [torch.arange(neighbor_cameras.shape[0]).repeat_interleave(neighbor_cameras.shape[1]).unsqueeze(-1),
+                 torch.arange(neighbor_cameras.shape[1]).repeat(neighbor_cameras.shape[0]).unsqueeze(-1)], -1)
+            pixel_areas = neighbor_cameras.generate_rays(camera_indices=camera_indices).pixel_area.permute(2, 0, 1, 3)
+
         for i in range(len(target_cameras)):
-            # Imitate what load_images does. "true_shape" is probably not necessary
-            scene_images = [{
-                "img": cond_rgbs_duster_input[i, j:j + 1],
-                "instance": str(j),
-                "idx": j,
-                "true_shape": np.int32([cond_rgbs_duster_input[i, j:j + 1].shape[-2:]]),
-            } for j in range(len(cond_rgbs_duster_input[i]))]
-            pairs = make_pairs(scene_images, scene_graph="complete", prefilter=None, symmetrize=True)
-            outputs = inference(pairs, self.model, cond_rgbs.device, batch_size=20)
-            scene = global_aligner(outputs, device=cond_rgbs.device, mode=GlobalAlignerMode.PointCloudOptimizer)
+            # with profiler.time_function("dust3r_load_images_old"):
+            #     # Imitate what load_images does. "true_shape" is probably not necessary
+            #     scene_images = [{
+            #         "img": cond_rgbs_duster_input[i, j:j + 1],
+            #         "instance": str(j),
+            #         "idx": j,
+            #         "true_shape": np.int32([cond_rgbs_duster_input[i, j:j + 1].shape[-2:]]),
+            #     } for j in range(len(cond_rgbs_duster_input[i]))]
+            #     pairs = make_pairs(scene_images, scene_graph="complete", prefilter=None, symmetrize=True)
+            #
+            # with profiler.time_function("dust3r_inference"):
+            #     outputs = inference(pairs, self.model, cond_rgbs.device, batch_size=20, verbose=False)
+            #
+            # scene = global_aligner(outputs, device=cond_rgbs.device, mode=GlobalAlignerMode.PointCloudOptimizer,
+            #                        verbose=False, optimize_pp=True)
+            #
+            # scene.preset_pose(neighbor_c2ws[i])
+            # scene.preset_focal(neighbor_cameras[i].fx.cpu())  # Assume fx and fy are almost equal
+            # scene.preset_principal_point(neighbor_cameras[i].cx.cpu())  # Assume cx and cy are almost equal
+            #
+            # import pdb;
+            # pdb.set_trace()
+            #
+            # with profiler.time_function("dust3r_global_alignment"):
+            #     with torch.enable_grad():
+            #         alignment_loss += scene.compute_global_alignment(init="known_poses", niter=self.alignment_iter,
+            #                                                          schedule=self.alignment_schedule,
+            #                                                          lr=self.alignment_lr)
+            with profiler.time_function("create_splats"):
+                scene_xyz = pts3d[i * neighbor_cameras.shape[1]:(i + 1) * neighbor_cameras.shape[1]].reshape(-1, 3)
+                scene_rgbs = cond_rgbs[i].permute(0, 2, 3, 1).view(-1, 3)
+                scene_features = cond_features[i].permute(0, 2, 3, 1)
+                scene_features = scene_features.view(-1, scene_features.shape[-1])
+                scene_depths = depth[i * neighbor_cameras.shape[1]:(i + 1) * neighbor_cameras.shape[1]].reshape(-1, 1)
+                scene_pixel_areas = pixel_areas[
+                                    i * neighbor_cameras.shape[1]:(i + 1) * neighbor_cameras.shape[1]].reshape(-1, 1)
+                scene_scales = (scene_depths * scene_pixel_areas).expand(-1, 3)
+                scene_opacity = torch.ones_like(scene_xyz[..., :1])
 
-            scene.preset_pose(neighbor_c2ws[i])
-            scene.preset_focal(neighbor_cameras[i].fx.cpu())  # Assume fx and fy are almost equal
-
-            with torch.enable_grad():
-                alignment_loss += scene.compute_global_alignment(init="known_poses", niter=self.alignment_iter,
-                                                                 schedule=self.alignment_schedule, lr=self.alignment_lr)
-            pts3d = scene.get_pts3d()
-
-            scene_xyz = []
-            scene_rgbs = []
-            scene_features = []
-            scene_scales = []
-            if self.use_confidence_opacity:
-                scene_opacity = []
-            for j in range(len(neighbor_cameras[i])):
-                image_xyz = pts3d[j].detach().view(-1, 3)
-                image_rgb = cond_rgbs[i, j].permute(1, 2, 0).view(-1, 3)
-                image_features = cond_features[i, j].permute(1, 2, 0)
-                image_features = image_features.view(-1, image_features.shape[-1])
-                pixel_area = neighbor_cameras[i].generate_rays(camera_indices=j).pixel_area.view(-1, 1)
-
-                scene_xyz.append(image_xyz)
-                scene_rgbs.append(image_rgb)
-                scene_features.append(image_features)
-
-                camera_pos = neighbor_cameras[i, j].camera_to_worlds[:, 3]
-                distances = (image_xyz - camera_pos).norm(dim=-1, keepdim=True)
-                scene_scales.append(pixel_area * distances)
-
-                if self.use_confidence_opacity:
-                    confidence = torch.log(scene.im_conf[j].detach().view(-1, 1))
-                    scene_opacity.append(confidence)
-
-            scene_xyz = torch.cat(scene_xyz)
-            scene_rgbs = torch.cat(scene_rgbs)
-            scene_scales = torch.cat(scene_scales).repeat(1, 3)
-            scene_features = torch.cat(scene_features)
-            scene_opacity = torch.cat(scene_opacity).clamp_max(1) if self.use_confidence_opacity \
-                else torch.ones_like(scene_xyz[..., :1])
+                # pts3d = scene.get_pts3d()
+                # scene_xyz = []
+                # scene_rgbs = []
+                # scene_features = []
+                # scene_scales = []
+                # if self.use_confidence_opacity:
+                #     scene_opacity = []
+                # for j in range(len(neighbor_cameras[i])):
+                #     image_xyz = pts3d[j].detach().view(-1, 3)
+                #     image_rgb = cond_rgbs[i, j].permute(1, 2, 0).view(-1, 3)
+                #     image_features = cond_features[i, j].permute(1, 2, 0)
+                #     image_features = image_features.view(-1, image_features.shape[-1])
+                #     pixel_area = neighbor_cameras[i].generate_rays(camera_indices=j).pixel_area.view(-1, 1)
+                #
+                #     scene_xyz.append(image_xyz)
+                #     scene_rgbs.append(image_rgb)
+                #     scene_features.append(image_features)
+                #
+                #     camera_pos = neighbor_cameras[i, j].camera_to_worlds[:, 3]
+                #     distances = (image_xyz - camera_pos).norm(dim=-1, keepdim=True)
+                #     scene_scales.append(pixel_area * distances)
+                #
+                #     if self.use_confidence_opacity:
+                #         confidence = torch.log(scene.im_conf[j].detach().view(-1, 1))
+                #         scene_opacity.append(confidence)
+                #
+                # scene_xyz = torch.cat(scene_xyz)
+                # scene_rgbs = torch.cat(scene_rgbs)
+                # scene_scales = torch.cat(scene_scales).repeat(1, 3)
+                # scene_features = torch.cat(scene_features)
+                # scene_opacity = torch.cat(scene_opacity).clamp_max(1) if self.use_confidence_opacity \
+                #     else torch.ones_like(scene_xyz[..., :1])
 
             if not self.training:
                 scene_neighbor_rgbs = []

@@ -14,7 +14,7 @@ from nerfstudio.model_components.ray_samplers import UniformLinDispPiecewiseSamp
 from nerfstudio.model_components.renderers import RGBRenderer, DepthRenderer, SemanticRenderer, AccumulationRenderer
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
-from nerfstudio.utils import colormaps
+from nerfstudio.utils import colormaps, profiler
 from nerfstudio.utils.comms import get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
 from omegaconf import OmegaConf
@@ -63,7 +63,10 @@ class MVDiffusionConfig(ModelConfig):
 
     freeze_cond_image_encoder: bool = False
 
-    dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    dust3r_min_conf_thr: int = 3
+    dust3r_pnp_method: str = "pytorch3d"
+    dust3r_use_elem_wise_pt_conf: bool = False
     dust3r_alignment_lr: int = 0.02
     dust3r_alignment_iter: int = 30
     dust3r_use_confidence_opacity: bool = False
@@ -160,9 +163,12 @@ class MVDiffusion(Model):
                 out_feature_dim=128,
                 positional_encoding_scale_factor=self.posenc_scale)
         elif self.config.pixelnerf_type == "dust3r":
-            self.cond_feature_field = Dust3rField(checkpoint_path=self.config.dust3r_checkpoint_path,
+            self.cond_feature_field = Dust3rField(model_name=self.config.dust3r_model_name,
                                                   in_feature_dim=encoder_dim,
                                                   out_feature_dim=128,
+                                                  min_conf_thr=self.config.dust3r_min_conf_thr,
+                                                  pnp_method=self.config.dust3r_pnp_method,
+                                                  use_elem_wise_pt_conf=self.config.dust3r_use_elem_wise_pt_conf,
                                                   alignment_lr=self.config.dust3r_alignment_lr,
                                                   alignment_iter=self.config.dust3r_alignment_iter,
                                                   use_confidence_opacity=self.config.dust3r_use_confidence_opacity)
@@ -224,6 +230,7 @@ class MVDiffusion(Model):
             ),
         ]
 
+    @profiler.time_function
     def get_cond_features(self, cameras: Cameras, cond_rgbs: torch.Tensor):
         neighbor_count = cond_rgbs.shape[1]
         cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
@@ -448,6 +455,7 @@ class MVDiffusion(Model):
 
         return loss_dict
 
+    @profiler.time_function
     def get_image_metrics_and_images(
             self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:

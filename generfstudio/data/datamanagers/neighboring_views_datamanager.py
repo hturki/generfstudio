@@ -15,7 +15,6 @@ from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
-from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
@@ -46,6 +45,8 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
     collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
 
     train_chunks: int = 10
+    
+    using_dust3r: bool = False
 
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):

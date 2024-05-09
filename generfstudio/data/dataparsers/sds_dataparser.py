@@ -8,6 +8,7 @@ from typing import Type, Optional
 import numpy as np
 import torch
 from PIL import Image
+from dust3r.cloud_opt.base_opt import global_alignment_loop
 
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 
@@ -114,9 +115,10 @@ class SDS(DataParser):
                         pred1, pred2 = model(view1, view2)
                         cameras = cameras.to("cuda")
                         scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, c2ws.cuda(), cameras.fx, cameras.fy,
-                                                          cameras.cx, cameras.cy, cameras.shape[0] - 1,
-                                                          pnp_method="pytorch3d")
-                        pts3d = scene.depth_to_pts3d()
+                                                          cameras.cx, cameras.cy, cameras.shape[0] - 1)
+                    # scene.init_scale_from_poses()
+                    global_alignment_loop(scene, niter=300, schedule="cosine", lr=0.01)
+                    pts3d = scene.pts3d_world()
                 else:
                     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
                     output = inference(pairs, model, "cuda", batch_size=1)

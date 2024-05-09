@@ -67,8 +67,8 @@ class MVDiffusionConfig(ModelConfig):
     dust3r_min_conf_thr: int = 3
     dust3r_pnp_method: str = "pytorch3d"
     dust3r_use_elem_wise_pt_conf: bool = False
-    dust3r_alignment_lr: int = 0.02
-    dust3r_alignment_iter: int = 30
+    dust3r_alignment_lr: int = 0.01
+    dust3r_alignment_iter: int = 300
     dust3r_use_confidence_opacity: bool = False
 
 

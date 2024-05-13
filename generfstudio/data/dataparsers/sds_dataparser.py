@@ -9,8 +9,12 @@ import numpy as np
 import torch
 from PIL import Image
 from dust3r.cloud_opt.base_opt import global_alignment_loop
+from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
+from dust3r.utils.geometry import geotrf
 
+from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
+from generfstudio.generfstudio_constants import DEPTH
 
 try:
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
@@ -32,7 +36,9 @@ from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConf
 class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
-    inner: DataParserConfig = field(default_factory=lambda: BlenderDataParserConfig())
+    inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
+        scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
+    # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""
 
     start: int = 0
@@ -60,8 +66,8 @@ class SDS(DataParser):
     def _generate_dataparser_outputs(self, split='train') -> DataparserOutputs:
         inner_outputs = self.inner.get_dataparser_outputs(split)
         if split == 'train':
-            train_image_filenames = inner_outputs.image_filenames[self.start:self.end + 1]
-            train_image_cameras = inner_outputs.cameras[self.start:self.end + 1]
+            train_image_filenames = inner_outputs.image_filenames[::10][self.start:self.end + 1]
+            train_image_cameras = inner_outputs.cameras[::10][self.start:self.end + 1]
             image_cond_override = self.config.image_cond_override
 
             if image_cond_override is not None:
@@ -94,7 +100,24 @@ class SDS(DataParser):
                     masks = [torch.BoolTensor(np.asarray(Image.open(x).resize((224, 224), Image.NEAREST))[..., 3] > 0)
                              for x in train_image_filenames]
 
-                if self.config.use_global_optimizer:
+                if DEPTH in inner_outputs.metadata:
+
+                    depths = []
+                    for frame_path_pt in inner_outputs.metadata[DEPTH][::10][self.start:self.end + 1]:
+                        frame_depth = torch.load(frame_path_pt, map_location="cpu")
+                        depths.append(frame_depth)
+                    # import pdb;
+                    # pdb.set_trace()
+                    depths = torch.stack(depths)
+                    pixels_im = torch.stack(
+                        torch.meshgrid(torch.arange(224, dtype=torch.float32),
+                                       torch.arange(224, dtype=torch.float32),
+                                       indexing="ij")).permute(2, 1, 0)
+                    pixels = pixels_im.reshape(-1, 2)
+                    pts3d_cam = _fast_depthmap_to_pts3d(depths, pixels.unsqueeze(0).expand(depths.shape[0], -1, -1),
+                                                        cameras.fx, torch.cat([cameras.cx, cameras.cy], -1))
+                    pts3d = geotrf(c2ws, pts3d_cam)
+                elif self.config.use_global_optimizer:
                     with torch.no_grad():
                         view1 = {"img": [], "idx": [], "instance": []}
                         view2 = {"img": [], "idx": [], "instance": []}
@@ -114,10 +137,13 @@ class SDS(DataParser):
 
                         pred1, pred2 = model(view1, view2)
                         cameras = cameras.to("cuda")
-                        scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, c2ws.cuda(), cameras.fx, cameras.fy,
-                                                          cameras.cx, cameras.cy, cameras.shape[0] - 1)
+                        scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, c2ws.cuda(), cameras.fx,
+                                                          cameras.fy,
+                                                          cameras.cx, cameras.cy, None, None, None, None,
+                                                          cameras.shape[0] - 1, verbose=True)
+                        scene.init_least_squares()
                     # scene.init_scale_from_poses()
-                    global_alignment_loop(scene, niter=300, schedule="cosine", lr=0.01)
+                    # global_alignment_loop(scene, niter=300, schedule="cosine", lr=0.01)
                     pts3d = scene.pts3d_world()
                 else:
                     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
@@ -127,10 +153,10 @@ class SDS(DataParser):
                     scene.preset_pose(c2ws)
                     scene.preset_focal(cameras.fx)  # Assume fx and fy are almost equal
                     scene.preset_principal_point(cameras.cx)  # Assume cx and cy are almost equal
-                    scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.01)
+                    scene.compute_global_alignment(init="known_poses", niter=3000, schedule="cosine", lr=0.1)
+                    # scene.clean_pointcloud()
                     pts3d = scene.get_pts3d()
-                
-                
+
                 xyz = []
                 rgb = []
                 scales = []
@@ -142,11 +168,11 @@ class SDS(DataParser):
                     # confidence = torch.log(scene.im_conf[i].detach().view(-1, 1)).clamp_max(1)
 
                     if has_alpha:
-                        mask = masks[i].view(-1)
+                        mask = scene.get_masks()[i].view(-1)
                         image_rgb = image_rgb[mask]
                         image_xyz = image_xyz[mask]
                         pixel_area = pixel_area[mask]
-                        confidence = confidence[mask]
+                        # confidence = confidence[mask]
 
                     xyz.append(image_xyz)
                     rgb.append(image_rgb)

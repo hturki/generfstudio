@@ -171,7 +171,7 @@ class Dust3rField(nn.Module):
         rgbs = []
         features = []
         accumulations = []
-        if not self.training:
+        if not self.training or True:
             depths = []
             neighbor_rgbs = []
             neighbor_depths = []
@@ -191,8 +191,12 @@ class Dust3rField(nn.Module):
             neighbor_fovy = 2 * torch.atan(neighbor_cameras.height / (2 * neighbor_cameras.fy))
             neighbor_projmats = projection_matrix(0.001, 1000, neighbor_fovx.view(-1, 1),
                                                   neighbor_fovy.view(-1, 1)).view(neighbor_w2cs.shape)
-
-        if self.training:
+        camera_indices = torch.cat(
+            [torch.arange(neighbor_cameras.shape[0]).repeat_interleave(neighbor_cameras.shape[1]).unsqueeze(-1),
+             torch.arange(neighbor_cameras.shape[1]).repeat(neighbor_cameras.shape[0]).unsqueeze(-1)], -1)
+        pixel_areas = neighbor_cameras.generate_rays(camera_indices=camera_indices).pixel_area.permute(2, 0, 1,
+                                                                                                       3)
+        if self.training or True:
             with profiler.time_function("dust3r_for_all_cameras"):
                 with torch.no_grad():
                     with profiler.time_function("dust3r_load_images"):
@@ -219,23 +223,31 @@ class Dust3rField(nn.Module):
                         pred1, pred2 = self.model(view1, view2)
 
                     with profiler.time_function("dust3r_create_scene"):
+                        # pixel_areas: torch.Tensor, rgbs: torch.Tensor,
+                        # w2cs: torch.Tensor, projmats: torch.Tensor,
                         scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, neighbor_c2ws.view(-1, 4, 4),
-                                                          neighbor_cameras.fx.view(-1, 1), neighbor_cameras.fy.view(-1, 1),
-                                                          neighbor_cameras.cx.view(-1, 1), neighbor_cameras.cy.view(-1, 1),
-                                                          cond_rgbs_duster_input.shape[1] - 1)
-                                                          # min_conf_thr=self.min_conf_thr,
-                                                          # pnp_method=self.pnp_method,
-                                                          # use_elem_wise_pt_conf=self.use_elem_wise_pt_conf)
+                                                          neighbor_cameras.fx.view(-1, 1),
+                                                          neighbor_cameras.fy.view(-1, 1),
+                                                          neighbor_cameras.cx.view(-1, 1),
+                                                          neighbor_cameras.cy.view(-1, 1),
+                                                          pixel_areas,
+                                                          cond_rgbs.view(-1, *cond_rgbs.shape[2:]).permute(0, 2, 3, 1),
+                                                          neighbor_w2cs.view(-1, *neighbor_w2cs.shape[2:]),
+                                                          neighbor_projmats.view(-1, *neighbor_projmats.shape[2:]),
+                                                          cond_rgbs_duster_input.shape[1] - 1,
+                                                          verbose=not self.training)
+                        scene.init_least_squares()
+                        alignment_loss = 0
+                        # min_conf_thr=self.min_conf_thr,
+                        # pnp_method=self.pnp_method,
+                        # use_elem_wise_pt_conf=self.use_elem_wise_pt_conf)
 
-                with torch.enable_grad(), profiler.time_function("dust3r_scale_opt"):
-                    alignment_loss = global_alignment_loop(scene, niter=self.alignment_iter, schedule=self.alignment_schedule,
-                                          lr=self.alignment_lr)
+                # with torch.enable_grad(), profiler.time_function("dust3r_scale_opt"):
+                #     alignment_loss = global_alignment_loop(scene, niter=self.alignment_iter,
+                #                                            schedule=self.alignment_schedule,
+                #                                            lr=self.alignment_lr)
                 pts3d = scene.pts3d_world().float()
                 depth = scene.depth().float()
-                camera_indices = torch.cat(
-                    [torch.arange(neighbor_cameras.shape[0]).repeat_interleave(neighbor_cameras.shape[1]).unsqueeze(-1),
-                     torch.arange(neighbor_cameras.shape[1]).repeat(neighbor_cameras.shape[0]).unsqueeze(-1)], -1)
-                pixel_areas = neighbor_cameras.generate_rays(camera_indices=camera_indices).pixel_area.permute(2, 0, 1, 3)
 
                 for i in range(len(target_cameras)):
                     with profiler.time_function("create_splats"):
@@ -259,6 +271,7 @@ class Dust3rField(nn.Module):
                     features.append(rendering[FEATURES])
                     if not self.training:
                         depths.append(rendering[DEPTH])
+
         else:
             alignment_loss = 0
             for i in range(len(target_cameras)):
@@ -284,10 +297,11 @@ class Dust3rField(nn.Module):
 
                 with profiler.time_function("dust3r_global_alignment_old"):
                     with torch.enable_grad():
-                        alignment_loss += scene.compute_global_alignment(init="mst", niter=3000, #self.alignment_iter,
-                                                                         schedule="cosine", #self.alignment_schedule,
-                                                                         lr=0.1)#self.alignment_lr)
-                        import pdb; pdb.set_trace()
+                        alignment_loss += scene.compute_global_alignment(init="known_poses", niter=3000,
+                                                                         # self.alignment_iter,
+                                                                         schedule="cosine",  # self.alignment_schedule,
+                                                                         lr=0.01)  # self.alignment_lr)
+                        # scene.clean_pointcloud()
                 with profiler.time_function("create_splats_old"):
                     pts3d = scene.get_pts3d()
                     scene_xyz = []
@@ -302,6 +316,14 @@ class Dust3rField(nn.Module):
                         image_features = cond_features[i, j].permute(1, 2, 0)
                         image_features = image_features.view(-1, image_features.shape[-1])
                         pixel_area = neighbor_cameras[i].generate_rays(camera_indices=j).pixel_area.view(-1, 1)
+
+                        # if True:
+                        #     mask = scene.get_masks()[i].view(-1)
+                        #     image_rgb = image_rgb[mask]
+                        #     image_features = image_features[mask]
+                        #     image_xyz = image_xyz[mask]
+                        #     pixel_area = pixel_area[mask]
+                        #     # confidence = confidence[mask]
 
                         scene_xyz.append(image_xyz)
                         scene_rgbs.append(image_rgb)
@@ -321,7 +343,23 @@ class Dust3rField(nn.Module):
                     scene_features = torch.cat(scene_features)
                     scene_opacity = torch.cat(scene_opacity).clamp_max(1) if self.use_confidence_opacity \
                         else torch.ones_like(scene_xyz[..., :1])
+            rendering = self.splat_gaussians(target_cameras[i], scene_xyz, scene_scales, scene_opacity, w2cs[i],
+                                             projmats[i], scene_rgbs, scene_features, not self.training)
 
+            rgbs.append(rendering[RGB])
+            accumulations.append(rendering[ACCUMULATION])
+            features.append(rendering[FEATURES])
+            if not self.training:
+                depths.append(rendering[DEPTH])
+
+        outputs = {
+            RGB: torch.stack(rgbs),
+            FEATURES: torch.stack(features),
+            ACCUMULATION: torch.stack(accumulations),
+            ALIGNMENT_LOSS: alignment_loss,
+        }
+
+        if not self.training:
             if not self.training:
                 scene_neighbor_rgbs = []
                 scene_neighbor_depths = []
@@ -338,23 +376,6 @@ class Dust3rField(nn.Module):
                 neighbor_depths.append(torch.cat(scene_neighbor_depths, 1))
                 neighbor_accumulations.append(torch.cat(scene_neighbor_accumulations, 1))
 
-            rendering = self.splat_gaussians(target_cameras[i], scene_xyz, scene_scales, scene_opacity, w2cs[i],
-                                             projmats[i], scene_rgbs, scene_features, not self.training)
-
-            rgbs.append(rendering[RGB])
-            accumulations.append(rendering[ACCUMULATION])
-            features.append(rendering[FEATURES])
-            if not self.training:
-                depths.append(rendering[DEPTH])
-
-        outputs = {
-            RGB: torch.stack(rgbs),
-            FEATURES: torch.stack(features),
-            ACCUMULATION: torch.stack(accumulations),
-            ALIGNMENT_LOSS: alignment_loss / len(target_cameras),
-        }
-
-        if not self.training:
             outputs[DEPTH] = torch.stack(depths)
             outputs[NEIGHBOR_RESULTS] = {
                 RGB: torch.stack(neighbor_rgbs),

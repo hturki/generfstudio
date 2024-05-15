@@ -64,22 +64,22 @@ class UnionDatamanagerConfig(DataManagerConfig):
     # ])
 
 
-DATAPARSERS = [
-    DL3DVDataParserConfig(),
-    CO3DDataParserConfig(),
-    R10KDataParserConfig(),
-    MVImgNetDataParserConfig(),
-    R10KDataParserConfig(data=Path("data/r10k")),
-]
-
 # DATAPARSERS = [
-#     DL3DVDataParserConfig(),
+#     DL3DVDataParserConfig(use_dust3r_poses=False),
 #     CO3DDataParserConfig(),
 #     R10KDataParserConfig(),
-#     ObjaverseXLDataParserConfig(),
+#     MVImgNetDataParserConfig(),
 #     R10KDataParserConfig(data=Path("data/r10k")),
-#     MVImgNetDataParserConfig()
 # ]
+
+DATAPARSERS = [
+    DL3DVDataParserConfig(use_dust3r_poses=False),
+    CO3DDataParserConfig(),
+    R10KDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+    R10KDataParserConfig(data=Path("data/r10k")),
+    MVImgNetDataParserConfig()
+]
 
 
 class UnionDatamanager(DataManager):

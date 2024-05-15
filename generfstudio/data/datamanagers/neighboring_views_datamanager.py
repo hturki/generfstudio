@@ -24,7 +24,7 @@ from torch.nn import Parameter
 from torch.utils.data import DistributedSampler, DataLoader
 
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, \
-    NEIGHBOR_INDICES
+    NEIGHBOR_INDICES, NEIGHBOR_PTS3D
 from generfstudio.generfstudio_utils import repeat_interleave
 
 
@@ -45,8 +45,6 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
     collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
 
     train_chunks: int = 10
-    
-    using_dust3r: bool = False
 
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
@@ -90,7 +88,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
 
         self.eval_dataparser_outputs = self.dataparser.get_dataparser_outputs(split=self.test_split)
         self.eval_dataset = self.create_eval_dataset()
-        self.eval_cameras = self.train_dataparser_outputs.cameras
+        self.eval_cameras = self.eval_dataparser_outputs.cameras
         assert self.eval_cameras.distortion_params is None
 
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
@@ -255,6 +253,10 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.device)
         del data[NEIGHBOR_INDICES]
 
+        if NEIGHBOR_PTS3D in data:
+            to_return.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].to(self.device)
+            del data[NEIGHBOR_PTS3D]
+
         # Used in mv_diffusion - DDP expects us to do all differentiable model computation in the forward function
         to_return.metadata["image"] = data["image"]
 
@@ -287,9 +289,12 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
 
-        camera.metadata[NEIGHBOR_CAMERAS] = self.eval_cameras[
-            data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
+        camera.metadata[NEIGHBOR_CAMERAS] = self.eval_cameras[data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
         del data[NEIGHBOR_INDICES]
+
+        if NEIGHBOR_PTS3D in data:
+            camera.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].unsqueeze(0).to(self.device)
+            del data[NEIGHBOR_PTS3D]
 
         return camera, data
 

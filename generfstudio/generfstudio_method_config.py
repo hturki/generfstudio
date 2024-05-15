@@ -212,7 +212,7 @@ pixelnerf_method = MethodSpecification(
 mv_diffusion_method = MethodSpecification(
     config=TrainerConfig(
         method_name="mv-diffusion",
-        steps_per_eval_image=1,
+        steps_per_eval_image=1000,
         steps_per_eval_batch=0,
         steps_per_save=1000,
         steps_per_eval_all_images=1000000,
@@ -227,7 +227,7 @@ mv_diffusion_method = MethodSpecification(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                 neighboring_views_size=3,
-                image_batch_size=1,
+                image_batch_size=64,
                 dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
             ),
             model=MVDiffusionConfig(),
@@ -251,7 +251,7 @@ mv_diffusion_method = MethodSpecification(
 mv_diffusion_union_method = MethodSpecification(
     config=TrainerConfig(
         method_name="mv-diffusion-union",
-        steps_per_eval_image=1000,
+        steps_per_eval_image=1,
         steps_per_eval_batch=0,
         steps_per_save=2000,
         steps_per_eval_all_images=1000000,
@@ -267,7 +267,7 @@ mv_diffusion_union_method = MethodSpecification(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                     neighboring_views_size=3,
-                    image_batch_size=4,
+                    image_batch_size=1,
                 ),
             ),
             model=MVDiffusionConfig(),

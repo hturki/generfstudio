@@ -1,11 +1,14 @@
+from copy import deepcopy
 from typing import Dict
 
 import numpy as np
 import torch
+from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
+from dust3r.utils.geometry import geotrf
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
 
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D
 
 
 class NeighboringViewsDataset(InputDataset):
@@ -23,6 +26,18 @@ class NeighboringViewsDataset(InputDataset):
 
         self.neighboring_views_size = neighboring_views_size
 
+        if DEPTH in self.metadata:
+            self.cameras_dust3r = deepcopy(dataparser_outputs.cameras)
+            self.cameras_dust3r.rescale_output_resolution(224 / self.cameras_dust3r.width)
+            self.c2w_dust3r = torch.eye(4).unsqueeze(0).repeat(len(self.cameras_dust3r), 1, 1)
+            self.c2w_dust3r[:, :3] = self.cameras_dust3r.camera_to_worlds
+            self.c2w_dust3r[:, :, 1:3] *= -1  # opengl to opencv
+            pixels_im = torch.stack(
+                torch.meshgrid(torch.arange(224, dtype=torch.float32),
+                               torch.arange(224, dtype=torch.float32),
+                               indexing="ij")).permute(2, 1, 0)
+            self.pixels = pixels_im.reshape(-1, 2)
+
     def get_metadata(self, data: Dict) -> Dict:
         metadata = super().get_metadata(data)
 
@@ -33,5 +48,14 @@ class NeighboringViewsDataset(InputDataset):
         metadata[NEIGHBOR_IMAGES] = torch.cat(
             [self.get_image_float32(x).unsqueeze(0) for x in neighbor_indices])
         metadata[NEIGHBOR_INDICES] = torch.LongTensor(neighbor_indices)
+
+        if DEPTH in self.metadata:
+            neighbor_depth = torch.stack(
+                [torch.load(self.metadata[DEPTH][x], map_location="cpu") for x in neighbor_indices])
+            pts3d_cam = _fast_depthmap_to_pts3d(neighbor_depth,
+                                                self.pixels.unsqueeze(0).expand(neighbor_depth.shape[0], -1, -1),
+                                                self.cameras_dust3r.fx[neighbor_indices], torch.cat(
+                    [self.cameras_dust3r.cx[neighbor_indices], self.cameras_dust3r.cy[neighbor_indices]], -1))
+            metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_dust3r[neighbor_indices], pts3d_cam)
 
         return metadata

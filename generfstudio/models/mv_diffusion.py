@@ -32,7 +32,7 @@ from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, NEAR, FAR, \
-    POSENC_SCALE, RGB, FEATURES, ACCUMULATION, DEPTH, NEIGHBOR_RESULTS, ALIGNMENT_LOSS
+    POSENC_SCALE, RGB, FEATURES, ACCUMULATION, DEPTH, NEIGHBOR_RESULTS, ALIGNMENT_LOSS, NEIGHBOR_PTS3D, VALID_ALIGNMENT
 
 
 @dataclass
@@ -81,6 +81,8 @@ class MVDiffusion(Model):
         self.posenc_scale = metadata[POSENC_SCALE]
         if self.near is not None or self.far is not None:
             CONSOLE.log(f"Using near and far bounds {self.near} {self.far} from metadata")
+        self.depth_available = DEPTH in metadata
+        CONSOLE.log(f"Depth available: {self.depth_available}")
 
         super().__init__(config=config, **kwargs)
 
@@ -171,7 +173,8 @@ class MVDiffusion(Model):
                                                   use_elem_wise_pt_conf=self.config.dust3r_use_elem_wise_pt_conf,
                                                   alignment_lr=self.config.dust3r_alignment_lr,
                                                   alignment_iter=self.config.dust3r_alignment_iter,
-                                                  use_confidence_opacity=self.config.dust3r_use_confidence_opacity)
+                                                  use_confidence_opacity=self.config.dust3r_use_confidence_opacity,
+                                                  depth_available=self.depth_available)
         else:
             raise Exception(self.config.pixelnerf_type)
 
@@ -245,7 +248,8 @@ class MVDiffusion(Model):
         neighbor_cameras = cameras.metadata[NEIGHBOR_CAMERAS]
 
         if self.config.pixelnerf_type == "dust3r":
-            return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features)
+            return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features,
+                                           cameras.metadata.get(NEIGHBOR_PTS3D, None))
 
         feature_scaling = torch.FloatTensor([cond_features.shape[-1], cond_features.shape[-2]]).to(cond_features.device)
         feature_scaling = feature_scaling / (feature_scaling - 1) * 2.0
@@ -322,7 +326,12 @@ class MVDiffusion(Model):
 
         if self.config.pixelnerf_type == "dust3r":
             outputs[ALIGNMENT_LOSS] = cond_features[ALIGNMENT_LOSS]
-            if not is_training:
+            valid_alignment = cond_features[VALID_ALIGNMENT]
+            outputs[VALID_ALIGNMENT] = valid_alignment
+            
+            if is_training:
+                image_cond = image_cond[valid_alignment]
+            else:
                 outputs[NEIGHBOR_RESULTS] = cond_features[NEIGHBOR_RESULTS]
 
         if self.config.cond_only:
@@ -355,7 +364,10 @@ class MVDiffusion(Model):
         if is_training:
             # Hack - we include the gt image in the forward loop, so that all model calculation is done in the
             # forward call as expected in DDP
-            encoder_posterior = self._model.encode_first_stage(cameras.metadata["image"].permute(0, 3, 1, 2) * 2 - 1)
+            image_gt = cameras.metadata["image"]
+            if self.config.pixelnerf_type == "dust3r":
+                image_gt = image_gt[valid_alignment]
+            encoder_posterior = self._model.encode_first_stage(image_gt.permute(0, 3, 1, 2) * 2 - 1)
             z = self._model.get_first_stage_encoding(encoder_posterior).detach()
             t = torch.randint(0, self._model.num_timesteps, (z.shape[0],), device=self.device).long()
             outputs["t"] = t
@@ -400,6 +412,14 @@ class MVDiffusion(Model):
         assert self.training
 
         image = batch["image"].to(self.device)
+        metrics_dict = {}
+        if self.config.pixelnerf_type == "dust3r":
+            metrics_dict[ALIGNMENT_LOSS] = outputs[ALIGNMENT_LOSS]
+            valid_alignment = outputs[VALID_ALIGNMENT]
+            metrics_dict[VALID_ALIGNMENT] = valid_alignment.sum() / valid_alignment.shape[0]
+            image = image[valid_alignment]
+
+
         cond_rgb, image = self.renderer_rgb.blend_background_for_loss_computation(
             pred_image=outputs[RGB],
             pred_accumulation=outputs[ACCUMULATION],
@@ -410,13 +430,8 @@ class MVDiffusion(Model):
             downsampled_image = F.interpolate(image.permute(0, 3, 1, 2), cond_rgb.shape[1:3], mode="bilinear",
                                               antialias=True).permute(0, 2, 3, 1)
 
-        metrics_dict = {
-            "loss_cond_image": self.rgb_loss(downsampled_image, cond_rgb),
-            "psnr_cond_image": self.psnr(downsampled_image, cond_rgb)
-        }
-
-        if self.config.pixelnerf_type == "dust3r":
-            metrics_dict[ALIGNMENT_LOSS] = outputs[ALIGNMENT_LOSS]
+        metrics_dict["loss_cond_image"] = self.rgb_loss(downsampled_image, cond_rgb)
+        metrics_dict["psnr_cond_image"] = self.psnr(downsampled_image, cond_rgb)
 
         if self.config.cond_only:
             return metrics_dict

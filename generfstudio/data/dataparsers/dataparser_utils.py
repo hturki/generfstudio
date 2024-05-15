@@ -1,3 +1,4 @@
+import traceback
 from pathlib import Path
 from typing import Optional, List, Any
 
@@ -129,10 +130,18 @@ def create_dust3r_poses(model, dust3r_path: Path, image_path: Path, frames: List
         else:
             pairs = make_pairs(images, scene_graph="complete", prefilter=None, symmetrize=True)
 
-        output = inference(pairs, model, device, batch_size=1000)
+        output = inference(pairs, model, device, batch_size=50)
         scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
 
-    alignment_loss = scene.compute_global_alignment(init="mst", niter=num_iters, schedule=schedule, lr=lr)
+        dust3r_path.mkdir(parents=True, exist_ok=True)
+        torch.cuda.empty_cache()
+
+    try:
+        alignment_loss = scene.compute_global_alignment(init="mst", niter=num_iters, schedule=schedule, lr=lr)
+    except:
+        traceback.print_exc()
+        (dust3r_path / "FAIL").touch()
+        return
 
     with torch.no_grad():
         focals = scene.get_focals()
@@ -140,7 +149,6 @@ def create_dust3r_poses(model, dust3r_path: Path, image_path: Path, frames: List
         im_poses = scene.get_im_poses()
         depth = scene.get_depthmaps(raw=True)
 
-        dust3r_path.mkdir(parents=True, exist_ok=True)
         for frame, depth_map in zip(frames, depth):
             frame_path_png = Path(dust3r_path / frame["file_path"])
             frame_path_png.parent.mkdir(exist_ok=True, parents=True)
@@ -166,8 +174,10 @@ def create_dust3r_poses(model, dust3r_path: Path, image_path: Path, frames: List
             "alignment_schedule": schedule,
             "near": float(depth.min()),
             "far": float(depth.max()),
-            "scene_box": torch.stack([min_bounds, max_bounds]).cpu().detach().clone()
+            "scene_box": torch.stack([min_bounds, max_bounds]).cpu().detach().clone(),
+            "acc_test": True,
         }, dust3r_path / "scene.pt")
+
 
         # view1 = torch.IntTensor(output["view1"]["idx"])
         # view2 = torch.IntTensor(output["view2"]["idx"])

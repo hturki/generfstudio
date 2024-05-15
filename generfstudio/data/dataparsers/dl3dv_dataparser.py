@@ -4,13 +4,11 @@ import json
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type, Optional
+from typing import Type, Optional, Tuple
 
 import numpy as np
 import torch
-from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
 from dust3r.model import AsymmetricCroCo3DStereo
-from dust3r.utils.geometry import geotrf
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
@@ -49,13 +47,20 @@ class DL3DVDataParserConfig(DataParserConfig):
 
     eval_scene_count: int = 50
 
-    neighbor_overlap_threshold: Optional[float] = 0.5
+    neighbor_overlap_threshold: Optional[Tuple[float, float]] = (0.3, 0.5)
 
     conversion_threads: int = 96
 
     use_dust3r_poses: bool = True
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    # dust3r_model_name: str = "/project_data/ramanan/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+
+    skip_dust3r_incomplete: bool = False
+
+    num_workers: Optional[int] = None
+
+    worker_offset: int = 0
 
 
 def convert_scene_metadata(source: Path, dest: Path, crop: Optional[int]) -> None:
@@ -117,15 +122,22 @@ class DL3DV(DataParser):
     config: DL3DVDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train", chunk_index=None, num_chunks=None, get_default_scene=False):
-        rank = get_rank()
-        world_size = get_world_size()
+        rank = get_rank() + self.config.worker_offset
+        world_size = self.config.num_workers if self.config.num_workers is not None else get_world_size()
 
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{self.config.neighbor_overlap_threshold}-{rank}-{world_size}-{chunk_index}-{num_chunks}.pt"
+        # split = "test"
+
+        overlap_threshold = self.config.neighbor_overlap_threshold
+        crop = self.config.crop
+        scale_near = self.config.scale_near
+        use_dust3r_poses = self.config.use_dust3r_poses
+
+        cached_path = self.config.data / f"cached-metadata-{split}-{crop}-{scale_near}-{overlap_threshold[0]}-{overlap_threshold[1]}--{rank}-{world_size}-{chunk_index}-{num_chunks}-{use_dust3r_poses}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
-        if self.config.use_dust3r_poses:
-            self.model = AsymmetricCroCo3DStereo.from_pretrained(self.config.dust3r_model_name).to(f"cuda:{rank}")
+        if use_dust3r_poses:
+            self.model = AsymmetricCroCo3DStereo.from_pretrained(self.config.dust3r_model_name).to(f"cuda:{get_rank()}")
             for p in self.model.parameters():
                 p.requires_grad_(False)
 
@@ -138,7 +150,7 @@ class DL3DV(DataParser):
             to_scan = self.config.data / "original"
             check_for_colmap = True
             if not to_scan.exists():
-                to_scan = self.config.data / f"crop-{self.config.crop}"
+                to_scan = self.config.data / f"crop-{crop}"
                 check_for_colmap = False
                 CONSOLE.log(f"Original dir not found, using {to_scan} instead")
             for subdir in sorted(to_scan.iterdir()):
@@ -174,10 +186,10 @@ class DL3DV(DataParser):
             convert_tasks = []
             for scene in tqdm(scenes):
                 source = self.config.data / "original" / scene
-                dest = self.config.data / f"crop-{self.config.crop}" / scene
+                dest = self.config.data / f"crop-{crop}" / scene
                 converted_metadata_path = dest / "metadata.json"
                 if not converted_metadata_path.exists():
-                    convert_tasks.append(executor.submit(convert_scene_metadata, source, dest, self.config.crop))
+                    convert_tasks.append(executor.submit(convert_scene_metadata, source, dest, crop))
 
             for task in tqdm(convert_tasks):
                 task.result()
@@ -186,8 +198,12 @@ class DL3DV(DataParser):
         max_bounds = None
         near = 1e10
         far = -1
+
+        if use_dust3r_poses:
+            dust3r_depth_paths = []
+
         for scene in tqdm(scenes):
-            dest = self.config.data / f"crop-{self.config.crop}" / scene
+            dest = self.config.data / f"crop-{crop}" / scene
             converted_metadata_path = dest / "metadata.json"
 
             if not converted_metadata_path.exists():
@@ -201,7 +217,7 @@ class DL3DV(DataParser):
                 CONSOLE.log(f"Skipping {scene} as it has less than 3 frames")
                 continue
 
-            if self.config.neighbor_overlap_threshold is not None:
+            if overlap_threshold is not None:
                 view_overlap_path = dest / "overlap.pt"
                 if not view_overlap_path.exists():
                     CONSOLE.log(f"Skipping {scene} as it does not have point cloud")
@@ -209,89 +225,32 @@ class DL3DV(DataParser):
 
                 frame_intersections = torch.load(view_overlap_path)
 
-            if self.config.use_dust3r_poses:
+            if use_dust3r_poses:
                 dust3r_dest = self.config.data / "dust3r" / scene
                 duster_metadata_path = dust3r_dest / "scene.pt"
 
-                if (dest / "scene.pt").exists():
-                    old_scene = torch.load(dest / "scene.pt", map_location="cpu")
-                    dust3r_dest.mkdir(exist_ok=True, parents=True)
-                    for frame, depth_map in zip(metadata["frames"], old_scene["depth"]):
-                        frame_path_png = Path(dust3r_dest / frame["file_path"])
-                        frame_path_png.parent.mkdir(exist_ok=True, parents=True)
-                        frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
-                        torch.save(depth_map.cpu().detach().clone(), frame_path_pt)
-                        # frame_path_gz = frame_path_png.parent / f"{frame_path_png.stem}.npy.gz"
-                        # f = gzip.GzipFile(str(frame_path_gz), "w")
-                        # numpy.save(file=f, arr=depth_map.detach().cpu().numpy())
-                        # f.close()
-
-                    del old_scene["depth"]
-                    for key, val in old_scene.items():
-                        if isinstance(val, torch.Tensor):
-                            old_scene[key] = val.cpu().detach().clone()
-                    torch.save(old_scene, duster_metadata_path)
-                    (dest / "scene.pt").unlink()
-                    print("converted", duster_metadata_path)
-
                 if not duster_metadata_path.exists():
+                    if self.config.skip_dust3r_incomplete:
+                        continue
+                    if (dust3r_dest / "FAIL").exists():
+                        continue
                     create_dust3r_poses(self.model, dust3r_dest, dest, metadata["frames"], frame_intersections)
+                    torch.cuda.empty_cache()
+
+                    if (dust3r_dest / "FAIL").exists():
+                        continue
 
                 dust3r_metadata = torch.load(duster_metadata_path, map_location="cpu")
-                dust3r_depth_paths = []
-                if dust3r_metadata["alignment_iters"] != 5000:
-                    print("RECREATING", duster_metadata_path, dust3r_metadata["alignment_iters"])
-                    create_dust3r_poses(self.model, dust3r_dest, dest, metadata["frames"], frame_intersections)
-                    dust3r_metadata = torch.load(duster_metadata_path, map_location="cpu")
-
-                if "near" not in dust3r_metadata or dust3r_metadata["far"] < 0:
-                    dust3r_near = 1e10
-                    dust3r_far = -1
-                    for frame in frames:
-                        frame_path_png = Path(dust3r_dest / frame["file_path"])
-                        frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
-                        frame_depth = torch.load(frame_path_pt, map_location="cpu")
-                        dust3r_near = min(float(frame_depth.min()), dust3r_near)
-                        dust3r_far = max(float(frame_depth.max()), dust3r_far)
-
-                    dust3r_metadata["near"] = dust3r_near
-                    dust3r_metadata["far"] = dust3r_far
-                    print(f"Derived bounds for {duster_metadata_path}: {dust3r_near}, {dust3r_far}")
-                    torch.save(dust3r_metadata, duster_metadata_path)
-
-                if "scene_box" not in dust3r_metadata:
-                    depths = []
-                    for frame in frames:
-                        frame_path_png = Path(dust3r_dest / frame["file_path"])
-                        frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
-                        frame_depth = torch.load(frame_path_pt, map_location="cpu")
-                        depths.append(frame_depth)
-
-                    pixels_im = torch.stack(
-                        torch.meshgrid(torch.arange(224, dtype=torch.float32),
-                                       torch.arange(224, dtype=torch.float32),
-                                       indexing="ij")).permute(2, 1, 0)
-                    pixels = pixels_im.reshape(-1, 2)
-
-                    depths = torch.stack(depths)
-                    pts3d_cam = _fast_depthmap_to_pts3d(depths, pixels.unsqueeze(0).expand(depths.shape[0], -1, -1), dust3r_metadata["focals"], dust3r_metadata["pp"])
-                    pts3d_world = geotrf(dust3r_metadata["poses"], pts3d_cam)
-                    min_bounds = pts3d_world.view(-1, 3).min(dim=0)[0]
-                    max_bounds = pts3d_world.view(-1, 3).max(dim=0)[0]
-                    print(f"Scene box for {duster_metadata_path}: {min_bounds}, {max_bounds}")
-                    dust3r_metadata["scene_box"] = torch.stack([min_bounds, max_bounds]).cpu().detach().clone()
-
-                    torch.save(dust3r_metadata, duster_metadata_path)
 
             pose_scale_factor = 1
             if "near" in metadata:
                 scene_near = max(metadata["near"], 0.01)
-                if self.config.scale_near is not None:
-                    pose_scale_factor = scene_near / self.config.scale_near
+                if scale_near is not None:
+                    pose_scale_factor = scene_near / scale_near
 
                 near = min(near, scene_near / pose_scale_factor)
                 far = max(far, metadata["far"] / pose_scale_factor)
-                scene_box = dust3r_metadata["scene_box"] if self.config.use_dust3r_poses \
+                scene_box = dust3r_metadata["scene_box"] if use_dust3r_poses \
                     else torch.FloatTensor(metadata["scene_box"])
                 current_scene_box = scene_box / pose_scale_factor
 
@@ -306,7 +265,7 @@ class DL3DV(DataParser):
 
             for scene_image_index, frame in enumerate(frames):
                 image_filenames.append(dest / frame["file_path"])
-                if self.config.use_dust3r_poses:
+                if use_dust3r_poses:
                     c2w = dust3r_metadata["poses"][scene_image_index, :3]
                     c2w[:, 1:3] *= -1  # opencv to opengl
 
@@ -332,9 +291,15 @@ class DL3DV(DataParser):
                 width.append(frame["w"])
                 height.append(frame["h"])
 
-                if self.config.neighbor_overlap_threshold is not None:
-                    neighbors = (scene_index_start + torch.arange(len(frames))[
-                        frame_intersections[scene_image_index] > self.config.neighbor_overlap_threshold]).tolist()
+                if overlap_threshold is not None:
+                    min_mask = frame_intersections[scene_image_index] > overlap_threshold[0]
+                    if split != "train":
+                        max_mask = frame_intersections[scene_image_index] < overlap_threshold[1]
+                        thresh_mask = torch.logical_and(min_mask, max_mask)
+                    else:
+                        thresh_mask = min_mask
+
+                    neighbors = (scene_index_start + torch.arange(len(frames))[thresh_mask]).tolist()
                     if len(neighbors) < 3:
                         neighbors = list(range(max(scene_index_start, scene_index_start + scene_image_index - 3),
                                                scene_index_start + scene_image_index)) + list(
@@ -402,7 +367,7 @@ class DL3DV(DataParser):
         if neighboring_views is not None:
             metadata[NEIGHBOR_INDICES] = neighboring_views
 
-        if self.config.use_dust3r_poses:
+        if use_dust3r_poses:
             metadata[DEPTH] = dust3r_depth_paths
 
         # if (not get_default_scene) and self.config.scene_id is None:
@@ -415,7 +380,7 @@ class DL3DV(DataParser):
             metadata=metadata
         )
 
-        if (not get_default_scene) and self.config.scene_id is None:
+        if (not get_default_scene) and self.config.scene_id is None and (not self.config.skip_dust3r_incomplete):
             torch.save(dataparser_outputs, cached_path)
 
         return dataparser_outputs

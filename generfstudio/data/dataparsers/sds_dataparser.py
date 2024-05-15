@@ -37,7 +37,8 @@ class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
     inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
-        scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
+    scene_id="7K/ed50ae07241a07a0d3dee2e20276514586af195d9ec73f69a4c5077b285bf3fe"))
+        # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
     # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""
 
@@ -66,8 +67,8 @@ class SDS(DataParser):
     def _generate_dataparser_outputs(self, split='train') -> DataparserOutputs:
         inner_outputs = self.inner.get_dataparser_outputs(split)
         if split == 'train':
-            train_image_filenames = inner_outputs.image_filenames[::10][self.start:self.end + 1]
-            train_image_cameras = inner_outputs.cameras[::10][self.start:self.end + 1]
+            train_image_filenames = np.array(inner_outputs.image_filenames)[[38,126,294]].tolist()[self.start:self.end + 1]
+            train_image_cameras = inner_outputs.cameras[torch.LongTensor([38,126,294])][self.start:self.end + 1]
             image_cond_override = self.config.image_cond_override
 
             if image_cond_override is not None:
@@ -103,7 +104,7 @@ class SDS(DataParser):
                 if DEPTH in inner_outputs.metadata:
 
                     depths = []
-                    for frame_path_pt in inner_outputs.metadata[DEPTH][::10][self.start:self.end + 1]:
+                    for frame_path_pt in np.array(inner_outputs.metadata[DEPTH])[[38,126,294]].tolist()[self.start:self.end + 1]:
                         frame_depth = torch.load(frame_path_pt, map_location="cpu")
                         depths.append(frame_depth)
                     # import pdb;
@@ -182,6 +183,8 @@ class SDS(DataParser):
                     scales.append(pixel_area.to(distances.device) * distances)
 
                     # confs.append(confidence)
+
+                import pdb; pdb.set_trace()
 
                 metadata["points3D_xyz"] = torch.cat(xyz)
                 metadata["points3D_rgb"] = ((torch.cat(rgb) / 2 + 0.5) * 255).byte()

@@ -7,13 +7,14 @@ from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
 from dust3r.utils.geometry import geotrf
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from torch.nn import functional as F
 
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D, NEIGHBOR_DEPTH
 
 
 class NeighboringViewsDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0,
-                 neighboring_views_size: int = 3):
+                 neighboring_views_size: int = 3, return_target_depth: bool = False):
         # super().__init__(dataparser_outputs, scale_factor)
         # Skip the deepcopy to save time
         self._dataparser_outputs = dataparser_outputs
@@ -25,6 +26,7 @@ class NeighboringViewsDataset(InputDataset):
         self.mask_color = dataparser_outputs.metadata.get("mask_color", None)
 
         self.neighboring_views_size = neighboring_views_size
+        self.return_target_depth = return_target_depth
 
         if DEPTH in self.metadata:
             self.cameras_dust3r = deepcopy(dataparser_outputs.cameras)
@@ -41,12 +43,12 @@ class NeighboringViewsDataset(InputDataset):
     def get_metadata(self, data: Dict) -> Dict:
         metadata = super().get_metadata(data)
 
-        neighbor_indices = self.metadata[NEIGHBOR_INDICES][data["image_idx"]]
+        image_idx = data["image_idx"]
+        neighbor_indices = self.metadata[NEIGHBOR_INDICES][image_idx]
         assert len(neighbor_indices) >= self.neighboring_views_size
         neighbor_indices = np.random.choice(neighbor_indices, self.neighboring_views_size,
                                             replace=False)
-        metadata[NEIGHBOR_IMAGES] = torch.cat(
-            [self.get_image_float32(x).unsqueeze(0) for x in neighbor_indices])
+        metadata[NEIGHBOR_IMAGES] = torch.stack([self.get_image_float32(x) for x in neighbor_indices])
         metadata[NEIGHBOR_INDICES] = torch.LongTensor(neighbor_indices)
 
         if DEPTH in self.metadata:
@@ -57,5 +59,11 @@ class NeighboringViewsDataset(InputDataset):
                                                 self.cameras_dust3r.fx[neighbor_indices], torch.cat(
                     [self.cameras_dust3r.cx[neighbor_indices], self.cameras_dust3r.cy[neighbor_indices]], -1))
             metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_dust3r[neighbor_indices], pts3d_cam)
+
+            if self.return_target_depth:
+                depth = torch.load(self.metadata[DEPTH][image_idx], map_location="cpu")
+                metadata[DEPTH] = F.interpolate(depth.view(1, 1, 224, 224), data["image"].shape[:2],
+                                                mode="bilinear").squeeze().unsqueeze(-1)
+                metadata[NEIGHBOR_DEPTH] = neighbor_depth
 
         return metadata

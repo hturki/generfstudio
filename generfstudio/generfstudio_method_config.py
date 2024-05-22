@@ -14,10 +14,12 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
+from generfstudio.adamw_8bit_optimizer_config import AdamW8bitOptimizerConfig
 from generfstudio.adamw_optimizer_config import AdamWOptimizerConfig
 from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
     NeighboringViewsDatamanager
 from generfstudio.data.datamanagers.union_datamanager import UnionDatamanagerConfig
+from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
 from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 from generfstudio.data.datasets.masked_dataset import MaskedDataset
@@ -25,6 +27,7 @@ from generfstudio.data.datasets.neighboring_views_dataset import NeighboringView
 from generfstudio.models.mv_diffusion import MVDiffusionConfig
 from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
 from generfstudio.models.pixelnerf import PixelNeRFModelConfig
+from generfstudio.models.rgbd_diffusion import RGBDDiffusionConfig
 from generfstudio.models.splatfacto_sds import SplatfactoSDSModelConfig
 from generfstudio.zero_redundancy_optimizer_config import ZeroRedundancyOptimizerConfig
 
@@ -242,8 +245,7 @@ mv_diffusion_method = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
         },
-        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="wandb",
     ),
     description='Training a multi-view diffusion model',
 )
@@ -282,8 +284,7 @@ mv_diffusion_union_method = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
         },
-        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="wandb",
     ),
     description='Training a multi-view diffusion model on all datasets',
 )
@@ -321,8 +322,7 @@ mv_diffusion_ddp_method = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
         },
-        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="wandb",
     ),
     description='Training a multi-view diffusion model with DDP (8 GPUs)',
 )
@@ -361,8 +361,46 @@ mv_diffusion_union_ddp_method = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
         },
-        viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="wandb",
     ),
     description='Training a multi-view diffusion model on all datasets with DDP (8 GPUs)',
+)
+
+rgbd_diffusion_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion",
+        steps_per_eval_image=250,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 4,
+            "fields": 4
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                neighboring_views_size=3,
+                image_batch_size=64,
+                return_target_depth=True,
+                dataparser=DL3DVDataParserConfig(),
+            ),
+            model=RGBDDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-5, eps=1e-15, max_norm=1),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-5, eps=1e-15, max_norm=1),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
 )

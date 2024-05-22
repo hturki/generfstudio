@@ -41,6 +41,7 @@ mv_diffusion = "generfstudio.generfstudio_method_config:mv_diffusion_method"
 mv_diffusion_union = "generfstudio.generfstudio_method_config:mv_diffusion_union_method"
 mv_diffusion_ddp = "generfstudio.generfstudio_method_config:mv_diffusion_ddp_method"
 mv_diffusion_union_ddp = "generfstudio.generfstudio_method_config:mv_diffusion_union_ddp_method"
+rgbd_diffusion = "generfstudio.generfstudio_method_config:rgbd_diffusion_method"
 
 [project.entry-points."nerfstudio.dataparser_configs"]
 co3d-data = "generfstudio.generfstudio_data_config:co3d_dataparser"

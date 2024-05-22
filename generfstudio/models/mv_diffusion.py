@@ -249,7 +249,7 @@ class MVDiffusion(Model):
 
         if self.config.pixelnerf_type == "dust3r":
             return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features,
-                                           cameras.metadata.get(NEIGHBOR_PTS3D, None))
+                                           cameras.metadata.get(NEIGHBOR_PTS3D, None), not self.training)
 
         feature_scaling = torch.FloatTensor([cond_features.shape[-1], cond_features.shape[-2]]).to(cond_features.device)
         feature_scaling = feature_scaling / (feature_scaling - 1) * 2.0
@@ -369,7 +369,7 @@ class MVDiffusion(Model):
                 image_gt = image_gt[valid_alignment]
             encoder_posterior = self._model.encode_first_stage(image_gt.permute(0, 3, 1, 2) * 2 - 1)
             z = self._model.get_first_stage_encoding(encoder_posterior).detach()
-            t = torch.randint(0, self._model.num_timesteps, (z.shape[0],), device=self.device).long()
+            t = torch.randint(0, self._model.num_timesteps, (z.shape[0],), device=self.device, dtype=torch.long)
             outputs["t"] = t
             noise = torch.randn_like(z)
             x_noisy = self._model.q_sample(x_start=z, t=t, noise=noise)

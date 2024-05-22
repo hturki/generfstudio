@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,7 +137,7 @@ class DL3DV(DataParser):
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
-        if use_dust3r_poses:
+        if use_dust3r_poses and not self.config.skip_dust3r_incomplete:
             self.model = AsymmetricCroCo3DStereo.from_pretrained(self.config.dust3r_model_name).to(f"cuda:{get_rank()}")
             for p in self.model.parameters():
                 p.requires_grad_(False)
@@ -166,6 +167,7 @@ class DL3DV(DataParser):
                 scenes = scenes[rank::world_size]
                 if chunk_index is not None:
                     scenes = scenes[chunk_index::num_chunks]
+                random.shuffle(scenes)
             else:
                 scenes = scenes[-self.config.eval_scene_count:]
 

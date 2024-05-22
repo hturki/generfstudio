@@ -24,7 +24,7 @@ from torch.nn import Parameter
 from torch.utils.data import DistributedSampler, DataLoader
 
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, \
-    NEIGHBOR_INDICES, NEIGHBOR_PTS3D
+    NEIGHBOR_INDICES, NEIGHBOR_PTS3D, DEPTH, NEIGHBOR_DEPTH
 from generfstudio.generfstudio_utils import repeat_interleave
 
 
@@ -46,6 +46,7 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
 
     train_chunks: int = 10
 
+    return_target_depth: bool = False
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     config: NeighboringViewsDatamanagerConfig
@@ -111,7 +112,8 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         return self.dataset_type(
             dataparser_outputs=self.train_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
-            neighboring_views_size=self.config.neighboring_views_size
+            neighboring_views_size=self.config.neighboring_views_size,
+            return_target_depth=self.config.return_target_depth,
         )
 
     def create_eval_dataset(self) -> TDataset:
@@ -119,7 +121,8 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         return self.dataset_type(
             dataparser_outputs=self.eval_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
-            neighboring_views_size=self.config.neighboring_views_size
+            neighboring_views_size=self.config.neighboring_views_size,
+            return_target_depth=self.config.return_target_depth,
         )
 
     @cached_property
@@ -257,8 +260,14 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             to_return.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].to(self.device)
             del data[NEIGHBOR_PTS3D]
 
+            to_return.metadata[NEIGHBOR_DEPTH] = data[NEIGHBOR_DEPTH].to(self.device)
+            del data[NEIGHBOR_DEPTH]
+
         # Used in mv_diffusion - DDP expects us to do all differentiable model computation in the forward function
-        to_return.metadata["image"] = data["image"]
+        to_return.metadata["image"] = data["image"].to(self.device)
+        if DEPTH in data:
+            to_return.metadata[DEPTH] = data[DEPTH].to(self.device)
+            del data[DEPTH]
 
         return to_return, data
 
@@ -286,6 +295,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device).unsqueeze(0)
         self.randomize_background(data)
         data["image"] = data["image"].to(self.device).squeeze(0)
+
         camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
 
@@ -295,6 +305,12 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         if NEIGHBOR_PTS3D in data:
             camera.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].unsqueeze(0).to(self.device)
             del data[NEIGHBOR_PTS3D]
+
+        if DEPTH in data:
+            data[DEPTH] = data[DEPTH].to(self.device)
+            data[NEIGHBOR_DEPTH] = data[NEIGHBOR_DEPTH].to(self.device)
+            camera.metadata[NEIGHBOR_DEPTH] = data[NEIGHBOR_DEPTH]
+
 
         return camera, data
 

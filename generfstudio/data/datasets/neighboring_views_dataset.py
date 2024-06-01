@@ -3,12 +3,12 @@ from typing import Dict
 
 import numpy as np
 import torch
-from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
 from dust3r.utils.geometry import geotrf
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from torch.nn import functional as F
 
+from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D, NEIGHBOR_DEPTH
 
 
@@ -54,10 +54,11 @@ class NeighboringViewsDataset(InputDataset):
         if DEPTH in self.metadata:
             neighbor_depth = torch.stack(
                 [torch.load(self.metadata[DEPTH][x], map_location="cpu") for x in neighbor_indices])
-            pts3d_cam = _fast_depthmap_to_pts3d(neighbor_depth,
-                                                self.pixels.unsqueeze(0).expand(neighbor_depth.shape[0], -1, -1),
-                                                self.cameras_dust3r.fx[neighbor_indices], torch.cat(
-                    [self.cameras_dust3r.cx[neighbor_indices], self.cameras_dust3r.cy[neighbor_indices]], -1))
+            pts3d_cam = fast_depthmap_to_pts3d(
+                neighbor_depth,
+                self.pixels,
+                torch.cat([self.cameras_dust3r.fx[neighbor_indices], self.cameras_dust3r.fy[neighbor_indices]], -1),
+                torch.cat([self.cameras_dust3r.cx[neighbor_indices], self.cameras_dust3r.cy[neighbor_indices]], -1))
             metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_dust3r[neighbor_indices], pts3d_cam)
 
             if self.return_target_depth:

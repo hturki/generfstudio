@@ -13,6 +13,7 @@ from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
 from dust3r.utils.geometry import geotrf
 
 from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
+from generfstudio.data.dataparsers.gaussian_optimizer import GaussianOptimizer
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 from generfstudio.generfstudio_constants import DEPTH
 
@@ -37,8 +38,8 @@ class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
     inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
-    scene_id="7K/ed50ae07241a07a0d3dee2e20276514586af195d9ec73f69a4c5077b285bf3fe"))
-        # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
+        scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117", use_dust3r_poses=True, dust3r_use_known_cameras=True))
+    # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
     # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""
 
@@ -48,6 +49,7 @@ class SDSDataParserConfig(DataParserConfig):
 
     init_with_depth: bool = True
     use_global_optimizer: bool = True
+    use_saved: bool = True
 
     dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
 
@@ -67,8 +69,44 @@ class SDS(DataParser):
     def _generate_dataparser_outputs(self, split='train') -> DataparserOutputs:
         inner_outputs = self.inner.get_dataparser_outputs(split)
         if split == 'train':
-            train_image_filenames = np.array(inner_outputs.image_filenames)[[38,126,294]].tolist()[self.start:self.end + 1]
-            train_image_cameras = inner_outputs.cameras[torch.LongTensor([38,126,294])][self.start:self.end + 1]
+            if self.config.use_saved:
+                depth = torch.stack([torch.load(x, map_location="cpu") for x in inner_outputs.metadata[DEPTH]])
+                c2ws_dust3r = deepcopy(inner_outputs.cameras.camera_to_worlds)
+                c2ws_dust3r[:, :, 1:3] *= -1  # opengl to opencv
+                opt_cameras = deepcopy(inner_outputs.cameras)
+                opt_cameras.rescale_output_resolution(224 / opt_cameras.width)
+                optimizer = GaussianOptimizer(inner_outputs.image_filenames,
+                                              # depth,
+                                              c2ws_dust3r,
+                                              opt_cameras.fx, opt_cameras.fy, opt_cameras.cx, opt_cameras.cy).cuda()
+                                              # , True,
+                                              # False, False).cuda()
+
+                optimizer.align_with_dust3r(self.config.dust3r_checkpoint_path)
+
+                with torch.enable_grad():
+                    optimizer.optimize(1000)
+
+                print(torch.FloatTensor(optimizer.get_psnr()[0]).mean())
+
+                metadata = {}
+                metadata["points3D_xyz"] = optimizer.get_xyz().detach()
+                metadata["points3D_rgb"] = (optimizer.rgbs.view(-1, 3) * 255).byte()
+                metadata["points3D_scale"] = optimizer.scales.detach()
+                # metadata["points3D_conf"] = torch.cat(confs)
+
+                return DataparserOutputs(
+                    image_filenames=inner_outputs.image_filenames,
+                    cameras=inner_outputs.cameras,
+                    alpha_color=inner_outputs.alpha_color,
+                    scene_box=inner_outputs.scene_box,
+                    dataparser_scale=inner_outputs.dataparser_scale,
+                    metadata=metadata
+                )
+
+            train_image_filenames = np.array(inner_outputs.image_filenames)[[38, 126, 294]].tolist()[
+                                    self.start:self.end + 1]
+            train_image_cameras = inner_outputs.cameras[torch.LongTensor([38, 126, 294])][self.start:self.end + 1]
             image_cond_override = self.config.image_cond_override
 
             if image_cond_override is not None:
@@ -104,7 +142,8 @@ class SDS(DataParser):
                 if DEPTH in inner_outputs.metadata:
 
                     depths = []
-                    for frame_path_pt in np.array(inner_outputs.metadata[DEPTH])[[38,126,294]].tolist()[self.start:self.end + 1]:
+                    for frame_path_pt in np.array(inner_outputs.metadata[DEPTH])[[38, 126, 294]].tolist()[
+                                         self.start:self.end + 1]:
                         frame_depth = torch.load(frame_path_pt, map_location="cpu")
                         depths.append(frame_depth)
                     # import pdb;
@@ -184,7 +223,8 @@ class SDS(DataParser):
 
                     # confs.append(confidence)
 
-                import pdb; pdb.set_trace()
+                import pdb;
+                pdb.set_trace()
 
                 metadata["points3D_xyz"] = torch.cat(xyz)
                 metadata["points3D_rgb"] = ((torch.cat(rgb) / 2 + 0.5) * 255).byte()

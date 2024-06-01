@@ -17,7 +17,12 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, profiler
 from nerfstudio.utils.comms import get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
-from omegaconf import OmegaConf
+
+try:
+    from omegaconf import OmegaConf
+except:
+    pass
+
 from pytorch_msssim import SSIM
 from torch import nn
 from torch.nn import Parameter, MSELoss
@@ -26,7 +31,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from extern.ldm_zero123.models.diffusion.ddim import DDIMSampler
 from extern.ldm_zero123.util import instantiate_from_config
-from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
 from generfstudio.fields.dust3r_field import Dust3rField
 from generfstudio.fields.ibrnet_field import IBRNetInnerField
 from generfstudio.fields.pixelnerf_field import PixelNeRFInnerField
@@ -56,7 +60,7 @@ class MVDiffusionConfig(ModelConfig):
 
     concat_crossattn_with_null_prompt: bool = False
 
-    cond_image_encoder_type: Literal["unet", "resnet", "dino"] = "resnet"
+    cond_image_encoder_type: Literal["unet", "resnet"] = "resnet"
     pixelnerf_type: Literal["ibrnet", "pixelnerf", "dust3r"] = "pixelnerf"
 
     cond_only: bool = False
@@ -148,10 +152,6 @@ class MVDiffusion(Model):
             assert not self.config.freeze_cond_image_encoder
             encoder_dim = 128
             # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
-        elif self.config.cond_image_encoder_type == "dino":
-            assert self.config.freeze_cond_image_encoder
-            self.cond_image_encoder = DinoV2Encoder()
-            encoder_dim = self.cond_image_encoder.out_feature_dim
         else:
             raise Exception(self.config.cond_image_encoder_type)
 
@@ -174,7 +174,7 @@ class MVDiffusion(Model):
                                                   alignment_lr=self.config.dust3r_alignment_lr,
                                                   alignment_iter=self.config.dust3r_alignment_iter,
                                                   use_confidence_opacity=self.config.dust3r_use_confidence_opacity,
-                                                  depth_available=self.depth_available)
+                                                  depth_precomputed=self.depth_available)
         else:
             raise Exception(self.config.pixelnerf_type)
 

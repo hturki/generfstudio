@@ -14,7 +14,6 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
-from generfstudio.adamw_8bit_optimizer_config import AdamW8bitOptimizerConfig
 from generfstudio.adamw_optimizer_config import AdamWOptimizerConfig
 from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
     NeighboringViewsDatamanager
@@ -369,7 +368,7 @@ mv_diffusion_union_ddp_method = MethodSpecification(
 rgbd_diffusion_method = MethodSpecification(
     config=TrainerConfig(
         method_name="rgbd-diffusion",
-        steps_per_eval_image=250,
+        steps_per_eval_image=1000,
         steps_per_eval_batch=0,
         steps_per_save=1000,
         steps_per_eval_all_images=1000000,

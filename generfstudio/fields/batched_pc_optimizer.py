@@ -396,7 +396,7 @@ class GlobalPointCloudOptimizer(nn.Module):
         # return self.depth_log.exp()
 
 
-def _fast_depthmap_to_pts3d(depth, pixel_grid, focal, pp):
+def fast_depthmap_to_pts3d(depth, pixel_grid, focal, pp):
     pp = pp.unsqueeze(1)
     focal = focal.unsqueeze(1)
     assert focal.shape == (len(depth), 1, 2)

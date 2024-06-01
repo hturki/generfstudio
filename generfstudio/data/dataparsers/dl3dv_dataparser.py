@@ -21,6 +21,7 @@ from torch_scatter import scatter_min
 from tqdm import tqdm
 
 from generfstudio.data.dataparsers.dataparser_utils import convert_from_inner, get_xyz_in_camera, create_dust3r_poses
+from generfstudio.data.dataparsers.gaussian_optimizer import GaussianOptimizer
 from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE, DEPTH
 
 
@@ -58,6 +59,14 @@ class DL3DVDataParserConfig(DataParserConfig):
     # dust3r_model_name: str = "/project_data/ramanan/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
 
     skip_dust3r_incomplete: bool = False
+
+    dust3r_use_known_cameras: bool = False
+
+    dust3r_num_neighbors: int = 10
+
+    dust3r_batch_size: int = 10000
+
+    dust3r_chunk_size: Optional[int] = None  # 12544
 
     num_workers: Optional[int] = None
 
@@ -132,8 +141,9 @@ class DL3DV(DataParser):
         crop = self.config.crop
         scale_near = self.config.scale_near
         use_dust3r_poses = self.config.use_dust3r_poses
+        dust3r_use_known_cameras = self.config.dust3r_use_known_cameras
 
-        cached_path = self.config.data / f"cached-metadata-{split}-{crop}-{scale_near}-{overlap_threshold[0]}-{overlap_threshold[1]}--{rank}-{world_size}-{chunk_index}-{num_chunks}-{use_dust3r_poses}.pt"
+        cached_path = self.config.data / f"cached-metadata-{split}-{crop}-{scale_near}-{overlap_threshold[0]}-{overlap_threshold[1]}--{rank}-{world_size}-{chunk_index}-{num_chunks}-{use_dust3r_poses}-{dust3r_use_known_cameras}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -167,7 +177,6 @@ class DL3DV(DataParser):
                 scenes = scenes[rank::world_size]
                 if chunk_index is not None:
                     scenes = scenes[chunk_index::num_chunks]
-                random.shuffle(scenes)
             else:
                 scenes = scenes[-self.config.eval_scene_count:]
 
@@ -228,7 +237,7 @@ class DL3DV(DataParser):
                 frame_intersections = torch.load(view_overlap_path)
 
             if use_dust3r_poses:
-                dust3r_dest = self.config.data / "dust3r" / scene
+                dust3r_dest = self.config.data / ("dust3r-posed" if dust3r_use_known_cameras else "dust3r") / scene
                 duster_metadata_path = dust3r_dest / "scene.pt"
 
                 if not duster_metadata_path.exists():
@@ -236,8 +245,9 @@ class DL3DV(DataParser):
                         continue
                     if (dust3r_dest / "FAIL").exists():
                         continue
-                    create_dust3r_poses(self.model, dust3r_dest, dest, metadata["frames"], frame_intersections)
-                    torch.cuda.empty_cache()
+                    create_dust3r_poses(self.model, dust3r_dest, dest, metadata, None, #frame_intersections,
+                                        dust3r_use_known_cameras,
+                                        num_iters=500 if dust3r_use_known_cameras else 5000)
 
                     if (dust3r_dest / "FAIL").exists():
                         continue
@@ -264,10 +274,9 @@ class DL3DV(DataParser):
 
             scene_index_start = len(image_filenames)
             scene_index_end = scene_index_start + len(frames)
-
             for scene_image_index, frame in enumerate(frames):
                 image_filenames.append(dest / frame["file_path"])
-                if use_dust3r_poses:
+                if use_dust3r_poses and not dust3r_use_known_cameras:
                     c2w = dust3r_metadata["poses"][scene_image_index, :3]
                     c2w[:, 1:3] *= -1  # opencv to opengl
 
@@ -277,16 +286,17 @@ class DL3DV(DataParser):
                     pp = dust3r_metadata["pp"][scene_image_index]
                     cx.append(float(pp[0]) * frame["w"] / 224)
                     cy.append(float(pp[1]) * frame["h"] / 224)
-
-                    frame_path_png = Path(dust3r_dest / frame["file_path"])
-                    frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
-                    dust3r_depth_paths.append(frame_path_pt)
                 else:
                     c2w = torch.FloatTensor(frame["transform_matrix"])
                     fx.append(frame["fl_x"])
                     fy.append(frame["fl_y"])
                     cx.append(frame["cx"])
                     cy.append(frame["cy"])
+
+                if use_dust3r_poses:
+                    frame_path_png = Path(dust3r_dest / frame["file_path"])
+                    frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
+                    dust3r_depth_paths.append(frame_path_pt)
 
                 c2w[:3, 3] /= pose_scale_factor
                 c2ws.append(c2w)
@@ -315,6 +325,23 @@ class DL3DV(DataParser):
                         list(range(scene_index_start, scene_index_start + scene_image_index))
                         + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
 
+            if use_dust3r_poses and (not "psnr" in dust3r_metadata):
+                depth = torch.stack([torch.load(x, map_location="cuda") for x in dust3r_depth_paths[-len(frames):]])
+                c2ws_dust3r = torch.stack(c2ws[-len(frames):]).cuda().clone()
+                c2ws_dust3r[:, :, 1:3] *= -1  # opengl to opencv
+
+                psnr = GaussianOptimizer(image_filenames[-len(frames):], depth, c2ws_dust3r,
+                    torch.FloatTensor(fx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                    torch.FloatTensor(fy[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                    torch.FloatTensor(cx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                    torch.FloatTensor(cy[-len(frames):]).view(-1, 1).cuda() * 224 / 256, True, False).cuda().get_psnr()
+
+                dust3r_metadata["psnr"] = psnr
+                torch.save(dust3r_metadata, duster_metadata_path)
+                print(scene, torch.FloatTensor(psnr).mean())
+            elif use_dust3r_poses and split != "train":
+                    print(scene, torch.FloatTensor(dust3r_metadata["psnr"]).mean())
+
         c2ws = torch.stack(c2ws)
         width = torch.LongTensor(width)
         height = torch.LongTensor(height)
@@ -327,27 +354,27 @@ class DL3DV(DataParser):
         scene_box = SceneBox(aabb=1.1 * torch.stack([min_bounds, max_bounds]))
 
         if self.config.scene_id is not None:
-            i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
-            if split == "train":
-                indices = i_train
-            elif split in ["val", "test"]:
-                indices = i_eval
-            else:
-                raise ValueError(f"Unknown dataparser split {split}")
-
-            image_filenames = [image_filenames[i] for i in indices]
+            # i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+            # if split == "train":
+            #     indices = i_train
+            # elif split in ["val", "test"]:
+            #     indices = i_eval
+            # else:
+            #     raise ValueError(f"Unknown dataparser split {split}")
+            # 
+            # image_filenames = [image_filenames[i] for i in indices]
 
             #  Need to deal with indices changing post filtering if we actually want this
             neighboring_views = None  # [neighboring_views[i] for i in indices]
 
-            idx_tensor = torch.LongTensor(indices)
-            c2ws = c2ws[idx_tensor]
-            width = width[idx_tensor]
-            height = height[idx_tensor]
-            fx = fx[idx_tensor]
-            fy = fy[idx_tensor]
-            cx = cx[idx_tensor]
-            cy = cy[idx_tensor]
+            # idx_tensor = torch.LongTensor(indices)
+            # c2ws = c2ws[idx_tensor]
+            # width = width[idx_tensor]
+            # height = height[idx_tensor]
+            # fx = fx[idx_tensor]
+            # fy = fy[idx_tensor]
+            # cx = cx[idx_tensor]
+            # cy = cy[idx_tensor]
 
         cameras = Cameras(
             fx=fx,

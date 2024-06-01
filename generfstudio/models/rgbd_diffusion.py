@@ -16,16 +16,14 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, profiler
 from nerfstudio.utils.comms import get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
-from omegaconf import OmegaConf
 from pytorch_msssim import SSIM
 from torch import nn
-from torch.nn import Parameter, MSELoss
+from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchvision.transforms import transforms
 from transformers import CLIPVisionModelWithProjection
 
-from extern.ldm_zero123.util import instantiate_from_config
 from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
 from generfstudio.fields.dust3r_field import Dust3rField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
@@ -64,6 +62,8 @@ class RGBDDiffusionConfig(ModelConfig):
     allow_tf32: bool = False
     rgb_only: bool = False
 
+    binarize_accumulation: bool = False
+
 
 class RGBDDiffusion(Model):
     config: RGBDDiffusionConfig
@@ -79,7 +79,6 @@ class RGBDDiffusion(Model):
             CONSOLE.log(f"Using near and far bounds {self.near} {self.far} from metadata")
         self.depth_available = DEPTH in metadata
         CONSOLE.log(f"Depth available: {self.depth_available}")
-
 
         super().__init__(config=config, **kwargs)
 
@@ -150,16 +149,16 @@ class RGBDDiffusion(Model):
             encoder_dim = 128
             # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
         elif self.config.cond_image_encoder_type == "dino":
-            assert self.config.freeze_cond_image_encoder
-            self.cond_image_encoder = DinoV2Encoder()
-            encoder_dim = self.cond_image_encoder.out_feature_dim
+            assert not self.config.freeze_cond_image_encoder
+            self.cond_image_encoder = DinoV2Encoder(out_feature_dim=self.config.cond_feature_out_dim)
+            encoder_dim = self.config.cond_feature_out_dim
         else:
             raise Exception(self.config.cond_image_encoder_type)
 
         self.cond_feature_field = Dust3rField(model_name=self.config.dust3r_model_name,
                                               in_feature_dim=encoder_dim,
                                               out_feature_dim=self.config.cond_feature_out_dim,
-                                              depth_available=self.depth_available)
+                                              depth_precomputed=self.depth_available)
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -204,9 +203,19 @@ class RGBDDiffusion(Model):
 
     @profiler.time_function
     def get_cond_features(self, cameras: Cameras, cond_rgbs: torch.Tensor):
-        cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
+        if self.config.cond_image_encoder_type == "dino":
+            # We're going to need to resize to 224 for both dino and dust3r - might as well only do it once
+            if cond_rgbs.shape[-1] != self.cond_feature_field.image_dim:
+                with profiler.time_function("interpolate_rgb_for_dust3r"), torch.no_grad():
+                    cond_rgbs = F.interpolate(cond_rgbs.view(-1, *cond_rgbs.shape[2:]),
+                                              self.cond_feature_field.image_dim, mode="bicubic")
+                    cond_rgbs = cond_rgbs.view(len(cameras), -1, *cond_rgbs.shape[1:])
+
         if self.config.freeze_cond_image_encoder:
-            cond_features = cond_features.detach()
+            with torch.no_grad():
+                cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
+        else:
+            cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
 
         target_cameras = deepcopy(cameras)
         target_cameras.metadata = {}
@@ -222,6 +231,7 @@ class RGBDDiffusion(Model):
 
         return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features,
                                        cameras.metadata.get(NEIGHBOR_PTS3D, None),
+                                       cameras.metadata.get(NEIGHBOR_DEPTH, None),
                                        (not self.config.rgb_only or not self.training),
                                        target_cameras_feature)
 
@@ -261,8 +271,8 @@ class RGBDDiffusion(Model):
                 concat_list = [cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1]
         else:
             depth_scaling_factor = \
-            cameras.metadata[DEPTH if is_training else NEIGHBOR_DEPTH].view(len(cameras), -1).max(dim=-1)[0] \
-                .view(-1, 1, 1, 1)
+                cameras.metadata[DEPTH if is_training else NEIGHBOR_DEPTH].view(len(cameras), -1).max(dim=-1)[0] \
+                    .view(-1, 1, 1, 1)
 
             cond_depth = (cond_features[DEPTH] / depth_scaling_factor).permute(0, 3, 1, 2)
             if self.config.encode_rgbd_vae:
@@ -274,7 +284,10 @@ class RGBDDiffusion(Model):
                 concat_list = [cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1,
                                cond_depth * 2 - 1]
 
-        concat_list.append(cond_features[ACCUMULATION_FEATURES].permute(0, 3, 1, 2))
+        accumulation_features = cond_features[ACCUMULATION_FEATURES].permute(0, 3, 1, 2)
+        if self.config.binarize_accumulation:
+            accumulation_features = (accumulation_features > 0.5).type(accumulation_features.dtype)
+        concat_list.append(accumulation_features)
         concat_list.append(cond_features[FEATURES].permute(0, 3, 1, 2))
 
         c_concat = torch.cat(concat_list, 1)

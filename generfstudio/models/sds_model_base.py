@@ -9,7 +9,6 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from jaxtyping import Float
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.models.base_model import Model, ModelConfig

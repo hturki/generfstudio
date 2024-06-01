@@ -8,11 +8,11 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
-from gsplat._torch_impl import quat_to_rotmat
-from gsplat.project_gaussians import project_gaussians
-from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import num_sh_bases, spherical_harmonics
-from nerfstudio.models.splatfacto import random_quat_tensor, RGB2SH, SH2RGB, projection_matrix
+# from gsplat._torch_impl import quat_to_rotmat
+# from gsplat.project_gaussians import project_gaussians
+# from gsplat.rasterize import rasterize_gaussians
+# from gsplat.sh import num_sh_bases, spherical_harmonics
+# from nerfstudio.models.splatfacto import random_quat_tensor, RGB2SH, SH2RGB, projection_matrix
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 from typing_extensions import Literal

@@ -9,7 +9,10 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler
 from jaxtyping import Float
 from nerfstudio.utils.rich_utils import CONSOLE
-from omegaconf import OmegaConf
+try:
+    from omegaconf import OmegaConf
+except:
+    pass
 from torch import Tensor
 
 from extern.ldm_zero123.util import instantiate_from_config

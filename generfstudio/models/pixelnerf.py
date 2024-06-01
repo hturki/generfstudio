@@ -28,7 +28,6 @@ from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
 from generfstudio.fields.ibrnet_field import IBRNetField
 from generfstudio.fields.image_encoder import ImageEncoder
 from generfstudio.fields.pixelnerf_field import PixelNeRFField
@@ -97,10 +96,6 @@ class PixelNeRFModel(Model):
             assert not self.config.freeze_encoder
             encoder_dim = 128
             self.encoder = UNet(in_channels=3, n_classes=encoder_dim)
-        elif self.config.image_encoder_type == "dino":
-            assert self.config.freeze_encoder
-            self.encoder = DinoV2Encoder()
-            encoder_dim = self.encoder.out_feature_dim
         else:
             raise Exception(self.config.image_encoder_type)
 

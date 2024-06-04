@@ -45,6 +45,8 @@ class R10KDataParserConfig(DataParserConfig):
 
     conversion_threads: int = 16
 
+    neighbor_window_size: Optional[int] = 20
+
 
 def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop: Optional[int]) -> bool:
     w2cs = []
@@ -130,7 +132,8 @@ class R10K(DataParser):
     def _generate_dataparser_outputs(self, split="train", chunk_index=None, num_chunks=None, get_default_scene=False):
         rank = get_rank()
         world_size = get_world_size()
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{rank}-{world_size}-{chunk_index}-{num_chunks}.pt"
+        window_size = self.config.neighbor_window_size
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{window_size}-{rank}-{world_size}-{chunk_index}-{num_chunks}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -211,9 +214,16 @@ class R10K(DataParser):
                 cx.append(frame["cx"])
                 cy.append(frame["cy"])
 
-                neighboring_views.append(
-                    list(range(scene_index_start, scene_index_start + scene_image_index))
-                    + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
+                if window_size is not None:
+                    neighboring_views.append(
+                        list(range(scene_index_start + max(0, scene_image_index - window_size),
+                                   scene_index_start + scene_image_index))
+                        + list(range(scene_index_start + scene_image_index + 1,
+                                     min(scene_index_end, scene_index_start + scene_image_index + window_size + 1))))
+                else:
+                    neighboring_views.append(
+                        list(range(scene_index_start, scene_index_start + scene_image_index))
+                        + list(range(scene_index_start + scene_image_index + 1, scene_index_end)))
 
         # if len(missing_scenes) > 0:
         #     for scene in missing_scenes:

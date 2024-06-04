@@ -15,16 +15,16 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
 from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
-    POSENC_SCALE
+    POSENC_SCALE, DEPTH
 
 
 @dataclass
 class ObjaverseXLDataParserConfig(DataParserConfig):
-    """Scene dataset parser config. Assumes Pixel-NeRF format"""
 
     _target: Type = field(default_factory=lambda: ObjaverseXL)
     """target class to instantiate"""
     data: Path = Path("data/oxl")
+
     """Directory specifying location of data."""
 
     scene_id: Optional[str] = None
@@ -58,9 +58,10 @@ class ObjaverseXL(DataParser):
             scenes = [self.config.scene_id]
         else:
             scenes = []
-            for subdir in sorted(self.config.data.iterdir()):
-                for scene_dir in sorted(subdir.iterdir()):
-                    scenes.append(f"{scene_dir.parent.name}/{scene_dir.name}")
+            for partition_dir in sorted(self.config.data.iterdir()):
+                for subdir in sorted(partition_dir.iterdir()):
+                    for scene_dir in sorted(subdir.iterdir()):
+                        scenes.append(f"{partition_dir.name}/{subdir.name}/{scene_dir.name}")
 
             if split == "train":
                 scenes = scenes[:-self.config.eval_scene_count]
@@ -82,6 +83,7 @@ class ObjaverseXL(DataParser):
         cx = []
         cy = []
         neighboring_views = []
+        depth_paths = []
 
         min_bounds = None
         max_bounds = None
@@ -130,6 +132,7 @@ class ObjaverseXL(DataParser):
                 fy.append(frame["fl_y"])
                 cx.append(frame["cx"])
                 cy.append(frame["cy"])
+                depth_paths.append(self.config.data / scene / frame["depth_path"])
 
                 neighboring_views.append(
                     list(range(scene_index_start, scene_index_start + scene_image_index))
@@ -184,6 +187,7 @@ class ObjaverseXL(DataParser):
             NEAR: near,
             FAR: far,
             POSENC_SCALE: 1 / (max_bounds - min_bounds).max(),
+            DEPTH: depth_paths,
         }
 
         if neighboring_views is not None:

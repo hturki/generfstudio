@@ -23,8 +23,9 @@ from nerfstudio.utils.misc import get_orig_class
 from torch.nn import Parameter
 from torch.utils.data import DistributedSampler, DataLoader
 
+from generfstudio.data.dataparsers.objaverse_xl_dataparser import ObjaverseXLDataParserConfig
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, \
-    NEIGHBOR_INDICES, NEIGHBOR_PTS3D, DEPTH, NEIGHBOR_DEPTH
+    NEIGHBOR_INDICES, NEIGHBOR_PTS3D, DEPTH, NEIGHBOR_DEPTH, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
 from generfstudio.generfstudio_utils import repeat_interleave
 
 
@@ -45,8 +46,6 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
     collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
 
     train_chunks: int = 10
-
-    return_target_depth: bool = False
 
 class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     config: NeighboringViewsDatamanagerConfig
@@ -78,11 +77,13 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.dataparser.downscale_factor = 1  # Avoid opening images
         self.includes_time = self.dataparser.includes_time
 
-        if world_size > 1:
+        is_oxl = isinstance(self.dataparser_config, ObjaverseXLDataParserConfig)
+        if world_size > 1 or is_oxl:
             self.load_train_chunk_executor = ThreadPoolExecutor(max_workers=1)
-            self.chunk_index = cycle(range(self.config.train_chunks))
+            chunks = 50 if is_oxl else self.config.train_chunks
+            self.chunk_index = cycle(range(chunks))
             self.load_train_chunk_future = self.load_train_chunk_executor.submit(
-                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), self.config.train_chunks)
+                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), chunks)
 
         self.set_train_data()
         assert self.train_cameras.distortion_params is None
@@ -97,10 +98,12 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         super().__init__()
 
     def set_train_data(self):
-        if self.world_size > 1:
+        is_oxl = isinstance(self.dataparser_config, ObjaverseXLDataParserConfig)
+        if self.world_size > 1 or is_oxl:
             self.train_dataparser_outputs = self.load_train_chunk_future.result()
+            chunks = 50 if is_oxl else self.config.train_chunks
             self.load_train_chunk_future = self.load_train_chunk_executor.submit(
-                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), self.config.train_chunks)
+                self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), chunks)
         else:
             self.train_dataparser_outputs = self.dataparser.get_dataparser_outputs(split="train")
 
@@ -113,7 +116,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             dataparser_outputs=self.train_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
             neighboring_views_size=self.config.neighboring_views_size,
-            return_target_depth=self.config.return_target_depth,
         )
 
     def create_eval_dataset(self) -> TDataset:
@@ -122,7 +124,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             dataparser_outputs=self.eval_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
             neighboring_views_size=self.config.neighboring_views_size,
-            return_target_depth=self.config.return_target_depth,
         )
 
     @cached_property
@@ -247,7 +248,12 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
                 to_return.metadata = {}
 
         data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device)
-        self.randomize_background(data)
+        randomize_result = self.randomize_background(data)
+        if randomize_result is not None:
+            fg_mask, neighbor_fg_mask, random_bg = randomize_result
+            to_return.metadata[FG_MASK] = fg_mask.to(self.device)
+            to_return.metadata[NEIGHBOR_FG_MASK] = neighbor_fg_mask.to(self.device)
+            to_return.metadata[BG_COLOR] = random_bg.to(self.device)
 
         to_return.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
         del data[NEIGHBOR_IMAGES]
@@ -293,7 +299,14 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             camera.metadata = {}
 
         data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device).unsqueeze(0)
-        self.randomize_background(data)
+        randomize_result = self.randomize_background(data)
+        if randomize_result is not None:
+            fg_mask, neighbor_fg_mask, random_bg = randomize_result
+            camera.metadata[FG_MASK] = fg_mask.to(self.device)
+            camera.metadata[NEIGHBOR_FG_MASK] = neighbor_fg_mask.to(self.device)
+            camera.metadata[BG_COLOR] = random_bg.to(self.device)
+
+        camera.metadata["image"] = data["image"].to(self.device)
         data["image"] = data["image"].to(self.device).squeeze(0)
 
         camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
@@ -316,12 +329,19 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
 
     # Randomize background if there's an alpha component and make sure it's consistent across neighboring views
     @staticmethod
-    def randomize_background(data: Dict) -> None:
+    def randomize_background(data: Dict) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         if data["image"].shape[-1] == 4:
             random_bg = torch.rand(data["image"].shape[0], 3, device=data["image"].device)
+            fg_mask = data["image"][..., 3] > 0
             data["image"] = data["image"][..., :3] * data["image"][..., 3:] \
                             + random_bg.view(data["image"].shape[0], 1, 1, 3) * (1 - data["image"][..., 3:])
+            neighbor_fg_mask = data[NEIGHBOR_IMAGES][..., 3] > 0
+
             data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES][..., :3] \
                                     * data[NEIGHBOR_IMAGES][..., 3:] \
                                     + random_bg.view(data["image"].shape[0], 1, 1, 1, 3) \
                                     * (1 - data[NEIGHBOR_IMAGES][..., 3:])
+            
+            return fg_mask, neighbor_fg_mask, random_bg
+        else:
+            return None

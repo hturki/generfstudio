@@ -29,7 +29,7 @@ from generfstudio.fields.dust3r_field import Dust3rField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, NEAR, FAR, \
     POSENC_SCALE, RGB, FEATURES, ACCUMULATION, DEPTH, NEIGHBOR_RESULTS, ALIGNMENT_LOSS, NEIGHBOR_PTS3D, VALID_ALIGNMENT, \
-    NEIGHBOR_DEPTH, ACCUMULATION_FEATURES
+    NEIGHBOR_DEPTH, ACCUMULATION_FEATURES, DEPTH_GT, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
 
 
 @dataclass
@@ -46,7 +46,7 @@ class RGBDDiffusionConfig(ModelConfig):
     background_color: Literal["random", "last_sample", "black", "white"] = "last_sample"
 
     cond_image_encoder_type: Literal["unet", "resnet", "dino"] = "resnet"
-    cond_feature_out_dim: int = 128
+    cond_feature_out_dim: int = 32
 
     freeze_cond_image_encoder: bool = False
 
@@ -56,7 +56,7 @@ class RGBDDiffusionConfig(ModelConfig):
     scheduler_pretrained_path: str = "Intel/ldm3d-4c"
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
-    encode_rgbd_vae: bool = True  # TODO - encode the dust3r vae into rgbd?
+    encode_rgbd_vae: bool = True
 
     use_ema: bool = True
     allow_tf32: bool = False
@@ -169,7 +169,7 @@ class RGBDDiffusion(Model):
 
         if get_world_size() > 1:
             CONSOLE.log("Using sync batchnorm for DDP")
-            self._model = nn.SyncBatchNorm.convert_sync_batchnorm(self._model)
+            self.unet = nn.SyncBatchNorm.convert_sync_batchnorm(self.unet)
             self.cond_feature_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_feature_field)
             if not self.config.freeze_cond_image_encoder:
                 self.cond_image_encoder = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_image_encoder)
@@ -206,6 +206,7 @@ class RGBDDiffusion(Model):
         if self.config.cond_image_encoder_type == "dino":
             # We're going to need to resize to 224 for both dino and dust3r - might as well only do it once
             if cond_rgbs.shape[-1] != self.cond_feature_field.image_dim:
+                assert not DEPTH in cameras.metadata
                 with profiler.time_function("interpolate_rgb_for_dust3r"), torch.no_grad():
                     cond_rgbs = F.interpolate(cond_rgbs.view(-1, *cond_rgbs.shape[2:]),
                                               self.cond_feature_field.image_dim, mode="bicubic")
@@ -232,6 +233,10 @@ class RGBDDiffusion(Model):
         return self.cond_feature_field(target_cameras, neighbor_cameras, cond_rgbs, cond_features,
                                        cameras.metadata.get(NEIGHBOR_PTS3D, None),
                                        cameras.metadata.get(NEIGHBOR_DEPTH, None),
+                                       cameras.metadata["image"].permute(0, 3, 1, 2),
+                                       cameras.metadata.get(FG_MASK, None),
+                                       cameras.metadata.get(NEIGHBOR_FG_MASK, None),
+                                       cameras.metadata.get(BG_COLOR, None),
                                        (not self.config.rgb_only or not self.training),
                                        target_cameras_feature)
 
@@ -245,16 +250,21 @@ class RGBDDiffusion(Model):
             image_cond_flat = self.image_encoder_resize(image_cond.view(-1, *image_cond.shape[2:]))
         image_cond = image_cond_flat.view(len(cameras), -1, *image_cond_flat.shape[1:])
         cond_features = self.get_cond_features(cameras, image_cond)
+
         valid_alignment = cond_features[VALID_ALIGNMENT]
         outputs = {
             ALIGNMENT_LOSS: cond_features[ALIGNMENT_LOSS],
-            VALID_ALIGNMENT: valid_alignment
+            VALID_ALIGNMENT: valid_alignment.float().mean()
         }
+
+        if not torch.any(valid_alignment):
+            valid_alignment = torch.ones_like(valid_alignment)
 
         is_training = (not torch.is_inference_mode_enabled()) and self.training
 
         if is_training:
             image_cond = image_cond[valid_alignment]
+            image_cond_flat = image_cond.view(-1, *image_cond.shape[2:])
         else:
             outputs[NEIGHBOR_RESULTS] = cond_features[NEIGHBOR_RESULTS]
 
@@ -265,21 +275,28 @@ class RGBDDiffusion(Model):
 
         if self.config.rgb_only:
             if self.config.encode_rgbd_vae:
-                concat_list = [self.vae.encode(cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1).latent_dist.sample()
-                               * self.vae.config.scaling_factor]
+                with torch.cuda.amp.autocast(enabled=False):
+                    concat_list = [self.vae.encode(cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1).latent_dist.mode()
+                                   * self.vae.config.scaling_factor]
             else:
                 concat_list = [cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1]
         else:
-            depth_scaling_factor = \
-                cameras.metadata[DEPTH if is_training else NEIGHBOR_DEPTH].view(len(cameras), -1).max(dim=-1)[0] \
-                    .view(-1, 1, 1, 1)
+            if NEIGHBOR_DEPTH in cameras.metadata:
+                # depth_scaling_factor = \
+                #     cameras.metadata[DEPTH if is_training else NEIGHBOR_DEPTH].view(len(cameras), -1).max(dim=-1)[0] \
+                #         .view(-1, 1, 1, 1)
+                depth_scaling_factor = cameras.metadata[NEIGHBOR_DEPTH].view(len(cameras), -1).mean(dim=-1) \
+                                           .view(-1, 1, 1, 1) * 2
+            else:
+                depth_scaling_factor = cond_features[DEPTH_GT].mean(dim=-1).view(-1, 1, 1, 1) * 2
 
             cond_depth = (cond_features[DEPTH] / depth_scaling_factor).permute(0, 3, 1, 2)
             if self.config.encode_rgbd_vae:
-                concat_list = [self.vae.encode(torch.cat([
-                    cond_features[RGB].permute(0, 3, 1, 2),
-                    cond_depth,
-                ], 1) * 2 - 1).latent_dist.sample() * self.vae.config.scaling_factor]
+                with torch.cuda.amp.autocast(enabled=False):
+                    concat_list = [self.vae.encode(torch.cat([
+                        cond_features[RGB].permute(0, 3, 1, 2),
+                        cond_depth,
+                    ], 1) * 2 - 1).latent_dist.mode() * self.vae.config.scaling_factor]
             else:
                 concat_list = [cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1,
                                cond_depth * 2 - 1]
@@ -303,6 +320,15 @@ class RGBDDiffusion(Model):
             c_crossattn = torch.where(prompt_mask, 0, c_crossattn)
             c_concat = input_mask * c_concat
 
+        if DEPTH_GT in cond_features:
+            depth_gt = cond_features[DEPTH_GT]
+            with torch.no_grad():
+                depth_gt = F.interpolate(depth_gt.view(-1, self.cond_feature_field.image_dim,
+                                                       self.cond_feature_field.image_dim).unsqueeze(1),
+                                         cameras.metadata["image"].shape[1:3],
+                                         mode="bilinear").squeeze(1).unsqueeze(-1)
+                outputs[DEPTH_GT] = depth_gt
+
         if is_training:
             # Hack - we include the gt image in the forward loop, so that all model calculation is done in the
             # forward call as expected in DDP
@@ -310,9 +336,15 @@ class RGBDDiffusion(Model):
             if self.config.rgb_only:
                 input_gt = image_gt.permute(0, 3, 1, 2) * 2 - 1
             else:
-                depth_gt = cameras.metadata[DEPTH][valid_alignment] / depth_scaling_factor[valid_alignment]
+                if DEPTH in cameras.metadata:
+                    depth_gt = cameras.metadata[DEPTH][valid_alignment] / depth_scaling_factor[valid_alignment]
+
                 input_gt = torch.cat([image_gt.permute(0, 3, 1, 2), depth_gt.permute(0, 3, 1, 2)], 1) * 2 - 1
-            latents = self.vae.encode(input_gt).latent_dist.sample() * self.vae.config.scaling_factor
+
+            # VAE operations should be upcasted
+            with torch.cuda.amp.autocast(enabled=False):
+                latents = self.vae.encode(input_gt).latent_dist.sample() * self.vae.config.scaling_factor
+
             timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (latents.shape[0],),
                                       device=self.device, dtype=torch.long)
             outputs["timesteps"] = timesteps
@@ -354,8 +386,9 @@ class RGBDDiffusion(Model):
 
                     inference_latents = self.ddim_scheduler.step(noise_pred, t, inference_latents, return_dict=False)[0]
 
-                decoded = (self.vae.decode(inference_latents / self.vae.config.scaling_factor, return_dict=False)[
-                               0].permute(0, 2, 3, 1) + 1) / 2
+                with torch.cuda.amp.autocast(enabled=False):
+                    decoded = (self.vae.decode(inference_latents / self.vae.config.scaling_factor, return_dict=False)[
+                                   0].permute(0, 2, 3, 1) + 1) / 2
 
                 outputs["samples_rgb"] = decoded[..., :3].clamp(0, 1)
                 if not self.config.rgb_only:
@@ -376,11 +409,7 @@ class RGBDDiffusion(Model):
     def get_metrics_dict(self, outputs, batch):
         assert self.training
 
-        metrics_dict = {ALIGNMENT_LOSS: outputs[ALIGNMENT_LOSS]}
-        valid_alignment = outputs[VALID_ALIGNMENT]
-        metrics_dict[VALID_ALIGNMENT] = valid_alignment.sum() / valid_alignment.shape[0]
-
-        return metrics_dict
+        return {ALIGNMENT_LOSS: outputs[ALIGNMENT_LOSS], VALID_ALIGNMENT: outputs[VALID_ALIGNMENT]}
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         model_output = outputs["model_output"]
@@ -388,6 +417,11 @@ class RGBDDiffusion(Model):
 
         loss = F.mse_loss(model_output.float(), target.float(), reduction="mean")
         assert torch.isfinite(loss).all(), loss
+
+        if outputs[VALID_ALIGNMENT] == 0:
+            CONSOLE.warn("No valid outputs, ignoring training batch")
+            loss = loss * 0  # Do this so that backprop doesn't complain
+
         return {"loss": loss}
 
     @profiler.time_function
@@ -425,13 +459,17 @@ class RGBDDiffusion(Model):
         images_dict["img"] = torch.cat([rgb_row_1, rgb_row_2], dim=0)
 
         if not self.config.rgb_only:
-            neighbor_depth = batch[NEIGHBOR_DEPTH].view(batch[NEIGHBOR_DEPTH].shape[0], 1, 224, 224)
-            neighbor_depth = F.interpolate(neighbor_depth, batch[DEPTH].shape[:2], mode="bilinear").squeeze(
-                1).unsqueeze(-1)
-            depth_row_1 = torch.cat([batch[DEPTH], *neighbor_depth], 1)
-            depth_row_2 = torch.cat([*outputs["samples_depth"]], 1)
+            if NEIGHBOR_DEPTH in batch:
+                # neighbor_depth = batch[NEIGHBOR_DEPTH].view(batch[NEIGHBOR_DEPTH].shape[0], 1, 224, 224)
+                # neighbor_depth = F.interpolate(neighbor_depth, batch[DEPTH].shape[:2], mode="bilinear").squeeze(
+                #     1).unsqueeze(-1)
+                depth_row_1 = torch.cat([batch[DEPTH], *batch[NEIGHBOR_DEPTH]], 1)
+                depth_row_2 = torch.cat([*outputs["samples_depth"]], 1)
 
-            images_dict["depth"] = colormaps.apply_depth_colormap(torch.cat([depth_row_1, depth_row_2], dim=0))
+                images_dict["depth"] = colormaps.apply_depth_colormap(torch.cat([depth_row_1, depth_row_2], dim=0))
+            else:
+                images_dict["depth"] = colormaps.apply_depth_colormap(
+                    torch.cat([outputs[DEPTH_GT].squeeze(0), *outputs["samples_depth"]], 1))
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image = torch.moveaxis(image, -1, 0)[None, ...]

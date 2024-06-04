@@ -57,29 +57,29 @@ class UnionDatamanagerConfig(DataManagerConfig):
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
     # DL3DVDataParserConfig(),
     # CO3DDataParserConfig(),
+    # R10KDataParserConfig(data=Path("data/r10k")),
     # R10KDataParserConfig(),
     # ObjaverseXLDataParserConfig(),
-    # R10KDataParserConfig(data=Path("data/r10k")),
     # MVImgNetDataParserConfig()
     # ])
 
 
-# DATAPARSERS = [
-#     DL3DVDataParserConfig(use_dust3r_poses=False),
-#     CO3DDataParserConfig(),
-#     R10KDataParserConfig(),
-#     MVImgNetDataParserConfig(),
-#     R10KDataParserConfig(data=Path("data/r10k")),
-# ]
-
 DATAPARSERS = [
     DL3DVDataParserConfig(use_dust3r_poses=False),
     CO3DDataParserConfig(),
-    R10KDataParserConfig(),
-    ObjaverseXLDataParserConfig(),
     R10KDataParserConfig(data=Path("data/r10k")),
-    MVImgNetDataParserConfig()
+    # R10KDataParserConfig(),
+    MVImgNetDataParserConfig(),
 ]
+
+# DATAPARSERS = [
+#     DL3DVDataParserConfig(use_dust3r_poses=False),
+#     CO3DDataParserConfig(),
+#     R10KDataParserConfig(data=Path("data/r10k")),
+#     ObjaverseXLDataParserConfig(),
+#     R10KDataParserConfig(),
+#     MVImgNetDataParserConfig(),
+# ]
 
 
 class UnionDatamanager(DataManager):

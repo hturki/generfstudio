@@ -17,10 +17,15 @@ from torch import nn
 # in the scene
 class GlobalPointCloudOptimizer(nn.Module):
 
-    def __init__(self, view1: Dict, view2: Dict, pred1: Dict, pred2: Dict, poses: torch.Tensor, fx: torch.Tensor,
-                 fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, rgbs: torch.Tensor, poses_per_scene: int,
+    def __init__(self, view1: Dict, view2: Dict, pred1: Dict, pred2: Dict, poses: torch.Tensor,
+                 fx: torch.Tensor,  fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                 poses_per_scene: int, fg_masks: Optional[torch.Tensor],
                  filter_dist_quantiles: Optional[Tuple[float, float]] = None,
                  filter_weight_quantile: Optional[float] = None, verbose: bool = False):
+    # def __init__(self, view1: Dict, view2: Dict, pred1: Dict, pred2: Dict, poses: torch.Tensor, fx: torch.Tensor,
+    #                  fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, poses_per_scene: int,
+    #                  filter_dist_quantiles: Optional[Tuple[float, float]] = None,
+    #                  filter_weight_quantile: Optional[float] = None, verbose: bool = False):
         super().__init__()
 
         num_preds = pred1["conf"].shape[0]
@@ -49,7 +54,7 @@ class GlobalPointCloudOptimizer(nn.Module):
         self.poses = poses
         self.focals = torch.cat([fx, fy], -1)
         self.pp = torch.cat([cx, cy], -1)
-        self.rgbs = rgbs
+        self.fg_masks = fg_masks
 
         pixels_im = torch.stack(
             torch.meshgrid(torch.arange(view1["img"].shape[-1], device=poses.device, dtype=torch.float32),
@@ -132,7 +137,10 @@ class GlobalPointCloudOptimizer(nn.Module):
     #     return loss  # + 0.01 * self.forward()
 
     def init_least_squares(self):
-        if self.filter_dist_quantiles is not None:
+        if self.fg_masks is not None:
+            constraint_i = self.fg_masks[self.view1_idx]
+            constraint_j = self.fg_masks[self.view2_idx]
+        elif self.filter_dist_quantiles is not None:
             metric_i = self.pts3d_i.norm(dim=-1)
             metric_j = self.pts3d_j.norm(dim=-1)
 
@@ -198,15 +206,17 @@ class GlobalPointCloudOptimizer(nn.Module):
                          constraint_i[second] if constraint_i is not None else None)]:
                         if view_idx_1 == view_idx_2:
                             assert self.view1_idx[first] != self.view1_idx[second]
-                            # TODO: need to set rows to zero instead of filtering to make this work with batches
+                            weights_chunk = torch.minimum(weights_1, weights_2)
                             if c1 is not None:
-                                constraint = torch.logical_and(c1, c2) > 0
-                                weights_1 = weights_1[constraint]
-                                weights_2 = weights_2[constraint]
-                                displacement_1 = displacement_1[constraint]
-                                displacement_2 = displacement_2[constraint]
+                                # constraint = torch.logical_and(c1, c2) > 0
+                                weights_chunk[torch.logical_or(torch.logical_not(c1), torch.logical_not(c2))] = 0
+                                # weights_1 = weights_1[constraint]
 
-                            weights_chunk = torch.minimum(weights_1, weights_2).repeat_interleave(3).unsqueeze(-1)
+                                # weights_2 = weights_2[constraint]
+                                # displacement_1 = displacement_1[constraint]
+                                # displacement_2 = displacement_2[constraint]
+
+                            weights_chunk = weights_chunk.repeat_interleave(3).unsqueeze(-1)
                             A_chunk = torch.zeros(weights_chunk.shape[0], pairs_per_scene, device=weights_chunk.device)
                             A_chunk[:, first % pairs_per_scene] = displacement_1.reshape(-1)
                             A_chunk[:, second % pairs_per_scene] = -displacement_2.reshape(-1)
@@ -381,13 +391,15 @@ class GlobalPointCloudOptimizer(nn.Module):
         # self.depth_log.data[:] = (self.pts3d_i.view(self.depth_log.shape[0], -1, self.depth_log.shape[1], 3)[:, 0, :,
         #                           2] * alignment.s.view(self.depth_log.shape[0], -1)[:, 0].view(-1, 1)).log()
 
-    def pts3d_world(self, from_depth=False):
+    def pts3d_world(self, from_depth=True):
         # return self.pts3d_cam
         # pts3d = self.pts3d_cam
         # pts3d = self.pred_scales_log.exp().view(-1, 1, 1)[::2] * self.pts3d_i[::2]
-        # pts3d = _fast_depthmap_to_pts3d(self.depth_log.exp(), self.pixels, self.focals,
-        #                                 self.pp) if from_depth else self.pts3d_cam
-        transformed = self.poses @ torch.cat([self.pts3d_cam, torch.ones_like(self.pts3d_cam[..., :1])], -1).transpose(
+
+
+        pts3d = fast_depthmap_to_pts3d(self.pts3d_cam[..., 2], self.pixels, self.focals,
+                                        self.pp) if from_depth else self.pts3d_cam
+        transformed = self.poses @ torch.cat([pts3d, torch.ones_like(self.pts3d_cam[..., :1])], -1).transpose(
             1, 2)
         return transformed.transpose(1, 2)[..., :3]
 

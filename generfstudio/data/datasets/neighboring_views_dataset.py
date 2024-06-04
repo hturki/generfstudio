@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 from typing import Dict
 
@@ -6,15 +7,17 @@ import torch
 from dust3r.utils.geometry import geotrf
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
-from torch.nn import functional as F
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D, NEIGHBOR_DEPTH
 
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+import cv2
+
 
 class NeighboringViewsDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0,
-                 neighboring_views_size: int = 3, return_target_depth: bool = False):
+                 neighboring_views_size: int = 3):
         # super().__init__(dataparser_outputs, scale_factor)
         # Skip the deepcopy to save time
         self._dataparser_outputs = dataparser_outputs
@@ -26,17 +29,16 @@ class NeighboringViewsDataset(InputDataset):
         self.mask_color = dataparser_outputs.metadata.get("mask_color", None)
 
         self.neighboring_views_size = neighboring_views_size
-        self.return_target_depth = return_target_depth
 
         if DEPTH in self.metadata:
-            self.cameras_dust3r = deepcopy(dataparser_outputs.cameras)
-            self.cameras_dust3r.rescale_output_resolution(224 / self.cameras_dust3r.width)
-            self.c2w_dust3r = torch.eye(4).unsqueeze(0).repeat(len(self.cameras_dust3r), 1, 1)
-            self.c2w_dust3r[:, :3] = self.cameras_dust3r.camera_to_worlds
-            self.c2w_dust3r[:, :, 1:3] *= -1  # opengl to opencv
+            # self.cameras_depth = deepcopy(dataparser_outputs.cameras)
+            # self.cameras_dust3r.rescale_output_resolution(224 / self.cameras_dust3r.width)
+            self.c2w_opencv = torch.eye(4).unsqueeze(0).repeat(len(dataparser_outputs.cameras), 1, 1)
+            self.c2w_opencv[:, :3] = deepcopy(dataparser_outputs.cameras).camera_to_worlds
+            self.c2w_opencv[:, :, 1:3] *= -1  # opengl to opencv
             pixels_im = torch.stack(
-                torch.meshgrid(torch.arange(224, dtype=torch.float32),
-                               torch.arange(224, dtype=torch.float32),
+                torch.meshgrid(torch.arange(dataparser_outputs.cameras.height[0].item(), dtype=torch.float32),
+                               torch.arange(dataparser_outputs.cameras.width[0].item(), dtype=torch.float32),
                                indexing="ij")).permute(2, 1, 0)
             self.pixels = pixels_im.reshape(-1, 2)
 
@@ -52,19 +54,21 @@ class NeighboringViewsDataset(InputDataset):
         metadata[NEIGHBOR_INDICES] = torch.LongTensor(neighbor_indices)
 
         if DEPTH in self.metadata:
-            neighbor_depth = torch.stack(
-                [torch.load(self.metadata[DEPTH][x], map_location="cpu") for x in neighbor_indices])
+            neighbor_depth = torch.stack([self.read_depth(x) for x in neighbor_indices])
+            cameras = self._dataparser_outputs.cameras
             pts3d_cam = fast_depthmap_to_pts3d(
-                neighbor_depth,
+                neighbor_depth.view(neighbor_depth.shape[0], -1),
                 self.pixels,
-                torch.cat([self.cameras_dust3r.fx[neighbor_indices], self.cameras_dust3r.fy[neighbor_indices]], -1),
-                torch.cat([self.cameras_dust3r.cx[neighbor_indices], self.cameras_dust3r.cy[neighbor_indices]], -1))
-            metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_dust3r[neighbor_indices], pts3d_cam)
+                torch.cat([cameras.fx[neighbor_indices], cameras.fy[neighbor_indices]], -1),
+                torch.cat([cameras.cx[neighbor_indices], cameras.cy[neighbor_indices]], -1))
+            metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_opencv[neighbor_indices], pts3d_cam)
 
-            if self.return_target_depth:
-                depth = torch.load(self.metadata[DEPTH][image_idx], map_location="cpu")
-                metadata[DEPTH] = F.interpolate(depth.view(1, 1, 224, 224), data["image"].shape[:2],
-                                                mode="bilinear").squeeze().unsqueeze(-1)
-                metadata[NEIGHBOR_DEPTH] = neighbor_depth
+            metadata[DEPTH] = self.read_depth(image_idx)
+            metadata[NEIGHBOR_DEPTH] = neighbor_depth
 
         return metadata
+
+    def read_depth(self, image_idx: int) -> torch.Tensor:
+        depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., :1]
+        depth[depth >= 65504.] = 0
+        return torch.FloatTensor(depth)

@@ -49,11 +49,13 @@ class DL3DVDataParserConfig(DataParserConfig):
 
     eval_scene_count: int = 50
 
-    neighbor_overlap_threshold: Optional[Tuple[float, float]] = (0.3, 0.5)
+    neighbor_overlap_threshold: Optional[Tuple[float, float]] = None # (0.3, 0.5)
+
+    neighbor_window_size: Optional[int] = 20
 
     conversion_threads: int = 96
 
-    use_dust3r_poses: bool = True
+    use_dust3r_poses: bool = False
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
     # dust3r_model_name: str = "/project_data/ramanan/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
@@ -135,15 +137,17 @@ class DL3DV(DataParser):
         rank = get_rank() + self.config.worker_offset
         world_size = self.config.num_workers if self.config.num_workers is not None else get_world_size()
 
-        # split = "test"
-
         overlap_threshold = self.config.neighbor_overlap_threshold
+        window_size = self.config.neighbor_window_size
+        assert overlap_threshold is None or window_size is None
+        neighbor_key = f"{overlap_threshold[0]}-{overlap_threshold[1]}" if overlap_threshold is not None else window_size
+
         crop = self.config.crop
         scale_near = self.config.scale_near
         use_dust3r_poses = self.config.use_dust3r_poses
         dust3r_use_known_cameras = self.config.dust3r_use_known_cameras
 
-        cached_path = self.config.data / f"cached-metadata-{split}-{crop}-{scale_near}-{overlap_threshold[0]}-{overlap_threshold[1]}--{rank}-{world_size}-{chunk_index}-{num_chunks}-{use_dust3r_poses}-{dust3r_use_known_cameras}.pt"
+        cached_path = self.config.data / f"cached-metadata-{split}-{crop}-{scale_near}-{neighbor_key}--{rank}-{world_size}-{chunk_index}-{num_chunks}-{use_dust3r_poses}-{dust3r_use_known_cameras}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -245,7 +249,7 @@ class DL3DV(DataParser):
                         continue
                     if (dust3r_dest / "FAIL").exists():
                         continue
-                    create_dust3r_poses(self.model, dust3r_dest, dest, metadata, None, #frame_intersections,
+                    create_dust3r_poses(self.model, dust3r_dest, dest, metadata, None,  # frame_intersections,
                                         dust3r_use_known_cameras,
                                         num_iters=500 if dust3r_use_known_cameras else 5000)
 
@@ -303,7 +307,13 @@ class DL3DV(DataParser):
                 width.append(frame["w"])
                 height.append(frame["h"])
 
-                if overlap_threshold is not None:
+                if window_size is not None:
+                    neighboring_views.append(
+                        list(range(scene_index_start + max(0, scene_image_index - window_size),
+                                   scene_index_start + scene_image_index))
+                        + list(range(scene_index_start + scene_image_index + 1,
+                                     min(scene_index_end, scene_index_start + scene_image_index + window_size + 1))))
+                elif overlap_threshold is not None:
                     min_mask = frame_intersections[scene_image_index] > overlap_threshold[0]
                     if split != "train":
                         max_mask = frame_intersections[scene_image_index] < overlap_threshold[1]
@@ -331,16 +341,17 @@ class DL3DV(DataParser):
                 c2ws_dust3r[:, :, 1:3] *= -1  # opengl to opencv
 
                 psnr = GaussianOptimizer(image_filenames[-len(frames):], depth, c2ws_dust3r,
-                    torch.FloatTensor(fx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
-                    torch.FloatTensor(fy[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
-                    torch.FloatTensor(cx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
-                    torch.FloatTensor(cy[-len(frames):]).view(-1, 1).cuda() * 224 / 256, True, False).cuda().get_psnr()
+                                         torch.FloatTensor(fx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                                         torch.FloatTensor(fy[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                                         torch.FloatTensor(cx[-len(frames):]).view(-1, 1).cuda() * 224 / 256,
+                                         torch.FloatTensor(cy[-len(frames):]).view(-1, 1).cuda() * 224 / 256, True,
+                                         False).cuda().get_psnr()
 
                 dust3r_metadata["psnr"] = psnr
                 torch.save(dust3r_metadata, duster_metadata_path)
                 print(scene, torch.FloatTensor(psnr).mean())
             elif use_dust3r_poses and split != "train":
-                    print(scene, torch.FloatTensor(dust3r_metadata["psnr"]).mean())
+                print(scene, torch.FloatTensor(dust3r_metadata["psnr"]).mean())
 
         c2ws = torch.stack(c2ws)
         width = torch.LongTensor(width)

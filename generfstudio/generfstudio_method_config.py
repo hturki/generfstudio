@@ -23,7 +23,6 @@ from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 from generfstudio.data.datasets.masked_dataset import MaskedDataset
 from generfstudio.data.datasets.neighboring_views_dataset import NeighboringViewsDataset
-from generfstudio.models.mv_diffusion import MVDiffusionConfig
 from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
 from generfstudio.models.pixelnerf import PixelNeRFModelConfig
 from generfstudio.models.rgbd_diffusion import RGBDDiffusionConfig
@@ -211,160 +210,6 @@ pixelnerf_method = MethodSpecification(
     description='PixelNeRF',
 )
 
-mv_diffusion_method = MethodSpecification(
-    config=TrainerConfig(
-        method_name="mv-diffusion",
-        steps_per_eval_image=1000,
-        steps_per_eval_batch=0,
-        steps_per_save=1000,
-        steps_per_eval_all_images=1000000,
-        max_num_iterations=1000000,
-        mixed_precision=True,
-        log_gradients=False,
-        gradient_accumulation_steps={
-            "cond_encoder": 4,
-            "fields": 4
-        },
-        pipeline=VanillaPipelineConfig(
-            datamanager=NeighboringViewsDatamanagerConfig(
-                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=3,
-                image_batch_size=64,
-                dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
-            ),
-            model=MVDiffusionConfig(),
-        ),
-        optimizers={
-            "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-            "fields": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-        },
-        vis="wandb",
-    ),
-    description='Training a multi-view diffusion model',
-)
-
-mv_diffusion_union_method = MethodSpecification(
-    config=TrainerConfig(
-        method_name="mv-diffusion-union",
-        steps_per_eval_image=1,
-        steps_per_eval_batch=0,
-        steps_per_save=2000,
-        steps_per_eval_all_images=1000000,
-        max_num_iterations=1000001,
-        mixed_precision=True,
-        log_gradients=False,
-        gradient_accumulation_steps={
-            "cond_encoder": 64,
-            "fields": 64
-        },
-        pipeline=VanillaPipelineConfig(
-            datamanager=UnionDatamanagerConfig(
-                inner=NeighboringViewsDatamanagerConfig(
-                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=3,
-                    image_batch_size=1,
-                ),
-            ),
-            model=MVDiffusionConfig(),
-        ),
-        optimizers={
-            "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-            "fields": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-        },
-        vis="wandb",
-    ),
-    description='Training a multi-view diffusion model on all datasets',
-)
-
-mv_diffusion_ddp_method = MethodSpecification(
-    config=TrainerConfig(
-        method_name="mv-diffusion-ddp",
-        steps_per_eval_image=1600,
-        steps_per_eval_batch=0,
-        steps_per_save=2000,
-        steps_per_eval_all_images=1000000,
-        max_num_iterations=1000001,
-        mixed_precision=True,
-        log_gradients=False,
-        gradient_accumulation_steps={
-            "cond_encoder": 8,
-            "fields": 8
-        },
-        pipeline=VanillaPipelineConfig(
-            datamanager=NeighboringViewsDatamanagerConfig(
-                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=3,
-                image_batch_size=32,
-                dataparser=DTUDataParserConfig(scene_id=None, auto_orient=True),
-            ),
-            model=MVDiffusionConfig(),
-        ),
-        optimizers={
-            "cond_encoder": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-            "fields": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-        },
-        vis="wandb",
-    ),
-    description='Training a multi-view diffusion model with DDP (8 GPUs)',
-)
-
-mv_diffusion_union_ddp_method = MethodSpecification(
-    config=TrainerConfig(
-        method_name="mv-diffusion-union-ddp",
-        steps_per_eval_image=1600,
-        steps_per_eval_batch=0,
-        steps_per_save=2000,
-        steps_per_eval_all_images=1000000,
-        max_num_iterations=1000001,
-        mixed_precision=True,
-        log_gradients=False,
-        gradient_accumulation_steps={
-            "cond_encoder": 16,
-            "fields": 16
-        },
-        pipeline=VanillaPipelineConfig(
-            datamanager=UnionDatamanagerConfig(
-                inner=NeighboringViewsDatamanagerConfig(
-                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=3,
-                    image_batch_size=16,
-                ),
-            ),
-            model=MVDiffusionConfig(),
-        ),
-        optimizers={
-            "cond_encoder": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-            "fields": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
-        },
-        vis="wandb",
-    ),
-    description='Training a multi-view diffusion model on all datasets with DDP (8 GPUs)',
-)
-
 rgbd_diffusion_method = MethodSpecification(
     config=TrainerConfig(
         method_name="rgbd-diffusion",
@@ -382,20 +227,135 @@ rgbd_diffusion_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=3,
+                neighboring_views_size=1,
                 image_batch_size=64,
-                return_target_depth=True,
                 dataparser=DL3DVDataParserConfig(),
             ),
             model=RGBDDiffusionConfig(),
         ),
         optimizers={
             "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-5, eps=1e-15, max_norm=1),
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
             "fields": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-5, eps=1e-15, max_norm=1),
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_ddp_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-ddp",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 1,
+            "fields": 1
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                neighboring_views_size=1,
+                image_batch_size=256,
+                dataparser=DL3DVDataParserConfig(),
+            ),
+            model=RGBDDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_union_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-union",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 4,
+            "fields": 4
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=UnionDatamanagerConfig(
+                inner=NeighboringViewsDatamanagerConfig(
+                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                    neighboring_views_size=1,
+                    image_batch_size=64,
+                ),
+            ),
+            model=RGBDDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_union_ddp_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-union-ddp",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 1,
+            "fields": 1
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=UnionDatamanagerConfig(
+                inner=NeighboringViewsDatamanagerConfig(
+                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                    neighboring_views_size=1,
+                    image_batch_size=256,
+                ),
+            ),
+            model=RGBDDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
             },
         },

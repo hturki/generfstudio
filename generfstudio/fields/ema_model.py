@@ -22,10 +22,6 @@ class EmaModel(EMAModel, nn.Module):
             model_config: Dict[str, Any] = None,
             **kwargs,
     ):
-        # super(EMAModel, self).__init__(parameters, decay=decay, min_decay=min_decay,
-        #                                update_after_step=update_after_step, use_ema_warmup=use_ema_warmup,
-        #                                inv_gamma=inv_gamma, power=power, model_cls=model_cls, model_config=model_config,
-        #                                kwargs=kwargs)
         if isinstance(parameters, torch.nn.Module):
             deprecation_message = (
                 "Passing a `torch.nn.Module` to `ExponentialMovingAverage` is deprecated. "

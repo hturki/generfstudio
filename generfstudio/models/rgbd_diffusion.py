@@ -140,23 +140,24 @@ class RGBDDiffusion(Model):
         self.ddim_scheduler = DDIMScheduler.from_pretrained(self.config.scheduler_pretrained_path,
                                                             subfolder="scheduler")
 
-        if self.config.cond_image_encoder_type == "resnet":
-            self.cond_image_encoder = SpatialEncoder()
-            encoder_dim = self.cond_image_encoder.latent_size
-            # self.cond_image_encoder = torch.compile(self.cond_image_encoder)
-        elif self.config.cond_image_encoder_type == "unet":
-            assert not self.config.freeze_cond_image_encoder
-            encoder_dim = 128
-            # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
-        elif self.config.cond_image_encoder_type == "dino":
-            assert not self.config.freeze_cond_image_encoder
-            self.cond_image_encoder = DinoV2Encoder(out_feature_dim=self.config.cond_feature_out_dim)
-            encoder_dim = self.config.cond_feature_out_dim
-        else:
-            raise Exception(self.config.cond_image_encoder_type)
+        if self.config.cond_feature_out_dim > 0:
+            if self.config.cond_image_encoder_type == "resnet":
+                self.cond_image_encoder = SpatialEncoder()
+                encoder_dim = self.cond_image_encoder.latent_size
+                # self.cond_image_encoder = torch.compile(self.cond_image_encoder)
+            elif self.config.cond_image_encoder_type == "unet":
+                assert not self.config.freeze_cond_image_encoder
+                encoder_dim = 128
+                # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
+            elif self.config.cond_image_encoder_type == "dino":
+                assert not self.config.freeze_cond_image_encoder
+                self.cond_image_encoder = DinoV2Encoder(out_feature_dim=self.config.cond_feature_out_dim)
+                encoder_dim = self.config.cond_feature_out_dim
+            else:
+                raise Exception(self.config.cond_image_encoder_type)
 
         self.cond_feature_field = Dust3rField(model_name=self.config.dust3r_model_name,
-                                              in_feature_dim=encoder_dim,
+                                              in_feature_dim=encoder_dim if self.config.cond_feature_out_dim > 0 else 0,
                                               out_feature_dim=self.config.cond_feature_out_dim,
                                               depth_precomputed=self.depth_available)
 
@@ -171,14 +172,14 @@ class RGBDDiffusion(Model):
             CONSOLE.log("Using sync batchnorm for DDP")
             self.unet = nn.SyncBatchNorm.convert_sync_batchnorm(self.unet)
             self.cond_feature_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_feature_field)
-            if not self.config.freeze_cond_image_encoder:
+            if self.config.cond_feature_out_dim > 0 and (not self.config.freeze_cond_image_encoder):
                 self.cond_image_encoder = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_image_encoder)
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
 
-        if not self.config.freeze_cond_image_encoder:
+        if self.config.cond_feature_out_dim > 0 and (not self.config.freeze_cond_image_encoder):
             param_groups["cond_encoder"] += list(self.cond_image_encoder.parameters())
 
         param_groups["fields"] = list(self.unet.parameters())
@@ -203,7 +204,7 @@ class RGBDDiffusion(Model):
 
     @profiler.time_function
     def get_cond_features(self, cameras: Cameras, cond_rgbs: torch.Tensor):
-        if self.config.cond_image_encoder_type == "dino":
+        if self.config.cond_feature_out_dim > 0 and self.config.cond_image_encoder_type == "dino":
             # We're going to need to resize to 224 for both dino and dust3r - might as well only do it once
             if cond_rgbs.shape[-1] != self.cond_feature_field.image_dim:
                 assert not DEPTH in cameras.metadata
@@ -212,11 +213,14 @@ class RGBDDiffusion(Model):
                                               self.cond_feature_field.image_dim, mode="bicubic")
                     cond_rgbs = cond_rgbs.view(len(cameras), -1, *cond_rgbs.shape[1:])
 
-        if self.config.freeze_cond_image_encoder:
-            with torch.no_grad():
+        if self.config.cond_feature_out_dim > 0:
+            if self.config.freeze_cond_image_encoder:
+                with torch.no_grad():
+                    cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
+            else:
                 cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
         else:
-            cond_features = self.cond_image_encoder(cond_rgbs.view(-1, *cond_rgbs.shape[2:]))
+            cond_features = None
 
         target_cameras = deepcopy(cameras)
         target_cameras.metadata = {}
@@ -287,6 +291,8 @@ class RGBDDiffusion(Model):
                 #         .view(-1, 1, 1, 1)
                 depth_scaling_factor = cameras.metadata[NEIGHBOR_DEPTH].view(len(cameras), -1).mean(dim=-1) \
                                            .view(-1, 1, 1, 1) * 2
+                if self.training:
+                    depth_scaling_factor = depth_scaling_factor[valid_alignment]
             else:
                 depth_scaling_factor = cond_features[DEPTH_GT].mean(dim=-1).view(-1, 1, 1, 1) * 2
 
@@ -305,7 +311,9 @@ class RGBDDiffusion(Model):
         if self.config.binarize_accumulation:
             accumulation_features = (accumulation_features > 0.5).type(accumulation_features.dtype)
         concat_list.append(accumulation_features)
-        concat_list.append(cond_features[FEATURES].permute(0, 3, 1, 2))
+
+        if self.config.cond_feature_out_dim > 0:
+            concat_list.append(cond_features[FEATURES].permute(0, 3, 1, 2))
 
         c_concat = torch.cat(concat_list, 1)
 
@@ -337,7 +345,7 @@ class RGBDDiffusion(Model):
                 input_gt = image_gt.permute(0, 3, 1, 2) * 2 - 1
             else:
                 if DEPTH in cameras.metadata:
-                    depth_gt = cameras.metadata[DEPTH][valid_alignment] / depth_scaling_factor[valid_alignment]
+                    depth_gt = cameras.metadata[DEPTH][valid_alignment] / depth_scaling_factor
 
                 input_gt = torch.cat([image_gt.permute(0, 3, 1, 2), depth_gt.permute(0, 3, 1, 2)], 1) * 2 - 1
 

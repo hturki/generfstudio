@@ -128,9 +128,10 @@ class Dust3rField(nn.Module):
 
     @profiler.time_function
     def forward(self, target_cameras: Cameras, neighbor_cameras: Cameras, cond_rgbs: torch.Tensor,
-                cond_features: torch.Tensor, cond_pts3d: Optional[torch.Tensor], neighbor_depth: Optional[torch.Tensor],
-                camera_rgbs: Optional[torch.Tensor], camera_fg_masks: Optional[torch.Tensor],
-                neighbor_fg_masks: Optional[torch.Tensor], bg_colors: Optional[torch.Tensor], return_depth: bool,
+                cond_features: Optional[torch.Tensor], cond_pts3d: Optional[torch.Tensor],
+                neighbor_depth: Optional[torch.Tensor], camera_rgbs: Optional[torch.Tensor],
+                camera_fg_masks: Optional[torch.Tensor], neighbor_fg_masks: Optional[torch.Tensor],
+                bg_colors: Optional[torch.Tensor], return_depth: bool,
                 target_cameras_feature: Optional[Cameras] = None):
 
         image_dim = self.image_dim if cond_pts3d is None else target_cameras.height[0].item()
@@ -359,7 +360,10 @@ class Dust3rField(nn.Module):
             neighbor_cameras = neighbor_cameras[valid_alignment]
             cond_pts3d = cond_pts3d[valid_alignment]
             cond_rgbs = cond_rgbs[valid_alignment]
-            cond_features = cond_features[valid_alignment]
+
+            if self.out_feature_dim > 0:
+                cond_features = cond_features[valid_alignment]
+
             target_cameras = target_cameras[valid_alignment]
             w2cs = w2cs[valid_alignment]
             if target_cameras_feature is not None:
@@ -368,7 +372,6 @@ class Dust3rField(nn.Module):
                 neighbor_fg_masks = neighbor_fg_masks[valid_alignment]
                 bg_colors = bg_colors[valid_alignment]
 
-        scales = depth / neighbor_cameras.fx.view(-1, 1)
         # scales = (depth * pixel_areas.view(depth.shape))
         xyz = cond_pts3d.view(len(target_cameras), -1, 3)
         rgbs = cond_rgbs.permute(0, 1, 3, 4, 2).view(len(target_cameras), -1, 3)
@@ -379,6 +382,12 @@ class Dust3rField(nn.Module):
         else:
             features = None
 
+        outputs = {
+            ALIGNMENT_LOSS: alignment_loss,
+            VALID_ALIGNMENT: valid_alignment,
+        }
+
+        scales = depth / neighbor_cameras.fx.view(-1, 1)
         scales = scales.view(len(target_cameras), -1, 1).expand(-1, -1, 3)
 
         conf = neighbor_fg_masks.view(xyz[..., :1].shape).float() if neighbor_fg_masks is not None \
@@ -397,12 +406,9 @@ class Dust3rField(nn.Module):
             bg_colors,
         )
 
-        outputs = {
-            RGB: rendering[RGB],
-            ACCUMULATION: rendering[ACCUMULATION],
-            ALIGNMENT_LOSS: alignment_loss,
-            VALID_ALIGNMENT: valid_alignment,
-        }
+        outputs[RGB] = rendering[RGB]
+        if ACCUMULATION not in outputs:
+            outputs[ACCUMULATION] = rendering[ACCUMULATION]
 
         if dust3r_on_gt:
             outputs[DEPTH_GT] = scene.depth()[1::2].detach()
@@ -412,7 +418,28 @@ class Dust3rField(nn.Module):
         if return_depth:
             outputs[DEPTH] = rendering[DEPTH]
 
-        if target_cameras_feature is not None:
+        if neighbor_fg_masks is not None:
+            with torch.no_grad():
+                conf_acc = torch.ones_like(xyz[..., :1])
+                depth_acc = torch.where(neighbor_fg_masks.view(xyz[..., 0].shape), depth, 1000)
+
+                scales_acc = depth_acc / neighbor_cameras.fx.view(-1, 1)
+                scales_acc = scales_acc.view(len(target_cameras), -1, 1).expand(-1, -1, 3)
+                rendering_acc = self.splat_gaussians(
+                    target_cameras_feature if target_cameras_feature is not None else target_cameras,
+                    xyz,
+                    scales_acc,
+                    conf_acc,
+                    w2cs,
+                    None,
+                    None,
+                    return_depth,
+                    1,
+                    None,
+                )
+                outputs[ACCUMULATION_FEATURES] = rendering_acc[ACCUMULATION]
+
+        if target_cameras_feature is not None and (self.out_feature_dim > 0 or neighbor_fg_masks is None):
             rendering_feature = self.splat_gaussians(
                 target_cameras_feature,
                 xyz,
@@ -421,15 +448,22 @@ class Dust3rField(nn.Module):
                 w2cs,
                 None,
                 features,
-                False,
+                features is None,
                 1,
                 None
             )
-            outputs[FEATURES] = rendering_feature[FEATURES]
-            outputs[ACCUMULATION_FEATURES] = rendering_feature[ACCUMULATION]
+
+            if self.out_feature_dim > 0:
+                outputs[FEATURES] = rendering_feature[FEATURES]
+
+            if neighbor_fg_masks is None:
+                outputs[ACCUMULATION_FEATURES] = rendering_feature[ACCUMULATION]
         else:
-            outputs[FEATURES] = rendering[FEATURES]
-            outputs[ACCUMULATION_FEATURES] = rendering[ACCUMULATION]
+            if self.out_feature_dim > 0:
+                outputs[FEATURES] = rendering[FEATURES]
+
+            if neighbor_fg_masks is None:
+                outputs[ACCUMULATION_FEATURES] = rendering[ACCUMULATION]
 
         if not self.training:
             neighbor_renderings = self.splat_gaussians(

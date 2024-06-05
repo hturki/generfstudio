@@ -53,33 +53,36 @@ class UnionDatamanagerConfig(DataManagerConfig):
         _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
     ))
 
+    include_oxl: bool = True
+
     # Making this a config makes startup very slow
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
     # DL3DVDataParserConfig(),
     # CO3DDataParserConfig(),
     # R10KDataParserConfig(data=Path("data/r10k")),
-    # R10KDataParserConfig(),
     # ObjaverseXLDataParserConfig(),
+    # R10KDataParserConfig(),
     # MVImgNetDataParserConfig()
     # ])
 
+
+DATAPARSERS_NO_OXL = [
+    DL3DVDataParserConfig(use_dust3r_poses=False),
+    CO3DDataParserConfig(),
+    R10KDataParserConfig(data=Path("data/r10k")),
+    # ObjaverseXLDataParserConfig(),
+    MVImgNetDataParserConfig(),
+    R10KDataParserConfig(),
+]
 
 DATAPARSERS = [
     DL3DVDataParserConfig(use_dust3r_poses=False),
     CO3DDataParserConfig(),
     R10KDataParserConfig(data=Path("data/r10k")),
-    # R10KDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+    R10KDataParserConfig(),
     MVImgNetDataParserConfig(),
 ]
-
-# DATAPARSERS = [
-#     DL3DVDataParserConfig(use_dust3r_poses=False),
-#     CO3DDataParserConfig(),
-#     R10KDataParserConfig(data=Path("data/r10k")),
-#     ObjaverseXLDataParserConfig(),
-#     R10KDataParserConfig(),
-#     MVImgNetDataParserConfig(),
-# ]
 
 
 class UnionDatamanager(DataManager):
@@ -97,7 +100,7 @@ class UnionDatamanager(DataManager):
             **kwargs,
     ):
         self.delegates = []
-        for dataparser in tqdm(DATAPARSERS):
+        for dataparser in tqdm(DATAPARSERS if config.include_oxl else DATAPARSERS_NO_OXL):
             inner = deepcopy(config.inner)
             inner.dataparser = dataparser
             self.delegates.append(

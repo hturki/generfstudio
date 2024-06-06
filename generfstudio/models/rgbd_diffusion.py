@@ -58,6 +58,8 @@ class RGBDDiffusionConfig(ModelConfig):
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
     encode_rgbd_vae: bool = True
 
+    guidance_scale: float = 3.0
+
     use_ema: bool = True
     allow_tf32: bool = False
     rgb_only: bool = False
@@ -382,15 +384,30 @@ class RGBDDiffusion(Model):
                                                   cameras.width[0, 0].item() // vae_scale_factor),
                                                  device=c_concat.device,
                                                  dtype=c_concat.dtype)
+
+                c_concat_inference = c_concat.expand(n_samples, -1, -1, -1)
+                c_crossattn_inference = c_crossattn.expand(n_samples, -1, -1)
+
+                if self.config.guidance_scale > 1:
+                    c_concat_inference = torch.cat([torch.zeros_like(c_concat_inference), c_concat_inference])
+                    c_crossattn_inference = torch.cat([torch.zeros_like(c_crossattn_inference), c_crossattn_inference])
+
                 for t in self.ddim_scheduler.timesteps:
-                    latent_model_input = self.ddim_scheduler.scale_model_input(inference_latents, t)
-                    latent_model_input = torch.cat([latent_model_input, c_concat.expand(n_samples, -1, -1, -1)], dim=1)
+                    latent_model_input = torch.cat([inference_latents] * 2) \
+                        if self.config.guidance_scale > 1 else inference_latents
+                    latent_model_input = self.ddim_scheduler.scale_model_input(latent_model_input, t)
+                    latent_model_input = torch.cat([latent_model_input, c_concat_inference], dim=1)
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
-                        c_crossattn.expand(n_samples, -1, -1),
+                        c_crossattn_inference,
                         return_dict=False,
                     )[0]
+
+                    if self.config.guidance_scale > 1:
+                        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.config.guidance_scale * (
+                                noise_pred_cond - noise_pred_uncond)
 
                     inference_latents = self.ddim_scheduler.step(noise_pred, t, inference_latents, return_dict=False)[0]
 

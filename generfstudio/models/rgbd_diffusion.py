@@ -56,6 +56,7 @@ class RGBDDiffusionConfig(ModelConfig):
     scheduler_pretrained_path: str = "Intel/ldm3d-4c"
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    intrinsics_from_dust3r: bool = False
     encode_rgbd_vae: bool = True
 
     guidance_scale: float = 3.0
@@ -161,6 +162,7 @@ class RGBDDiffusion(Model):
         self.cond_feature_field = Dust3rField(model_name=self.config.dust3r_model_name,
                                               in_feature_dim=encoder_dim if self.config.cond_feature_out_dim > 0 else 0,
                                               out_feature_dim=self.config.cond_feature_out_dim,
+                                              intrinsics_from_dust3r=self.config.intrinsics_from_dust3r,
                                               depth_precomputed=self.depth_available)
 
         # metrics
@@ -271,7 +273,7 @@ class RGBDDiffusion(Model):
         if is_training:
             image_cond = image_cond[valid_alignment]
             image_cond_flat = image_cond.view(-1, *image_cond.shape[2:])
-        else:
+        elif not self.config.intrinsics_from_dust3r:
             outputs[NEIGHBOR_RESULTS] = cond_features[NEIGHBOR_RESULTS]
 
         with torch.no_grad():
@@ -472,12 +474,14 @@ class RGBDDiffusion(Model):
 
         images_dict = {"cond_img": torch.cat([cond_rgb_gt.squeeze(0), cond_rgb.squeeze(0), cond_depth], 1)}
 
-        neighbor_splat_depth = colormaps.apply_depth_colormap(
-            outputs[NEIGHBOR_RESULTS][DEPTH].squeeze(0),
-            accumulation=outputs[NEIGHBOR_RESULTS][ACCUMULATION].squeeze(0),
-        )
-        images_dict["neighbor_splats"] = torch.cat([outputs[NEIGHBOR_RESULTS][RGB].squeeze(0), neighbor_splat_depth],
+        if not self.config.intrinsics_from_dust3r:
+            neighbor_splat_depth = colormaps.apply_depth_colormap(
+                outputs[NEIGHBOR_RESULTS][DEPTH].squeeze(0),
+                accumulation=outputs[NEIGHBOR_RESULTS][ACCUMULATION].squeeze(0),
+            )
+            images_dict["neighbor_splats"] = torch.cat([outputs[NEIGHBOR_RESULTS][RGB].squeeze(0), neighbor_splat_depth],
                                                    0)
+
         rgb_row_1 = torch.cat([image, *batch[NEIGHBOR_IMAGES].squeeze(0)], 1)
         rgb_row_2 = torch.cat([*outputs["samples_rgb"]], 1)
 

@@ -75,28 +75,22 @@ nerfacto_sds_method = MethodSpecification(
 
 splatfacto_sds_method = MethodSpecification(
     config=TrainerConfig(
-        method_name="splatfacto-sds",
+        method_name="splatfacto",
         steps_per_eval_image=100,
         steps_per_eval_batch=0,
         steps_per_save=2000,
         steps_per_eval_all_images=1000,
         max_num_iterations=30000,
-        # mixed_precision=True,
         mixed_precision=False,
-        # gradient_accumulation_steps={"camera_opt": 100},
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
-                _target=FullImageDatamanager[MaskedDataset],
                 dataparser=SDSDataParserConfig(),
                 cache_images_type="uint8",
             ),
-            model=SplatfactoSDSModelConfig(
-                random_init=True,
-                background_color="white"
-            ),
+            model=SplatfactoSDSModelConfig(),
         ),
         optimizers={
-            "xyz": {
+            "means": {
                 "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=1.6e-6,
@@ -111,15 +105,21 @@ splatfacto_sds_method = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
                 "scheduler": None,
             },
-            "opacity": {
+            "opacities": {
                 "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
                 "scheduler": None,
             },
-            "scaling": {
+            "scales": {
                 "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
                 "scheduler": None,
             },
-            "rotation": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+            "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+            "camera_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=5e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                ),
+            },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",

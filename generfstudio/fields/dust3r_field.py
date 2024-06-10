@@ -388,7 +388,10 @@ class Dust3rField(nn.Module):
 
         # scales = (depth * pixel_areas.view(depth.shape))
         xyz = cond_pts3d.view(len(target_cameras), -1, 3)
-        rgbs = cond_rgbs.permute(0, 1, 3, 4, 2).view(len(target_cameras), -1, 3)
+        try:
+            rgbs = cond_rgbs.permute(0, 1, 3, 4, 2).view(len(target_cameras), -1, 3)
+        except:
+            import pdb; pdb.set_trace()
 
         if self.out_feature_dim > 0:
             features = cond_features.permute(0, 1, 3, 4, 2)

@@ -8,14 +8,9 @@ from typing import Type, Optional
 import numpy as np
 import torch
 from PIL import Image
-from dust3r.cloud_opt.base_opt import global_alignment_loop
-from dust3r.cloud_opt.optimizer import _fast_depthmap_to_pts3d
-from dust3r.utils.geometry import geotrf
 
 from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
-from generfstudio.data.dataparsers.gaussian_optimizer import GaussianOptimizer
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
-from generfstudio.generfstudio_constants import DEPTH
 
 try:
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
@@ -30,7 +25,6 @@ from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
     DataParserConfig, DataparserOutputs,
 )
-from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 
 
 @dataclass
@@ -38,18 +32,16 @@ class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
     inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
-        scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117", use_dust3r_poses=True, dust3r_use_known_cameras=True))
-    # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
+        # scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117"))
+        scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
     # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""
 
-    start: int = 0
-    end: int = 2
+    num_images: int = 2
     image_cond_override: Optional[Path] = None
 
     init_with_depth: bool = True
-    use_global_optimizer: bool = True
-    use_saved: bool = True
+    use_global_optimizer: bool = False
 
     dust3r_checkpoint_path: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
 
@@ -63,50 +55,14 @@ class SDS(DataParser):
         if config.data != Path():
             config.inner.data = self.config.data
         self.inner: DataParser = config.inner.setup()
-        self.start = config.start
-        self.end = config.end
 
     def _generate_dataparser_outputs(self, split='train') -> DataparserOutputs:
         inner_outputs = self.inner.get_dataparser_outputs(split)
         if split == 'train':
-            if self.config.use_saved:
-                depth = torch.stack([torch.load(x, map_location="cpu") for x in inner_outputs.metadata[DEPTH]])
-                c2ws_dust3r = deepcopy(inner_outputs.cameras.camera_to_worlds)
-                c2ws_dust3r[:, :, 1:3] *= -1  # opengl to opencv
-                opt_cameras = deepcopy(inner_outputs.cameras)
-                opt_cameras.rescale_output_resolution(224 / opt_cameras.width)
-                optimizer = GaussianOptimizer(inner_outputs.image_filenames,
-                                              # depth,
-                                              c2ws_dust3r,
-                                              opt_cameras.fx, opt_cameras.fy, opt_cameras.cx, opt_cameras.cy).cuda()
-                                              # , True,
-                                              # False, False).cuda()
+            image_indices = np.linspace(0, len(inner_outputs.image_filenames) - 1, self.config.num_images, dtype=int)
 
-                optimizer.align_with_dust3r(self.config.dust3r_checkpoint_path)
-
-                with torch.enable_grad():
-                    optimizer.optimize(1000)
-
-                print(torch.FloatTensor(optimizer.get_psnr()[0]).mean())
-
-                metadata = {}
-                metadata["points3D_xyz"] = optimizer.get_xyz().detach()
-                metadata["points3D_rgb"] = (optimizer.rgbs.view(-1, 3) * 255).byte()
-                metadata["points3D_scale"] = optimizer.scales.detach()
-                # metadata["points3D_conf"] = torch.cat(confs)
-
-                return DataparserOutputs(
-                    image_filenames=inner_outputs.image_filenames,
-                    cameras=inner_outputs.cameras,
-                    alpha_color=inner_outputs.alpha_color,
-                    scene_box=inner_outputs.scene_box,
-                    dataparser_scale=inner_outputs.dataparser_scale,
-                    metadata=metadata
-                )
-
-            train_image_filenames = np.array(inner_outputs.image_filenames)[[38, 126, 294]].tolist()[
-                                    self.start:self.end + 1]
-            train_image_cameras = inner_outputs.cameras[torch.LongTensor([38, 126, 294])][self.start:self.end + 1]
+            train_image_filenames = np.array(inner_outputs.image_filenames)[image_indices].tolist()
+            train_image_cameras = inner_outputs.cameras[torch.LongTensor(image_indices)]
             image_cond_override = self.config.image_cond_override
 
             if image_cond_override is not None:
@@ -120,6 +76,7 @@ class SDS(DataParser):
             metadata = {
                 "train_image_filenames": train_image_filenames,
                 "train_image_cameras": train_image_cameras,
+                "train_image_cameras_all": inner_outputs.cameras,
                 "test_cameras": self.inner.get_dataparser_outputs("test").cameras
             }
 
@@ -139,25 +96,7 @@ class SDS(DataParser):
                     masks = [torch.BoolTensor(np.asarray(Image.open(x).resize((224, 224), Image.NEAREST))[..., 3] > 0)
                              for x in train_image_filenames]
 
-                if DEPTH in inner_outputs.metadata:
-
-                    depths = []
-                    for frame_path_pt in np.array(inner_outputs.metadata[DEPTH])[[38, 126, 294]].tolist()[
-                                         self.start:self.end + 1]:
-                        frame_depth = torch.load(frame_path_pt, map_location="cpu")
-                        depths.append(frame_depth)
-                    # import pdb;
-                    # pdb.set_trace()
-                    depths = torch.stack(depths)
-                    pixels_im = torch.stack(
-                        torch.meshgrid(torch.arange(224, dtype=torch.float32),
-                                       torch.arange(224, dtype=torch.float32),
-                                       indexing="ij")).permute(2, 1, 0)
-                    pixels = pixels_im.reshape(-1, 2)
-                    pts3d_cam = _fast_depthmap_to_pts3d(depths, pixels.unsqueeze(0).expand(depths.shape[0], -1, -1),
-                                                        cameras.fx, torch.cat([cameras.cx, cameras.cy], -1))
-                    pts3d = geotrf(c2ws, pts3d_cam)
-                elif self.config.use_global_optimizer:
+                if self.config.use_global_optimizer:
                     with torch.no_grad():
                         view1 = {"img": [], "idx": [], "instance": []}
                         view2 = {"img": [], "idx": [], "instance": []}
@@ -178,13 +117,13 @@ class SDS(DataParser):
                         pred1, pred2 = model(view1, view2)
                         cameras = cameras.to("cuda")
                         scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, c2ws.cuda(), cameras.fx,
-                                                          cameras.fy,
-                                                          cameras.cx, cameras.cy, None, None, None, None,
-                                                          cameras.shape[0] - 1, verbose=True)
+                                                          cameras.fy, cameras.cx, cameras.cy, cameras.shape[0] - 1,
+                                                          None, verbose=True)
                         scene.init_least_squares()
                     # scene.init_scale_from_poses()
                     # global_alignment_loop(scene, niter=300, schedule="cosine", lr=0.01)
                     pts3d = scene.pts3d_world()
+                    depth = scene.depth()
                 else:
                     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
                     output = inference(pairs, model, "cuda", batch_size=1)
@@ -192,44 +131,21 @@ class SDS(DataParser):
                                            optimize_pp=True)
                     scene.preset_pose(c2ws)
                     scene.preset_focal(cameras.fx)  # Assume fx and fy are almost equal
-                    scene.preset_principal_point(cameras.cx)  # Assume cx and cy are almost equal
-                    scene.compute_global_alignment(init="known_poses", niter=3000, schedule="cosine", lr=0.1)
+                    scene.preset_principal_point(torch.cat([cameras.cx, cameras.cy], -1))
+                    scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.1)
                     # scene.clean_pointcloud()
-                    pts3d = scene.get_pts3d()
+                    pts3d = scene.get_pts3d(raw=True)
+                    depth = scene.get_depthmaps(raw=True)
 
-                xyz = []
-                rgb = []
-                scales = []
-                confs = []
-                for i in range(len(train_image_cameras)):
-                    image_xyz = pts3d[i].detach().view(-1, 3)
-                    image_rgb = images[i]["img"].squeeze(0).permute(1, 2, 0).detach().view(-1, 3).to(image_xyz.device)
-                    pixel_area = cameras.generate_rays(camera_indices=i).pixel_area.view(-1, 1).to(image_xyz.device)
-                    # confidence = torch.log(scene.im_conf[i].detach().view(-1, 1)).clamp_max(1)
+                xyz = pts3d.view(-1, 3).detach()
+                scales = depth.detach() / cameras.fx.view(-1, 1).cuda()
+                # scales = scales.view(-1, 1).expand(-1, 3)
+                rgb = torch.cat([images[x]["img"].squeeze(0).permute(1, 2, 0) for x in range(len(cameras))]).view(-1,
+                                                                                                                  3) / 2 + 0.5
 
-                    if has_alpha:
-                        mask = scene.get_masks()[i].view(-1)
-                        image_rgb = image_rgb[mask]
-                        image_xyz = image_xyz[mask]
-                        pixel_area = pixel_area[mask]
-                        # confidence = confidence[mask]
-
-                    xyz.append(image_xyz)
-                    rgb.append(image_rgb)
-
-                    camera_pos = cameras[i].camera_to_worlds[:, 3]
-                    distances = (image_xyz - camera_pos.to(image_xyz.device)).norm(dim=-1, keepdim=True)
-                    scales.append(pixel_area.to(distances.device) * distances)
-
-                    # confs.append(confidence)
-
-                import pdb;
-                pdb.set_trace()
-
-                metadata["points3D_xyz"] = torch.cat(xyz)
-                metadata["points3D_rgb"] = ((torch.cat(rgb) / 2 + 0.5) * 255).byte()
-                metadata["points3D_scale"] = torch.cat(scales)
-                # metadata["points3D_conf"] = torch.cat(confs)
+                metadata["points3D_xyz"] = xyz
+                metadata["points3D_rgb"] = (rgb * 255).byte()
+                metadata["points3D_scale"] = scales.view(-1, 1)
 
             return DataparserOutputs(
                 image_filenames=train_image_filenames,

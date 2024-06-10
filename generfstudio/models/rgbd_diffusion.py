@@ -59,13 +59,11 @@ class RGBDDiffusionConfig(ModelConfig):
     intrinsics_from_dust3r: bool = False
     encode_rgbd_vae: bool = True
 
-    guidance_scale: float = 3.0
+    guidance_scale: float = 2.0
 
     use_ema: bool = True
     allow_tf32: bool = False
     rgb_only: bool = False
-
-    binarize_accumulation: bool = False
 
 
 class RGBDDiffusion(Model):
@@ -311,10 +309,7 @@ class RGBDDiffusion(Model):
                 concat_list = [cond_features[RGB].permute(0, 3, 1, 2) * 2 - 1,
                                cond_depth * 2 - 1]
 
-        accumulation_features = cond_features[ACCUMULATION_FEATURES].permute(0, 3, 1, 2)
-        if self.config.binarize_accumulation:
-            accumulation_features = (accumulation_features > 0.5).type(accumulation_features.dtype)
-        concat_list.append(accumulation_features)
+        concat_list.append(cond_features[ACCUMULATION_FEATURES].permute(0, 3, 1, 2))
 
         if self.config.cond_feature_out_dim > 0:
             concat_list.append(cond_features[FEATURES].permute(0, 3, 1, 2))
@@ -322,7 +317,7 @@ class RGBDDiffusion(Model):
         c_concat = torch.cat(concat_list, 1)
 
         if is_training:
-            # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
+            # To support classifier-free guidance, randomly drop out only concat conditioning 5%, only cross_attn conditioning 5%, and both 5%.
             random_mask = torch.rand((image_cond.shape[0], 1, 1), device=image_cond.device)
             prompt_mask = random_mask < 2 * self.config.uncond
             input_mask = torch.logical_not(

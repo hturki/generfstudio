@@ -75,10 +75,10 @@ nerfacto_sds_method = MethodSpecification(
 
 splatfacto_sds_method = MethodSpecification(
     config=TrainerConfig(
-        method_name="splatfacto",
+        method_name="splatfacto-sds",
         steps_per_eval_image=100,
         steps_per_eval_batch=0,
-        steps_per_save=2000,
+        steps_per_save=1000,
         steps_per_eval_all_images=1000,
         max_num_iterations=30000,
         mixed_precision=False,

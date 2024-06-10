@@ -69,11 +69,7 @@ class NeighboringViewsDataset(InputDataset):
         return metadata
 
     def read_depth(self, image_idx: int) -> torch.Tensor:
-        try:
-            depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., :1]
-        except Exception as e:
-            torch.save([self.metadata, image_idx], "/scratch/hturki/fail.pt")
-            raise e
+        depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., :1]
 
         depth[depth >= 65504.] = 0
         return torch.FloatTensor(depth)

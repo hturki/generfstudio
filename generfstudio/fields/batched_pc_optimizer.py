@@ -240,7 +240,7 @@ class GlobalPointCloudOptimizer(nn.Module):
 
         solution = torch.linalg.lstsq(A, B)
 
-        scene_scales = solution.solution.squeeze()
+        scene_scales = solution.solution.squeeze(-1)
         valid_scenes = scene_scales.min(dim=-1)[0] > 0
 
         if self.verbose:

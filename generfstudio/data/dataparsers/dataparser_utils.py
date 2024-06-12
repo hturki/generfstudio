@@ -3,17 +3,12 @@ from pathlib import Path
 from typing import Optional, List, Any, Dict
 
 import cv2
-import math
 import numpy as np
 import torch
 from PIL import Image
-from dust3r.utils.geometry import geotrf
-from gsplat import projection, isect_tiles, isect_offset_encode, rasterize_to_pixels
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.utils.comms import get_rank
-from torchmetrics.image import PeakSignalNoiseRatio
 
-from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.generfstudio_utils import central_crop_v2
 
 try:

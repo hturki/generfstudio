@@ -9,7 +9,7 @@ from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, NEIGHBOR_PTS3D, NEIGHBOR_DEPTH
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEIGHBOR_IMAGES, DEPTH, PTS3D, NEIGHBOR_DEPTH
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
@@ -17,7 +17,7 @@ import cv2
 
 class NeighboringViewsDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0,
-                 neighboring_views_size: int = 3):
+                 neighboring_views_size: int = 3, return_neighbor_points: bool = True):
         # super().__init__(dataparser_outputs, scale_factor)
         # Skip the deepcopy to save time
         self._dataparser_outputs = dataparser_outputs
@@ -29,6 +29,7 @@ class NeighboringViewsDataset(InputDataset):
         self.mask_color = dataparser_outputs.metadata.get("mask_color", None)
 
         self.neighboring_views_size = neighboring_views_size
+        self.return_neighbor_points = return_neighbor_points
 
         if DEPTH in self.metadata:
             # self.cameras_depth = deepcopy(dataparser_outputs.cameras)
@@ -54,17 +55,24 @@ class NeighboringViewsDataset(InputDataset):
         metadata[NEIGHBOR_INDICES] = torch.LongTensor(neighbor_indices)
 
         if DEPTH in self.metadata:
-            neighbor_depth = torch.stack([self.read_depth(x) for x in neighbor_indices])
-            cameras = self._dataparser_outputs.cameras
-            pts3d_cam = fast_depthmap_to_pts3d(
-                neighbor_depth.view(neighbor_depth.shape[0], -1),
-                self.pixels,
-                torch.cat([cameras.fx[neighbor_indices], cameras.fy[neighbor_indices]], -1),
-                torch.cat([cameras.cx[neighbor_indices], cameras.cy[neighbor_indices]], -1))
-            metadata[NEIGHBOR_PTS3D] = geotrf(self.c2w_opencv[neighbor_indices], pts3d_cam)
-
             metadata[DEPTH] = self.read_depth(image_idx)
-            metadata[NEIGHBOR_DEPTH] = neighbor_depth
+            metadata[NEIGHBOR_DEPTH] = torch.stack([self.read_depth(x) for x in neighbor_indices])
+            
+            cameras = self._dataparser_outputs.cameras
+            if self.return_neighbor_points:
+                pts3d_cam = fast_depthmap_to_pts3d(
+                    metadata[NEIGHBOR_DEPTH].view(metadata[NEIGHBOR_DEPTH].shape[0], -1),
+                    self.pixels,
+                    torch.cat([cameras.fx[neighbor_indices], cameras.fy[neighbor_indices]], -1),
+                    torch.cat([cameras.cx[neighbor_indices], cameras.cy[neighbor_indices]], -1))
+                metadata[PTS3D] = geotrf(self.c2w_opencv[neighbor_indices], pts3d_cam)
+            else:
+                pts3d_cam = fast_depthmap_to_pts3d(
+                    metadata[DEPTH],
+                    self.pixels,
+                    torch.cat([cameras.fx[image_idx], cameras.fy[image_idx]], -1),
+                    torch.cat([cameras.cx[image_idx], cameras.cy[image_idx]], -1))
+                metadata[PTS3D] = geotrf(self.c2w_opencv[image_idx], pts3d_cam)
 
         return metadata
 

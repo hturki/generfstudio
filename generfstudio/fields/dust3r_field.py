@@ -1,17 +1,16 @@
 from copy import deepcopy
-from typing import Optional
+from typing import Optional, Callable, Tuple
 
 import math
 import torch
 from dust3r.model import AsymmetricCroCo3DStereo
-from dust3r.utils.geometry import xy_grid
-from gsplat import projection, isect_tiles, isect_offset_encode, rasterize_to_pixels
+from gsplat import fully_fused_projection, isect_tiles, isect_offset_encode, rasterize_to_pixels
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils import profiler
 from torch import nn
 from torch.nn import functional as F
 
-from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
+from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer, fast_depthmap_to_pts3d
 from generfstudio.generfstudio_constants import RGB, FEATURES, ACCUMULATION, ALIGNMENT_LOSS, NEIGHBOR_RESULTS, DEPTH, \
     VALID_ALIGNMENT, ACCUMULATION_FEATURES, DEPTH_GT
 
@@ -23,8 +22,7 @@ class Dust3rField(nn.Module):
             model_name: str,
             in_feature_dim: int = 512,
             out_feature_dim: int = 128,
-            image_dim: int = 224,
-            intrinsics_from_dust3r: bool = False,
+            noisy_cond_views: int = 0,
             depth_precomputed: bool = False,
     ) -> None:
         super().__init__()
@@ -36,48 +34,44 @@ class Dust3rField(nn.Module):
         else:
             self.model = None
 
-        self.image_dim = image_dim
-        # self.pnp_method = pnp_method
         self.out_feature_dim = out_feature_dim
         if out_feature_dim > 0 and in_feature_dim != out_feature_dim:
             self.feature_layer = nn.Linear(in_feature_dim, out_feature_dim)
         else:
             self.feature_layer = None
 
-        self.intrinsics_from_dust3r = intrinsics_from_dust3r
+        self.noisy_cond_views = noisy_cond_views
 
     @profiler.time_function
     @torch.cuda.amp.autocast(enabled=False)
-    def splat_gaussians(self, cameras: Cameras, xyz: torch.Tensor, scales: torch.Tensor, conf: torch.Tensor,
-                        w2cs: torch.Tensor, rgbs: Optional[torch.Tensor], features: Optional[torch.Tensor],
+    def splat_gaussians(self, w2cs: torch.Tensor, fx: torch.Tensor, fy: torch.Tensor, cx: torch.Tensor,
+                        cy: torch.Tensor, xyz: torch.Tensor, scales: torch.Tensor, conf: torch.Tensor,
+                        rgbs: Optional[torch.Tensor], features: Optional[torch.Tensor], camera_dim: int,
                         return_depth: bool, cameras_per_scene: int, bg_colors: Optional[torch.Tensor]):
         quats = torch.cat([torch.ones_like(conf), torch.zeros_like(xyz)], -1)
 
-        fx = cameras.fx.view(-1, 1)
         zeros = torch.zeros_like(fx)
         ones = torch.ones_like(fx)
 
         K = torch.cat([
-            torch.cat([cameras.fx.view(-1, 1), zeros, cameras.cx.view(-1, 1)], -1).unsqueeze(1),
-            torch.cat([zeros, cameras.fy.view(-1, 1), cameras.cy.view(-1, 1)], -1).unsqueeze(1),
+            torch.cat([fx, zeros, cx], -1).unsqueeze(1),
+            torch.cat([zeros, fy, cy], -1).unsqueeze(1),
             torch.cat([zeros, zeros, ones], -1).unsqueeze(1)
         ], 1)
 
-        W = cameras.width[0, 0].item()
-        H = cameras.height[0, 0].item()
-        radii, means2d, depths, conics, compensations = projection(xyz, None, quats, scales, w2cs, K, W, H,
-                                                                   cameras_per_scene=cameras_per_scene)
+        radii, means2d, depths, conics, compensations = fully_fused_projection(
+            xyz, None, quats, scales, w2cs, K, camera_dim, camera_dim, cameras_per_scene=cameras_per_scene)
 
         tile_size = 16
-        tile_width = math.ceil(W / tile_size)
-        tile_height = math.ceil(H / tile_size)
+        tile_width = math.ceil(camera_dim / tile_size)
+        tile_height = math.ceil(camera_dim / tile_size)
         tiles_per_gauss, isect_ids, gauss_ids = isect_tiles(
             means2d, radii, depths, tile_size, tile_width, tile_height
         )
 
         # assert (tiles_per_gauss > 0).any()
 
-        isect_offsets = isect_offset_encode(isect_ids, len(cameras), tile_width, tile_height)
+        isect_offsets = isect_offset_encode(isect_ids, w2cs.shape[0], tile_width, tile_height)
 
         inputs = []
         if rgbs is not None:
@@ -108,8 +102,8 @@ class Dust3rField(nn.Module):
             conics,
             inputs,
             conf.squeeze(-1),
-            W,
-            H,
+            camera_dim,
+            camera_dim,
             tile_size,
             isect_offsets,
             gauss_ids,
@@ -130,60 +124,101 @@ class Dust3rField(nn.Module):
 
         return outputs
 
+    # Intrinsics should be passed for image size inferred by rgb
     @profiler.time_function
-    def forward(self, target_cameras: Cameras, neighbor_cameras: Cameras, cond_rgbs: torch.Tensor,
-                cond_features: Optional[torch.Tensor], cond_pts3d: Optional[torch.Tensor],
-                neighbor_depth: Optional[torch.Tensor], camera_rgbs: Optional[torch.Tensor],
-                camera_fg_masks: Optional[torch.Tensor], neighbor_fg_masks: Optional[torch.Tensor],
-                bg_colors: Optional[torch.Tensor], return_depth: bool,
-                target_cameras_feature: Optional[Cameras] = None):
+    @torch.inference_mode()
+    def get_pts3d_and_depth(self, rgbs: torch.Tensor, fg_masks: Optional[torch.Tensor], c2ws: torch.Tensor,
+                            fx: torch.Tensor, fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor):
+        rgbs = rgbs * 2 - 1
+
+        view1 = {"img": [], "idx": [], "instance": []}
+        view2 = {"img": [], "idx": [], "instance": []}
+        for i in range(rgbs.shape[0]):
+            for first in range(rgbs.shape[1]):
+                for second in range(rgbs.shape[1]):
+                    if first == second:
+                        continue
+                    view1["img"].append(rgbs[i, first])
+                    view2["img"].append(rgbs[i, second])
+                    view_idx_first = i * rgbs.shape[1] + first
+                    view1["idx"].append(view_idx_first)
+                    view1["instance"].append(str(view_idx_first))
+                    view_idx_second = i * rgbs.shape[1] + second
+                    view2["idx"].append(view_idx_second)
+                    view2["instance"].append(str(view_idx_second))
+
+        view1["img"] = torch.stack(view1["img"])
+        view2["img"] = torch.stack(view2["img"])
+
+        with profiler.time_function("dust3r_inference"):
+            pred1, pred2 = self.model(view1, view2)
+
+        scene = GlobalPointCloudOptimizer(
+            view1, view2, pred1, pred2, c2ws.view(-1, 4, 4), fx.view(-1, 1), fy.view(-1, 1), cx.view(-1, 1),
+            cy.view(-1, 1), rgbs.shape[1], fg_masks.flatten(0, 1) if fg_masks is not None else None,
+            verbose=not self.training)
+
+        alignment_loss, valid_alignment = scene.init_least_squares()
+        pts3d = scene.pts3d_world().detach()
+        depth = scene.depth().detach()
+
+        return pts3d, depth, alignment_loss, valid_alignment
+
+    @profiler.time_function
+    def forward(self, target_cameras: Cameras, neighbor_cameras: Cameras,
+                target_rgbs: Optional[torch.Tensor], neighbor_rgbs: torch.Tensor,
+                target_fg_masks: Optional[torch.Tensor], neighbor_fg_masks: Optional[torch.Tensor],
+                neighbor_features: Optional[torch.Tensor],
+                cond_pts3d: Optional[torch.Tensor], cond_depth: Optional[torch.Tensor],
+                bg_colors: Optional[torch.Tensor], return_target_depth: bool,
+                to_noise_fn: Optional[
+                    Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
+                rgb_resolution: int, feature_resolution: int):
 
         image_dim = self.image_dim if cond_pts3d is None else target_cameras.height[0].item()
 
-        if cond_rgbs.shape[-1] != image_dim:
-            with profiler.time_function("interpolate_rgb_for_dust3r"), torch.no_grad():
-                cond_rgbs = F.interpolate(cond_rgbs.view(-1, *cond_rgbs.shape[2:]), image_dim, mode="bicubic")
-                cond_rgbs = cond_rgbs.view(len(target_cameras), -1, *cond_rgbs.shape[1:])
+        if neighbor_rgbs.shape[-1] != image_dim:
+            with torch.no_grad():
+                neighbor_rgbs = F.interpolate(neighbor_rgbs.view(-1, *neighbor_rgbs.shape[2:]), image_dim,
+                                              mode="bicubic")
+                neighbor_rgbs = neighbor_rgbs.view(len(target_cameras), -1, *neighbor_rgbs.shape[1:])
 
         if self.out_feature_dim > 0:
-            with profiler.time_function("feature_layer_for_dust3r"):
-                # bilinear interpolation can be expensive for high-dimensional features
-                b, d, h, w = cond_features.shape
-                cond_features = cond_features.permute(0, 2, 3, 1)  # b, d, h, w
-                if self.feature_layer is not None:
-                    cond_features = self.feature_layer(cond_features.reshape(-1, d)).view(b, h, w, -1)
-                    cond_features = cond_features.permute(0, 3, 1, 2)  # b, d, h, w
+            # bilinear interpolation can be expensive for high-dimensional features
+            b, d, h, w = neighbor_features.shape
+            neighbor_features = neighbor_features.permute(0, 2, 3, 1)  # b, d, h, w
+            if self.feature_layer is not None:
+                neighbor_features = self.feature_layer(neighbor_features.reshape(-1, d)).view(b, h, w, -1)
+                neighbor_features = neighbor_features.permute(0, 3, 1, 2)  # b, d, h, w
 
-            if cond_features.shape[-1] != image_dim:
-                with profiler.time_function("interpolate_features_for_dust3r"):
-                    cond_features = F.interpolate(cond_features, image_dim)
-                    cond_features = cond_features.view(len(target_cameras), -1, *cond_features.shape[1:])
+            if neighbor_features.shape[-1] != image_dim:
+                neighbor_features = F.interpolate(neighbor_features, image_dim)
+                neighbor_features = neighbor_features.view(len(target_cameras), -1, *neighbor_features.shape[1:])
 
-        with profiler.time_function("dust3r_camera_prep"):
-            w2cs = torch.eye(4, device=target_cameras.device).unsqueeze(0).repeat(len(target_cameras), 1, 1)
+        w2cs = torch.eye(4, device=target_cameras.device).unsqueeze(0).repeat(len(target_cameras), 1, 1)
 
-            if not self.intrinsics_from_dust3r:
-                R = target_cameras.camera_to_worlds[:, :3,
-                    :3].clone()  # 3 x 3, clone to avoid changing original cameras
-                R[:, :, 1:3] *= -1  # opengl to opencv (what gsplat expects)
-                T = target_cameras.camera_to_worlds[:, :3, 3:]  # 3 x 1
+        R = target_cameras.camera_to_worlds[:, :3, :3].clone()  # 3 x 3, clone to avoid changing original cameras
+        R[:, :, 1:3] *= -1  # opengl to opencv
+        T = target_cameras.camera_to_worlds[:, :3, 3:]  # 3 x 1
 
-                R_inv = R[:, :3, :3].transpose(1, 2)
-                w2cs[:, :3, :3] = R_inv
-                w2cs[:, :3, 3:] = -torch.bmm(R_inv, T)
+        R_inv = R[:, :3, :3].transpose(1, 2)
+        w2cs[:, :3, :3] = R_inv
+        w2cs[:, :3, 3:] = -torch.bmm(R_inv, T)
 
-                if neighbor_cameras.height[0, 0].item() != image_dim:
-                    neighbor_cameras = deepcopy(neighbor_cameras)
-                    neighbor_cameras.rescale_output_resolution(image_dim / neighbor_cameras.height[0, 0].item())
+        neighbor_cameras_dust3r = neighbor_cameras
+        if neighbor_cameras_dust3r.height[0, 0].item() != image_dim:
+            neighbor_cameras_dust3r = deepcopy(neighbor_cameras_dust3r)
+            neighbor_cameras_dust3r.rescale_output_resolution(image_dim / neighbor_cameras_dust3r.height[0, 0].item())
 
-                neighbor_c2ws = torch.eye(4, device=neighbor_cameras.device).view(1, 1, 4, 4).repeat(
-                    neighbor_cameras.shape[0], neighbor_cameras.shape[1], 1, 1)
-                neighbor_c2ws[:, :, :3] = neighbor_cameras.camera_to_worlds
-                neighbor_c2ws[:, :, :, 1:3] *= -1  # opengl to opencv (what dust3r expects)
+        neighbor_c2ws = torch.eye(4, device=neighbor_cameras_dust3r.device).view(1, 1, 4, 4).repeat(
+            neighbor_cameras_dust3r.shape[0], neighbor_cameras_dust3r.shape[1], 1, 1)
+        neighbor_c2ws[:, :, :3] = neighbor_cameras_dust3r.camera_to_worlds
+        neighbor_c2ws[:, :, :, 1:3] *= -1  # opengl to opencv
 
-        if (not self.training) and (not self.intrinsics_from_dust3r):
-            neighbor_w2cs = torch.eye(4, device=R.device).view(1, 1, 4, 4).repeat(neighbor_cameras.shape[0],
-                                                                                  neighbor_cameras.shape[1], 1, 1)
+        if self.noisy_cond_views > 0 or (not self.training):
+            neighbor_w2cs = torch.eye(4, device=R.device).view(1, 1, 4, 4).repeat(neighbor_cameras_dust3r.shape[0],
+                                                                                  neighbor_cameras_dust3r.shape[1], 1,
+                                                                                  1)
 
             # We can reuse neighbor_c2ws since dust3r and gsplat use the same coordinate convention
             neighbor_R_inv = neighbor_c2ws[:, :, :3, :3].transpose(2, 3)
@@ -192,191 +227,145 @@ class Dust3rField(nn.Module):
             neighbor_inv_T = -torch.bmm(neighbor_R_inv.view(-1, 3, 3), neighbor_T.view(-1, 3, 1))
             neighbor_w2cs[:, :, :3, 3:] = neighbor_inv_T.view(neighbor_w2cs[:, :, :3, 3:].shape)
 
-        dust3r_on_gt = False
-        cond_pts3d_from_gt = cond_pts3d is not None
         if cond_pts3d is None:
-            with profiler.time_function("dust3r_for_all_cameras"):
-                with torch.no_grad():
-                    cond_rgbs_dust3r_input = cond_rgbs * 2 - 1
+            with torch.no_grad():
+                if target_rgbs.shape[-1] != image_dim:
+                    target_rgbs = F.interpolate(target_rgbs, image_dim, mode="bicubic")
 
-                    if neighbor_fg_masks is not None and neighbor_fg_masks.shape[-1] != image_dim:
-                        with torch.no_grad():
-                            neighbor_fg_masks = F.interpolate(
-                                neighbor_fg_masks.view(-1, *neighbor_fg_masks.shape[2:]).unsqueeze(1).float(),
-                                image_dim)
-                            neighbor_fg_masks = neighbor_fg_masks.squeeze(1).view(len(target_cameras), -1,
-                                                                                  image_dim * image_dim).bool()
+                camera_rgbs_dust3r_input = target_rgbs * 2 - 1
+                cond_rgbs_dust3r_input = neighbor_rgbs * 2 - 1
 
-                    if neighbor_cameras.shape[1] == 1:
-                        dust3r_on_gt = not self.intrinsics_from_dust3r
-                        if camera_rgbs.shape[-1] != image_dim:
-                            with torch.no_grad():
-                                camera_rgbs = F.interpolate(camera_rgbs, image_dim, mode="bicubic")
+                if target_fg_masks is not None and target_fg_masks.shape[-1] != image_dim:
+                    target_fg_masks = F.interpolate(target_fg_masks.unsqueeze(1).float(), image_dim)
+                    target_fg_masks = target_fg_masks.squeeze(1).view(len(target_cameras), -1).bool()
 
-                        if camera_fg_masks is not None and camera_fg_masks.shape[-1] != image_dim:
-                            with torch.no_grad():
-                                camera_fg_masks = F.interpolate(camera_fg_masks.unsqueeze(1).float(), image_dim)
-                                camera_fg_masks = camera_fg_masks.squeeze(1).view(len(target_cameras), -1).bool()
+                if neighbor_fg_masks is not None and neighbor_fg_masks.shape[-1] != image_dim:
+                    neighbor_fg_masks = F.interpolate(
+                        neighbor_fg_masks.view(-1, *neighbor_fg_masks.shape[2:]).unsqueeze(1).float(), image_dim)
+                    neighbor_fg_masks = neighbor_fg_masks.squeeze(1).view(len(target_cameras), -1,
+                                                                          image_dim * image_dim).bool()
 
-                        camera_rgbs_dust3r_input = camera_rgbs * 2 - 1
+                c2ws = torch.eye(4, device=R.device).view(1, 4, 4).repeat(target_cameras.shape[0], 1, 1)
+                c2ws[:, :3, :3] = R
+                c2ws[:, :3, 3:] = T
 
-                        if not self.intrinsics_from_dust3r:
-                            pc_c2ws = []
-                            pc_fx = []
-                            pc_fy = []
-                            pc_cx = []
-                            pc_cy = []
-                            if camera_fg_masks is not None:
-                                pc_fg_masks = []
+                view1 = {"img": [], "idx": [], "instance": []}
+                view2 = {"img": [], "idx": [], "instance": []}
+                for i in range(len(target_cameras)):
+                    images_in_scene = [camera_rgbs_dust3r_input[i], *cond_rgbs_dust3r_input[i]]
+                    for first in range(len(images_in_scene)):
+                        for second in range(len(images_in_scene)):
+                            if first == second:
+                                continue
+                            view1["img"].append(images_in_scene[first])
+                            view2["img"].append(images_in_scene[second])
+                            view_idx_first = i * len(images_in_scene) + first
+                            view1["idx"].append(view_idx_first)
+                            view1["instance"].append(str(view_idx_first))
+                            view_idx_second = i * len(images_in_scene) + second
+                            view2["idx"].append(view_idx_second)
+                            view2["instance"].append(str(view_idx_second))
 
-                        with profiler.time_function("dust3r_load_images"):
-                            view1 = {"img": [], "idx": [], "instance": []}
-                            view2 = {"img": [], "idx": [], "instance": []}
-                            for pi, (cond_rgb, camera_rgb) in enumerate(
-                                    zip(cond_rgbs_dust3r_input, camera_rgbs_dust3r_input)):
+                view1["img"] = torch.stack(view1["img"])
+                view2["img"] = torch.stack(view2["img"])
 
-                                if not self.intrinsics_from_dust3r:
-                                    pc_c2ws.append(neighbor_c2ws[pi, 0])
-                                    pc_fx.append(neighbor_cameras.fx[pi, 0])
-                                    pc_fy.append(neighbor_cameras.fy[pi, 0])
-                                    pc_cx.append(neighbor_cameras.cx[pi, 0])
-                                    pc_cy.append(neighbor_cameras.cy[pi, 0])
+                with profiler.time_function("dust3r_inference"):
+                    pred1, pred2 = self.model(view1, view2)
 
-                                    camera_c2w = torch.eye(4, device=R.device)
-                                    camera_c2w[:3, :3] = R[pi]
-                                    camera_c2w[:3, 3:] = T[pi]
-                                    pc_c2ws.append(camera_c2w)
-                                    pc_fx.append(target_cameras.fx[pi] * image_dim / target_cameras.width[pi])
-                                    pc_fy.append(target_cameras.fy[pi] * image_dim / target_cameras.height[pi])
-                                    pc_cx.append(target_cameras.cx[pi] * image_dim / target_cameras.width[pi])
-                                    pc_cy.append(target_cameras.cy[pi] * image_dim / target_cameras.height[pi])
+                scene = GlobalPointCloudOptimizer(
+                    view1, view2, pred1, pred2,
+                    torch.cat([c2ws.unsqueeze(1), neighbor_c2ws], 1).view(-1, 4, 4),
+                    torch.cat(
+                        [(target_cameras.fx * image_dim / target_cameras.width).unsqueeze(1),
+                         neighbor_cameras_dust3r.fx], 1).view(-1, 1),
+                    torch.cat(
+                        [(target_cameras.fy * image_dim / target_cameras.height).unsqueeze(1),
+                         neighbor_cameras_dust3r.fy], 1).view(-1, 1),
+                    torch.cat(
+                        [(target_cameras.cx * image_dim / target_cameras.width).unsqueeze(1),
+                         neighbor_cameras_dust3r.cx], 1).view(-1, 1),
+                    torch.cat(
+                        [(target_cameras.cy * image_dim / target_cameras.height).unsqueeze(1),
+                         neighbor_cameras_dust3r.cy], 1).view(-1, 1),
+                    cond_rgbs_dust3r_input.shape[1] + 1,
+                    torch.cat([target_fg_masks.unsqueeze(1), neighbor_fg_masks], 1).flatten(0, 1)
+                    if target_fg_masks is not None else None,
+                    verbose=not self.training)
 
-                                    if camera_fg_masks is not None:
-                                        pc_fg_masks.append(neighbor_fg_masks[pi, 0])
-                                        pc_fg_masks.append(camera_fg_masks[pi])
+                alignment_loss, valid_alignment = scene.init_least_squares()
+                all_pts3d = scene.pts3d_world().detach()
+                all_depth = scene.depth().detach()
 
-                                    view1["img"].append(cond_rgb[0])
-                                    view2["img"].append(camera_rgb)
-                                    view1["idx"].append(pi * 2)
-                                    view1["instance"].append(str(pi * 2))
-                                    view2["idx"].append(pi * 2 + 1)
-                                    view2["instance"].append(str(pi * 2 + 1))
+                if self.training:
+                    pts3d = all_pts3d.view(target_cameras.shape[0], -1, *all_pts3d.shape[1:])[:, 1:]
+                    depth = all_depth.view(target_cameras.shape[0], -1, *all_depth.shape[1:])[:, 1:]
+                else:
+                    pts3d = all_pts3d.view(target_cameras.shape[0], -1, *all_pts3d.shape[1:])[:, :1]
+                    depth = all_depth.view(target_cameras.shape[0], -1, *all_depth.shape[1:])[:, :1]
 
-                                view2["img"].append(cond_rgb[0])
-                                view1["img"].append(camera_rgb)
-                                view2["idx"].append(pi * 2)
-                                view2["instance"].append(str(pi * 2))
-                                view1["idx"].append(pi * 2 + 1)
-                                view1["instance"].append(str(pi * 2 + 1))
-
-                            view1["img"] = torch.stack(view1["img"])
-                            view2["img"] = torch.stack(view2["img"])
-
-                        with profiler.time_function("dust3r_inference"):
-                            pred1, pred2 = self.model(view1, view2)
-
-                        if self.intrinsics_from_dust3r:
-                            pts3d = pred1["pts3d"].flatten(1, 2)
-                            pp = torch.full_like(target_cameras.width, image_dim / 2).expand(-1, 2)
-                            pixels = xy_grid(image_dim, image_dim, device=pts3d.device).view(1, -1, 2) - pp.view(-1, 1,
-                                                                                                                 2)  # B,HW,2
-                            # u, v = pixels.unbind(dim=-1)
-                            # x, y, z = pts3d.unbind(dim=-1)
-                            # fx_votes = (u * z) / x
-                            # fy_votes = (v * z) / y
-                            # dust3r_fx = torch.nanmedian(fx_votes, dim=-1).values
-                            # dust3r_fy = torch.nanmedian(fy_votes, dim=-1).values
-
-                            # from dust3r
-                            # init focal with l2 closed form
-                            # we try to find focal = argmin Sum | pixel - focal * (x,y)/z|
-                            xy_over_z = (pts3d[..., :2] / pts3d[..., 2:3]).nan_to_num(posinf=0,
-                                                                                      neginf=0)  # homogeneous (x,y,1)
-
-                            dot_xy_px = (xy_over_z * pixels).sum(dim=-1)
-                            dot_xy_xy = xy_over_z.square().sum(dim=-1)
-
-                            dust3r_focal = dot_xy_px.mean(dim=1) / dot_xy_xy.mean(dim=1)
-
-                            # iterative re-weighted least-squares
-                            for iter in range(10):
-                                # re-weighting by inverse of distance
-                                dis = (pixels - dust3r_focal.view(-1, 1, 1) * xy_over_z).norm(dim=-1)
-                                # print(dis.nanmean(-1))
-                                w = dis.clip(min=1e-8).reciprocal()
-                                # update the scaling with the new weights
-                                dust3r_focal = (w * dot_xy_px).mean(dim=1) / (w * dot_xy_xy).mean(dim=1)
-
-                            alignment_loss = 0
-                            valid_alignment = torch.ones(len(target_cameras), dtype=torch.bool, device=pts3d.device)
-                            cond_pts3d = pred2["pts3d_in_other_view"].flatten(1, 2)
-                            depth = cond_pts3d[..., 2]
-                        else:
-                            scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, torch.stack(pc_c2ws),
-                                                              torch.FloatTensor(pc_fx).unsqueeze(-1).to(R.device),
-                                                              torch.FloatTensor(pc_fy).unsqueeze(-1).to(R.device),
-                                                              torch.FloatTensor(pc_cx).unsqueeze(-1).to(R.device),
-                                                              torch.FloatTensor(pc_cy).unsqueeze(-1).to(R.device),
-                                                              2, torch.stack(pc_fg_masks)
-                                                              if camera_fg_masks is not None else None,
-                                                              verbose=not self.training)
-                            alignment_loss, valid_alignment = scene.init_least_squares()
-                            cond_pts3d = scene.pts3d_world()[::2].float().detach()
-                            depth = scene.depth()[::2].float().detach()
-                    else:
-                        with profiler.time_function("dust3r_load_images"):
-                            view1 = {"img": [], "idx": [], "instance": []}
-                            view2 = {"img": [], "idx": [], "instance": []}
-                            for i in range(len(target_cameras)):
-                                for first in range(len(cond_rgbs_dust3r_input[i])):
-                                    for second in range(len(cond_rgbs_dust3r_input[i])):
-                                        if first == second:
-                                            continue
-                                        view1["img"].append(cond_rgbs_dust3r_input[i, first])
-                                        view2["img"].append(cond_rgbs_dust3r_input[i, second])
-                                        view_idx_first = i * len(cond_rgbs_dust3r_input[i]) + first
-                                        view1["idx"].append(view_idx_first)
-                                        view1["instance"].append(str(view_idx_first))
-                                        view_idx_second = i * len(cond_rgbs_dust3r_input[i]) + second
-                                        view2["idx"].append(view_idx_second)
-                                        view2["instance"].append(str(view_idx_second))
-
-                            view1["img"] = torch.stack(view1["img"])
-                            view2["img"] = torch.stack(view2["img"])
-
-                        with profiler.time_function("dust3r_inference"):
-                            pred1, pred2 = self.model(view1, view2)
-
-                        with profiler.time_function("dust3r_create_scene"):
-                            scene = GlobalPointCloudOptimizer(view1, view2, pred1, pred2, neighbor_c2ws.view(-1, 4, 4),
-                                                              neighbor_cameras.fx.view(-1, 1),
-                                                              neighbor_cameras.fy.view(-1, 1),
-                                                              neighbor_cameras.cx.view(-1, 1),
-                                                              neighbor_cameras.cy.view(-1, 1),
-                                                              # cond_rgbs.view(-1, *cond_rgbs.shape[2:]).permute(0, 2, 3,
-                                                              #                                                  1),
-                                                              cond_rgbs_dust3r_input.shape[1],
-                                                              neighbor_fg_masks.view(-1, image_dim,
-                                                                                     image_dim),
-                                                              verbose=not self.training)
-                            alignment_loss, valid_alignment = scene.init_least_squares()
-
-                        cond_pts3d = scene.pts3d_world().float()
-                        depth = scene.depth().float()
+                if self.noisy_cond_views > 0 and to_noise_fn is not None:
+                    pixels = scene.pixels
+                    noisy_focals = scene.focals.view(target_cameras.shape[0], -1, 2)[:,
+                                   1:1 + self.noisy_cond_views].view(-1, 2)
+                    noisy_pp = scene.pp.view(target_cameras.shape[0], -1, 2)[:,
+                               1:1 + self.noisy_cond_views].view(-1, 2)
         else:
+            import pdb;
+            pdb.set_trace()
+            pts3d = cond_pts3d
             alignment_loss = 0
-            depth = neighbor_depth.view(len(target_cameras), -1)
+            depth = cond_depth  # .view(len(target_cameras), -1)
             valid_alignment = depth.max(dim=-1)[0] > 0
+
+            # neighbor cameras should be set to image dim (256 when using gt depth)
+            noisy_focals = torch.cat([neighbor_cameras_dust3r.fx, neighbor_cameras_dust3r.fy], -1)[:,
+                           :self.noisy_cond_views].view(-1, 2)
+            noisy_pp = torch.cat([neighbor_cameras_dust3r.cx, neighbor_cameras_dust3r.cy], -1)[:,
+                       :self.noisy_cond_views].view(-1, 2)
+
+            pixels_im = torch.stack(
+                torch.meshgrid(torch.arange(image_dim, device=noisy_focals.device, dtype=torch.float32),
+                               torch.arange(image_dim, device=noisy_focals.device, dtype=torch.float32),
+                               indexing="ij")).permute(2, 1, 0)
+            pixels = pixels_im.reshape(-1, 2)
+
+        rgbs = neighbor_rgbs
+        conf = neighbor_fg_masks.view(pts3d[..., :1].shape).float() if neighbor_fg_masks is not None \
+            else torch.ones_like(pts3d[..., :1])
+        if neighbor_fg_masks is not None:
+            conf_acc = torch.ones_like(pts3d[..., :1])
+        if self.noisy_cond_views > 0 and to_noise_fn is not None:
+            rgb_to_noise = rgbs[:, :self.noisy_cond_views].flatten(0, 1)
+            depth_to_noise = depth[:, :self.noisy_cond_views].flatten(0, 1).view(-1, 1, image_dim, image_dim)
+            noisy_rgb, noisy_depth, noisy_opacity = to_noise_fn(rgb_to_noise, depth_to_noise)
+
+            noisy_pts3d_cam = fast_depthmap_to_pts3d(noisy_depth.view(-1, image_dim * image_dim),
+                                                     pixels,
+                                                     noisy_focals,
+                                                     noisy_pp)
+            noisy_pts3d = neighbor_c2ws[:, :self.noisy_cond_views].view(-1, 4, 4) @ torch.cat(
+                [noisy_pts3d_cam, torch.ones_like(noisy_pts3d_cam[..., :1])], -1).transpose(1, 2)
+            noisy_pts3d = noisy_pts3d.transpose(1, 2)[..., :3].view(target_cameras.shape[0], self.noisy_cond_views, -1,
+                                                                    3)
+            pts3d = torch.cat([noisy_pts3d, pts3d[:, self.noisy_cond_views:]], 1)
+            depth = torch.cat([noisy_depth.view(target_cameras.shape[0], self.noisy_cond_views, -1),
+                               depth[:, self.noisy_cond_views:]], 1)
+            rgbs = torch.cat([noisy_rgb.view(target_cameras.shape[0], self.noisy_cond_views, 3, image_dim, image_dim),
+                              rgbs[:, self.noisy_cond_views:]], 1)
+            conf[:, :self.noisy_cond_views] *= noisy_opacity.view(-1, 1, 1, 1)
+            if neighbor_fg_masks is not None:
+                conf_acc[:, :self.noisy_cond_views] *= noisy_opacity.view(-1, 1, 1, 1)
 
         # If none are valid, discard the entire batch when computing loss
         if self.training and torch.any(valid_alignment):
+            neighbor_cameras_dust3r = neighbor_cameras_dust3r[valid_alignment]
+            pts3d = pts3d[valid_alignment]
             depth = depth[valid_alignment]
-            neighbor_cameras = neighbor_cameras[valid_alignment]
-            cond_pts3d = cond_pts3d[valid_alignment]
-            cond_rgbs = cond_rgbs[valid_alignment]
+            rgbs = rgbs[valid_alignment]
+            conf = conf[valid_alignment]
 
             if self.out_feature_dim > 0:
-                cond_features = cond_features[valid_alignment]
+                neighbor_features = neighbor_features[valid_alignment]
 
             target_cameras = target_cameras[valid_alignment]
             w2cs = w2cs[valid_alignment]
@@ -387,14 +376,12 @@ class Dust3rField(nn.Module):
                 bg_colors = bg_colors[valid_alignment]
 
         # scales = (depth * pixel_areas.view(depth.shape))
-        xyz = cond_pts3d.view(len(target_cameras), -1, 3)
-        try:
-            rgbs = cond_rgbs.permute(0, 1, 3, 4, 2).view(len(target_cameras), -1, 3)
-        except:
-            import pdb; pdb.set_trace()
+        xyz = pts3d.reshape(len(target_cameras), -1, 3).float()
+        rgbs = rgbs.permute(0, 1, 3, 4, 2).reshape(len(target_cameras), -1, 3)
+        conf = conf.reshape(len(target_cameras), -1, 1).float()
 
         if self.out_feature_dim > 0:
-            features = cond_features.permute(0, 1, 3, 4, 2)
+            features = neighbor_features.permute(0, 1, 3, 4, 2)
             features = features.view(len(target_cameras), -1, features.shape[-1])
         else:
             features = None
@@ -404,11 +391,8 @@ class Dust3rField(nn.Module):
             VALID_ALIGNMENT: valid_alignment,
         }
 
-        scales = depth / neighbor_cameras.fx.view(-1, 1)
+        scales = depth.flatten(0, 1) / neighbor_cameras_dust3r.fx.view(-1, 1)
         scales = scales.view(len(target_cameras), -1, 1).expand(-1, -1, 3)
-
-        conf = neighbor_fg_masks.view(xyz[..., :1].shape).float() if neighbor_fg_masks is not None \
-            else torch.ones_like(xyz[..., :1])
 
         rendering = self.splat_gaussians(
             target_cameras,
@@ -418,7 +402,7 @@ class Dust3rField(nn.Module):
             w2cs,
             rgbs,
             features if target_cameras_feature is None else None,
-            return_depth,
+            return_target_depth,
             1,
             bg_colors,
         )
@@ -427,22 +411,19 @@ class Dust3rField(nn.Module):
         if ACCUMULATION not in outputs:
             outputs[ACCUMULATION] = rendering[ACCUMULATION]
 
-        if self.intrinsics_from_dust3r and (not cond_pts3d_from_gt):
-            outputs[DEPTH_GT] = pts3d[..., 2]
-        elif dust3r_on_gt:
-            outputs[DEPTH_GT] = scene.depth()[1::2].detach()
+        if cond_pts3d is None:
+            outputs[DEPTH_GT] = all_depth[::(neighbor_cameras_dust3r.shape[1] + 1)].detach()
             if self.training:
                 outputs[DEPTH_GT] = outputs[DEPTH_GT][valid_alignment]
 
-        if return_depth:
+        if return_target_depth:
             outputs[DEPTH] = rendering[DEPTH]
 
         if neighbor_fg_masks is not None:
             with torch.no_grad():
-                conf_acc = torch.ones_like(xyz[..., :1])
                 depth_acc = torch.where(neighbor_fg_masks.view(xyz[..., 0].shape), depth, 1000)
 
-                scales_acc = depth_acc / neighbor_cameras.fx.view(-1, 1)
+                scales_acc = depth_acc.flatten(0, 1) / neighbor_cameras_dust3r.fx.view(-1, 1)
                 scales_acc = scales_acc.view(len(target_cameras), -1, 1).expand(-1, -1, 3)
                 rendering_acc = self.splat_gaussians(
                     target_cameras_feature if target_cameras_feature is not None else target_cameras,
@@ -452,7 +433,7 @@ class Dust3rField(nn.Module):
                     w2cs,
                     None,
                     None,
-                    return_depth,
+                    return_target_depth,
                     1,
                     None,
                 )
@@ -484,9 +465,9 @@ class Dust3rField(nn.Module):
             if neighbor_fg_masks is None:
                 outputs[ACCUMULATION_FEATURES] = rendering[ACCUMULATION]
 
-        if not self.training and not self.intrinsics_from_dust3r:
+        if not self.training:
             neighbor_renderings = self.splat_gaussians(
-                neighbor_cameras.flatten(),
+                neighbor_cameras_dust3r.flatten(),
                 xyz,
                 scales,
                 conf,
@@ -494,7 +475,7 @@ class Dust3rField(nn.Module):
                 rgbs,
                 None,
                 True,
-                neighbor_cameras.shape[1],
+                neighbor_cameras_dust3r.shape[1],
                 bg_colors
             )
 

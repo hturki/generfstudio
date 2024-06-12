@@ -25,7 +25,7 @@ from torch.utils.data import DistributedSampler, DataLoader
 
 from generfstudio.data.dataparsers.objaverse_xl_dataparser import ObjaverseXLDataParserConfig
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, \
-    NEIGHBOR_INDICES, NEIGHBOR_PTS3D, DEPTH, NEIGHBOR_DEPTH, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
+    NEIGHBOR_INDICES, PTS3D, DEPTH, NEIGHBOR_DEPTH, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
 from generfstudio.generfstudio_utils import repeat_interleave
 
 
@@ -39,7 +39,9 @@ class NeighboringViewsDatamanagerConfig(DataManagerConfig):
 
     image_batch_size: int = 4
 
-    neighboring_views_size: int = 3
+    neighboring_views_size: int = 2
+
+    neighboring_views_size_eval: int = 4
 
     rays_per_image: Optional[int] = None
 
@@ -116,6 +118,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             dataparser_outputs=self.train_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
             neighboring_views_size=self.config.neighboring_views_size,
+            return_neighbor_points=True,
         )
 
     def create_eval_dataset(self) -> TDataset:
@@ -123,7 +126,8 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         return self.dataset_type(
             dataparser_outputs=self.eval_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
-            neighboring_views_size=self.config.neighboring_views_size,
+            neighboring_views_size=self.config.neighboring_views_size_eval,
+            return_neighbor_points=False,
         )
 
     @cached_property
@@ -262,9 +266,9 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             self.device)
         del data[NEIGHBOR_INDICES]
 
-        if NEIGHBOR_PTS3D in data:
-            to_return.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].to(self.device)
-            del data[NEIGHBOR_PTS3D]
+        if PTS3D in data:
+            to_return.metadata[PTS3D] = data[PTS3D].to(self.device)
+            del data[PTS3D]
 
             to_return.metadata[NEIGHBOR_DEPTH] = data[NEIGHBOR_DEPTH].to(self.device)
             del data[NEIGHBOR_DEPTH]
@@ -315,9 +319,9 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         camera.metadata[NEIGHBOR_CAMERAS] = self.eval_cameras[data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
         del data[NEIGHBOR_INDICES]
 
-        if NEIGHBOR_PTS3D in data:
-            camera.metadata[NEIGHBOR_PTS3D] = data[NEIGHBOR_PTS3D].unsqueeze(0).to(self.device)
-            del data[NEIGHBOR_PTS3D]
+        if PTS3D in data:
+            camera.metadata[PTS3D] = data[PTS3D].unsqueeze(0).to(self.device)
+            del data[PTS3D]
 
         if DEPTH in data:
             data[DEPTH] = data[DEPTH].to(self.device)

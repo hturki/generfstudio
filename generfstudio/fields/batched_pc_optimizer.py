@@ -182,8 +182,7 @@ class GlobalPointCloudOptimizer(nn.Module):
         # w2 = self.weight_j.clone()
         # w2[self.fj] = 0
 
-        pairs_per_scene = math.factorial(self.poses_per_scene)
-
+        pairs_per_scene = self.poses_per_scene * (self.poses_per_scene - 1)
         num_scenes = num_pairs // pairs_per_scene
         for scene_index in range(num_scenes):
             scene_A = []

@@ -9,7 +9,7 @@ from PIL import Image
 from dust3r.cloud_opt.commons import cosine_schedule
 from dust3r.model import AsymmetricCroCo3DStereo
 from dust3r.utils.geometry import geotrf
-from gsplat import projection, isect_tiles, isect_offset_encode, rasterize_to_pixels
+from gsplat import fully_fused_projection, isect_tiles, isect_offset_encode, rasterize_to_pixels
 # from gsplat.experimental.cuda import quat_scale_to_covar_perci, projection, isect_tiles, isect_offset_encode, \
 #     rasterize_to_pixels
 from pytorch_msssim import SSIM
@@ -116,7 +116,6 @@ class GaussianOptimizer(nn.Module):
         A = torch.cat(A)
         B = torch.cat(B)
 
-
         est = sklearn.linear_model.LinearRegression(positive=True)
         regressor = sklearn.linear_model.RANSACRegressor(estimator=est, random_state=42)
 
@@ -125,7 +124,6 @@ class GaussianOptimizer(nn.Module):
         lol = scipy.sparse.linalg.lsmr(A.cpu().to_dense().numpy(), B.squeeze().cpu().numpy())
 
         regressor.fit(A.cpu().to_dense().numpy(), B.squeeze().cpu().numpy(), torch.cat(weights).squeeze().cpu().numpy())
-
 
         solution = torch.linalg.lstsq(A.to_dense(), B)
 
@@ -284,9 +282,10 @@ class GaussianOptimizer(nn.Module):
             Tuple[
                 torch.Tensor, torch.Tensor]:
         w2cs_chunk = self.w2cs[view_indices]
-        radii, means2d, depths, conics, compensations = projection(xyz, None, self.quats, scales.expand(-1, 3),
-                                                                   w2cs_chunk, self.K[view_indices], 224, 224,
-                                                                   packed=False)
+        radii, means2d, depths, conics, compensations = fully_fused_projection(xyz, None, self.quats,
+                                                                               scales.expand(-1, 3),
+                                                                               w2cs_chunk, self.K[view_indices], 224,
+                                                                               224, packed=False)
 
         tiles_per_gauss, isect_ids, gauss_ids = isect_tiles(
             means2d, radii, depths, self.tile_size, self.tile_dim, self.tile_dim, packed=False

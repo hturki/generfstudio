@@ -227,7 +227,7 @@ rgbd_diffusion_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=1,
+                neighboring_views_size=2,
                 image_batch_size=64,
                 dataparser=DL3DVDataParserConfig(),
             ),
@@ -265,7 +265,7 @@ rgbd_diffusion_ddp_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=1,
+                neighboring_views_size=2,
                 image_batch_size=256,
                 dataparser=DL3DVDataParserConfig(),
             ),
@@ -304,7 +304,7 @@ rgbd_diffusion_union_method = MethodSpecification(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=1,
+                    neighboring_views_size=2,
                     image_batch_size=64,
                 ),
             ),
@@ -343,7 +343,7 @@ rgbd_diffusion_union_ddp_method = MethodSpecification(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=1,
+                    neighboring_views_size=2,
                     image_batch_size=256,
                 ),
             ),

@@ -22,7 +22,7 @@ ACCUMULATION_FEATURES = "accumulation_features"
 ALIGNMENT_LOSS = "alignment_loss"
 VALID_ALIGNMENT = "valid_alignment"
 NEIGHBOR_RESULTS = "neighbor_results"
-NEIGHBOR_PTS3D = "neighbor_pts3d"
+PTS3D = "pts3d"
 NEIGHBOR_DEPTH = "neighbor_depth"
 DEPTH_GT = "depth_gt"
 

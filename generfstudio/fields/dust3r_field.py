@@ -13,9 +13,6 @@ class Dust3rField(nn.Module):
     def __init__(
             self,
             model_name: str,
-            in_feature_dim: int = 512,
-            out_feature_dim: int = 128,
-            noisy_cond_views: int = 0,
             depth_precomputed: bool = False,
     ) -> None:
         super().__init__()
@@ -27,13 +24,6 @@ class Dust3rField(nn.Module):
         else:
             self.model = None
 
-        self.out_feature_dim = out_feature_dim
-        if out_feature_dim > 0 and in_feature_dim != out_feature_dim:
-            self.feature_layer = nn.Linear(in_feature_dim, out_feature_dim)
-        else:
-            self.feature_layer = None
-
-        self.noisy_cond_views = noisy_cond_views
 
     # Intrinsics should be passed for image size inferred by rgb
     @profiler.time_function

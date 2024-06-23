@@ -72,7 +72,7 @@ DATAPARSERS_NO_OXL = [
     R10KDataParserConfig(data=Path("data/r10k")),
     # ObjaverseXLDataParserConfig(),
     MVImgNetDataParserConfig(),
-    R10KDataParserConfig(),
+    # R10KDataParserConfig(),
 ]
 
 DATAPARSERS = [
@@ -80,7 +80,7 @@ DATAPARSERS = [
     CO3DDataParserConfig(),
     R10KDataParserConfig(data=Path("data/r10k")),
     ObjaverseXLDataParserConfig(),
-    R10KDataParserConfig(),
+    # R10KDataParserConfig(),
     MVImgNetDataParserConfig(),
 ]
 

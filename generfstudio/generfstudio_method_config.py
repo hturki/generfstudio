@@ -26,6 +26,7 @@ from generfstudio.data.datasets.neighboring_views_dataset import NeighboringView
 from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
 from generfstudio.models.pixelnerf import PixelNeRFModelConfig
 from generfstudio.models.rgbd_diffusion import RGBDDiffusionConfig
+from generfstudio.models.rgbd_diffusion_if import RGBDDiffusionIFConfig
 from generfstudio.models.splatfacto_sds import SplatfactoSDSModelConfig
 from generfstudio.zero_redundancy_optimizer_config import ZeroRedundancyOptimizerConfig
 
@@ -213,7 +214,7 @@ pixelnerf_method = MethodSpecification(
 rgbd_diffusion_method = MethodSpecification(
     config=TrainerConfig(
         method_name="rgbd-diffusion",
-        steps_per_eval_image=1,
+        steps_per_eval_image=1000,
         steps_per_eval_batch=0,
         steps_per_save=1000,
         steps_per_eval_all_images=1000000,
@@ -289,7 +290,7 @@ rgbd_diffusion_ddp_method = MethodSpecification(
 rgbd_diffusion_union_method = MethodSpecification(
     config=TrainerConfig(
         method_name="rgbd-diffusion-union",
-        steps_per_eval_image=1000,
+        steps_per_eval_image=1,
         steps_per_eval_batch=0,
         steps_per_save=1000,
         steps_per_eval_all_images=1000000,
@@ -348,6 +349,83 @@ rgbd_diffusion_union_ddp_method = MethodSpecification(
                 ),
             ),
             model=RGBDDiffusionConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_if_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-if",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 16,
+            "fields": 16
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=NeighboringViewsDatamanagerConfig(
+                _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                neighboring_views_size=2,
+                image_batch_size=16,
+                dataparser=DL3DVDataParserConfig(),
+            ),
+            model=RGBDDiffusionIFConfig(),
+        ),
+        optimizers={
+            "cond_encoder": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_if_union_ddp_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-if-union-ddp",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "cond_encoder": 4,
+            "fields": 4
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=UnionDatamanagerConfig(
+                inner=NeighboringViewsDatamanagerConfig(
+                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                    neighboring_views_size=2,
+                    image_batch_size=64,
+                ),
+            ),
+            model=RGBDDiffusionIFConfig(),
         ),
         optimizers={
             "cond_encoder": {

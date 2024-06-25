@@ -282,7 +282,7 @@ class RGBDDiffusion(Model):
     def splat_gaussians(w2cs: torch.Tensor, fx: torch.Tensor, fy: torch.Tensor, cx: torch.Tensor,
                         cy: torch.Tensor, xyz: torch.Tensor, scales: torch.Tensor, opacity: torch.Tensor,
                         rgbs: Optional[torch.Tensor], camera_dim: int, return_depth: bool, cameras_per_scene: int,
-                        bg_colors: Optional[torch.Tensor]):
+                        bg_colors: Optional[torch.Tensor], calc_compensations: bool = False):
         quats = torch.cat([torch.ones_like(xyz[..., :1]), torch.zeros_like(xyz)], -1)
 
         zeros = torch.zeros_like(fx)
@@ -295,7 +295,8 @@ class RGBDDiffusion(Model):
         ], 1)
 
         radii, means2d, depths, conics, compensations = fully_fused_projection(
-            xyz, None, quats, scales, w2cs, K, camera_dim, camera_dim, cameras_per_scene=cameras_per_scene)
+            xyz, None, quats, scales, w2cs, K, camera_dim, camera_dim, cameras_per_scene=cameras_per_scene,
+            calc_compensations=calc_compensations)
 
         tile_size = 16
         tile_width = math.ceil(camera_dim / tile_size)
@@ -330,6 +331,9 @@ class RGBDDiffusion(Model):
         if cameras_per_scene > 1:
             opacity = opacity.expand(cameras_per_scene, -1)
 
+        if compensations is not None:
+            opacity = opacity * compensations
+
         splat_results, alpha = rasterize_to_pixels(
             means2d,
             conics,
@@ -349,7 +353,7 @@ class RGBDDiffusion(Model):
             outputs[RGB] = splat_results[..., :3]
 
         if return_depth:
-            outputs[DEPTH] = splat_results[..., -1:]
+            outputs[DEPTH] = (splat_results[..., -1:] / alpha.clamp_min(1e-8))
 
         return outputs
 

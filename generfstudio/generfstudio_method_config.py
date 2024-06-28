@@ -389,10 +389,10 @@ rgbd_diffusion_if_method = MethodSpecification(
             model=RGBDDiffusionIFConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
+            # "cond_encoder": {
+            #     "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+            #     "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            # },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -428,10 +428,10 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
             model=RGBDDiffusionIFConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
+            # "cond_encoder": {
+            #     "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
+            #     "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            # },
             "fields": {
                 "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),

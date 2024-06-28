@@ -53,14 +53,20 @@ class RGBDDiffusionIFConfig(ModelConfig):
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
     noisy_cond_views: int = 0
-    noisy_eval_only: bool = False
+    calc_compensations: bool = False
+    independent_noise: bool = False
+    noise_after_reproj: bool = False
+
+    opacity_multiplier: float = 50
     image_crossattn: Literal["clip-expand", "clip-replace", "unet-replace"] = "clip-expand"
     depth_mapping: Literal["simple", "disparity", "log"] = "log"
+    center_depth: bool = False
 
     scale_with_pixel_area: bool = True
 
     guidance_scale: float = 2.0
     image_dim: int = 64
+    image_dim_project: Optional[int] = None
 
     use_ema: bool = True
     allow_tf32: bool = False
@@ -83,7 +89,6 @@ class RGBDDiffusionIF(Model):
         """Set the fields and modules."""
         super().populate_modules()
         self.collider = None
-        assert self.config.cond_feature_out_dim == 0, self.config.cond_feature_out_dim
 
         if self.config.image_crossattn == "clip-expand":
             image_encoder_base = CLIPVisionModelWithProjection.from_pretrained(
@@ -181,36 +186,17 @@ class RGBDDiffusionIF(Model):
         # Need to explicitly set this for DDIMScheduler for some reason
         ddim_scheduler.config["variance_type"] = "fixed_small"
         self.ddim_scheduler = DDIMScheduler.from_config(ddim_scheduler.config)
+        CONSOLE.log(f"DDIM Scheduler: {self.ddim_scheduler.config}")
 
-        assert self.config.noisy_cond_views >= 0, self.config.noisy_cond_views
-        if self.config.noisy_cond_views > 0:
-            assert not self.config.rgb_only
-        if self.config.cond_feature_out_dim > 0:
-            assert self.config.noisy_cond_views == 0, self.config.noisy_cond_views
-            if self.config.cond_image_encoder_type == "resnet":
-                self.cond_image_encoder = SpatialEncoder()
-                encoder_dim = self.cond_image_encoder.latent_size
-                # self.cond_image_encoder = torch.compile(self.cond_image_encoder)
-            elif self.config.cond_image_encoder_type == "unet":
-                assert not self.config.freeze_cond_image_encoder
-                encoder_dim = 128
-                # self.cond_image_encoder = torch.compile(UNet(in_channels=3, n_classes=encoder_dim))
-            elif self.config.cond_image_encoder_type == "dino":
-                assert not self.config.freeze_cond_image_encoder
-                self.cond_image_encoder = DinoV2Encoder(out_feature_dim=self.config.cond_feature_out_dim)
-                encoder_dim = self.config.cond_feature_out_dim
-            else:
-                raise Exception(self.config.cond_image_encoder_type)
-
-        self.cond_feature_field = Dust3rField(model_name=self.config.dust3r_model_name,
-                                              depth_precomputed=self.depth_available)
+        self.dust3r_field = Dust3rField(model_name=self.config.dust3r_model_name,
+                                        depth_precomputed=self.depth_available)
 
         # metrics
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
-        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
-        self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
-        for p in self.lpips.parameters():
-            p.requires_grad_(False)
+        # self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        # self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
+        # self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
+        # for p in self.lpips.parameters():
+        #     p.requires_grad_(False)
 
         if self.config.noisy_cond_views > 0:
             pixels_im = torch.stack(
@@ -223,16 +209,11 @@ class RGBDDiffusionIF(Model):
         if get_world_size() > 1:
             CONSOLE.log("Using sync batchnorm for DDP")
             self.unet = nn.SyncBatchNorm.convert_sync_batchnorm(self.unet)
-            self.cond_feature_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_feature_field)
-            if self.config.cond_feature_out_dim > 0 and (not self.config.freeze_cond_image_encoder):
-                self.cond_image_encoder = nn.SyncBatchNorm.convert_sync_batchnorm(self.cond_image_encoder)
+            self.dust3r_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.dust3r_field)
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        param_groups["cond_encoder"] = list(self.cond_feature_field.parameters())
-
-        if self.config.cond_feature_out_dim > 0 and (not self.config.freeze_cond_image_encoder):
-            param_groups["cond_encoder"] += list(self.cond_image_encoder.parameters())
+        # param_groups["cond_encoder"] = list(self.dust3r_field.parameters())
 
         param_groups["fields"] = list(self.unet.parameters())
         if self.config.image_crossattn != "unet-replace":
@@ -266,10 +247,17 @@ class RGBDDiffusionIF(Model):
         else:
             raise Exception(self.config.depth_mapping)
 
-        return encoded_0_1 * 2 - 1
+        if self.config.center_depth:
+            return encoded_0_1 * 2 - 1
+        else:
+            return encoded_0_1
 
     def decode_depth(self, to_decode_m1_1: torch.Tensor) -> torch.Tensor:
-        to_decode = (to_decode_m1_1 + 1) / 2
+        if self.config.center_depth:
+            to_decode = (to_decode_m1_1 + 1) / 2
+        else:
+            to_decode = to_decode_m1_1
+
         if self.config.depth_mapping == "simple":
             scaled = to_decode.clamp_min(0)
         elif self.config.depth_mapping == "disparity":
@@ -285,22 +273,28 @@ class RGBDDiffusionIF(Model):
     @torch.inference_mode()
     def get_concat(self, w2cs: torch.Tensor, cameras: Cameras, pts3d: torch.Tensor, scales: torch.Tensor,
                    opacity: torch.Tensor, rgbs: torch.Tensor, cameras_per_scene: int, bg_colors: Optional[torch.Tensor],
-                   depth_scale_factor: torch.Tensor, calc_compensations: bool = False):
+                   depth_scale_factor: torch.Tensor, calc_compensations: bool = False, normalize_rgb: bool = False,
+                   opacity_multiplier: float = 1):
         camera_dim = cameras.width[0, 0].item()
         fx = cameras.fx.view(w2cs.shape[0], 1)
         fy = cameras.fy.view(w2cs.shape[0], 1)
         cx = cameras.cx.view(w2cs.shape[0], 1)
         cy = cameras.cy.view(w2cs.shape[0], 1)
 
-        if camera_dim != self.config.image_dim:
-            scale_factor = self.config.image_dim / camera_dim
-            camera_dim = self.config.image_dim
+        image_dim = self.config.image_dim_project if self.config.image_dim_project is not None else self.config.image_dim
+        if camera_dim != image_dim:
+            scale_factor = image_dim / camera_dim
+            camera_dim = image_dim
             fx = fx * scale_factor
             fy = fy * scale_factor
             cx = cx * scale_factor
             cy = cy * scale_factor
 
         S = w2cs.shape[0] // cameras_per_scene
+        opacity = opacity.view(S, -1).float() * opacity_multiplier
+        # if calc_compensations:
+        #     opacity = opacity * 20  # Hack, otherwise opacity seems to be too small
+
         rendering = RGBDDiffusion.splat_gaussians(
             w2cs,
             fx,
@@ -309,14 +303,20 @@ class RGBDDiffusionIF(Model):
             cy,
             pts3d.view(S, -1, 3).float(),
             scales.view(S, -1, 1).expand(-1, -1, 3),
-            opacity.view(S, -1).float(),
+            opacity,
             rgbs.permute(0, 1, 3, 4, 2).reshape(S, -1, 3),
             camera_dim,
             not self.config.rgb_only,
             cameras_per_scene,
             bg_colors,
-            calc_compensations
+            calc_compensations=calc_compensations,
+            normalize_rgb=normalize_rgb,
         )
+
+        if self.config.image_dim_project is not None:
+            for key in rendering:
+                rendering[key] = F.interpolate(rendering[key].permute(0, 3, 1, 2), self.config.image_dim,
+                                               mode="bicubic", antialias=True).permute(0, 2, 3, 1)
 
         rendered_rgb = rendering[RGB].permute(0, 3, 1, 2)
         rendered_accumulation = rendering[ACCUMULATION].permute(0, 3, 1, 2)
@@ -334,8 +334,8 @@ class RGBDDiffusionIF(Model):
     def project_encoded_rgbd(self, encoded: torch.Tensor, render_cameras: Cameras, c2ws: torch.Tensor,
                              w2cs: torch.Tensor, depth_fx: torch.Tensor, depth_fy: torch.Tensor, depth_cx: torch.Tensor,
                              depth_cy: torch.Tensor, bg_colors: Optional[torch.Tensor],
-                             fg_masks: Optional[torch.Tensor],
-                             scale_mult: torch.Tensor, depth_scale_factor: torch.Tensor):
+                             fg_masks: Optional[torch.Tensor], scale_mult: torch.Tensor,
+                             depth_scale_factor: torch.Tensor):
         rgb = (encoded[:, :, :3] + 1) / 2
         depth = self.decode_depth(encoded[:, :, 3:]) * depth_scale_factor.unsqueeze(1)
         pts3d_cam = fast_depthmap_to_pts3d(
@@ -361,7 +361,10 @@ class RGBDDiffusionIF(Model):
             rgb,
             1,
             bg_colors,
-            depth_scale_factor
+            depth_scale_factor,
+            self.config.calc_compensations,
+            True,
+            self.config.opacity_multiplier,
         )
 
     def get_pixel_area_scale_mult(self, cameras: Cameras, camera_dim: int):
@@ -381,8 +384,6 @@ class RGBDDiffusionIF(Model):
         bg_colors = cameras.metadata.get(BG_COLOR, None)
 
         noisy_cond_views = self.config.noisy_cond_views
-        if self.training and self.config.noisy_eval_only:
-            noisy_cond_views = 0
 
         if noisy_cond_views > 0:
             neighbor_images = cameras.metadata[NEIGHBOR_IMAGES]
@@ -460,7 +461,7 @@ class RGBDDiffusionIF(Model):
             cx = torch.cat([cameras.cx.unsqueeze(1), neighbor_cameras.cx], 1) * dust3r_scale_factor
             cy = torch.cat([cameras.cy.unsqueeze(1), neighbor_cameras.cy], 1) * dust3r_scale_factor
 
-            all_pts3d, all_depth, alignment_loss, valid_alignment = self.cond_feature_field.get_pts3d_and_depth(
+            all_pts3d, all_depth, alignment_loss, valid_alignment = self.dust3r_field.get_pts3d_and_depth(
                 rgbs, fg_masks, c2ws_opencv, fx, fy, cx, cy)
 
             camera_depth = all_depth.view(rgbs.shape[0], -1, *all_depth.shape[1:])[:, 0].view(
@@ -505,12 +506,12 @@ class RGBDDiffusionIF(Model):
             outputs[ALIGNMENT_LOSS] = alignment_loss
             outputs[VALID_ALIGNMENT] = valid_alignment.to(rgbs.dtype).mean()
 
+        # Get CLIP embeddings for cross attention
         if self.config.image_crossattn != "unet-replace":
             c_crossattn = self.image_encoder(self.image_encoder_normalize(clip_rgbs.flatten(0, 1))).image_embeds
             c_crossattn = c_crossattn.view(-1, clip_rgbs.shape[1], c_crossattn.shape[-1])
         else:
             with torch.inference_mode():
-                # Get CLIP embeddings for cross attention
                 c_crossattn = self.image_encoder(self.image_encoder_normalize(clip_rgbs.flatten(0, 1))).image_embeds
                 c_crossattn = c_crossattn.view(-1, clip_rgbs.shape[1], c_crossattn.shape[-1])
 
@@ -518,7 +519,7 @@ class RGBDDiffusionIF(Model):
             .view(cameras.shape[0], -1).mean(dim=-1).view(-1, 1, 1, 1)
 
         if self.training:
-            timesteps = torch.randint(0, self.ddpm_scheduler.config.num_train_timesteps, (cond_rgbs.shape[0],),
+            timesteps = torch.randint(0, self.ddpm_scheduler.config.num_train_timesteps, (cameras.shape[0],),
                                       device=self.device, dtype=torch.long)
             outputs["timesteps"] = timesteps
 
@@ -527,7 +528,7 @@ class RGBDDiffusionIF(Model):
             image_gt = image_gt.permute(0, 3, 1, 2)
             if image_gt.shape[-1] != self.config.image_dim:
                 with torch.inference_mode():
-                    image_gt = F.interpolate(image_gt, self.config.image_dim, mode="bicubic")
+                    image_gt = F.interpolate(image_gt, self.config.image_dim, mode="bicubic", antialias=True)
 
             if self.config.rgb_only:
                 input_gt = image_gt * 2 - 1
@@ -535,19 +536,20 @@ class RGBDDiffusionIF(Model):
                 depth_gt = camera_depth.unsqueeze(1)
                 if depth_gt.shape[-1] != self.config.image_dim:
                     with torch.inference_mode():
-                        depth_gt = F.interpolate(depth_gt, self.config.image_dim, mode="bicubic")
+                        depth_gt = F.interpolate(depth_gt, self.config.image_dim, mode="bicubic", antialias=True)
 
                 input_gt = torch.cat([image_gt * 2 - 1, self.encode_depth(depth_gt / depth_scale_factor)], 1)
 
             noise = torch.randn_like(input_gt)
             noisy_input_gt = self.ddpm_scheduler.add_noise(input_gt, noise, timesteps)
-            # noise_orig = noise
-            # noisy_input_gt_old = noisy_input_gt
-            # alpha_prod_t = self.ddpm_scheduler.alphas_cumprod.to(self.device)[timesteps]
-            # beta_prod_t = 1 - alpha_prod_t
-            # noise_old = (noisy_input_gt - input_gt * alpha_prod_t.view(-1, 1, 1, 1) ** 0.5) / (
-            #         beta_prod_t.view(-1, 1, 1, 1) ** 0.5)
-            # input_gt_old = input_gt
+            # if self.config.image_dim_project is not None:
+            #     noise_orig = noise
+            #     noisy_input_gt_old = noisy_input_gt
+            #     alpha_prod_t = self.ddpm_scheduler.alphas_cumprod.to(self.device)[timesteps]
+            #     beta_prod_t = 1 - alpha_prod_t
+            #     noise_old = (noisy_input_gt - input_gt * alpha_prod_t.view(-1, 1, 1, 1) ** 0.5) / (
+            #             beta_prod_t.view(-1, 1, 1, 1) ** 0.5)
+            #     input_gt_old = input_gt
 
             if noisy_cond_views > 0:
                 noisy_scale_factor = self.config.image_dim / cameras.width[0, 0].item()
@@ -566,41 +568,52 @@ class RGBDDiffusionIF(Model):
                     noisy_scale_mult = self.get_pixel_area_scale_mult(neighbor_cameras[:, :noisy_cond_views].flatten(),
                                                                       self.config.image_dim).flatten(-2, -1).unsqueeze(
                         1)
+                    noise_scale_mult = torch.cat([camera_scale_mult, noisy_scale_mult], 1)
                 else:
-                    camera_scale_mult = 1 / depth_fx[:, :1]
-                    noisy_scale_mult = 1 / depth_fx[:, 1:]
-
-                input_gt, _ = self.project_encoded_rgbd(
-                    input_gt.unsqueeze(1), cameras, c2ws_for_noisy[:, 0], camera_w2cs_opencv, depth_fx[:, 0],
-                    depth_fy[:, 0], depth_cx[:, 0], depth_cy[:, 0], bg_colors, fg_masks, camera_scale_mult,
-                    depth_scale_factor)
-                input_gt = input_gt[:, :-1]
+                    noise_scale_mult = 1 / depth_fx
 
                 depth_to_noise = neighbor_depth[:, :noisy_cond_views].flatten(0, 1).unsqueeze(1)
                 if depth_to_noise.shape[-1] != self.config.image_dim:
                     with torch.inference_mode():
-                        depth_to_noise = F.interpolate(depth_to_noise, self.config.image_dim, mode="bicubic")
+                        depth_to_noise = F.interpolate(depth_to_noise, self.config.image_dim, mode="bicubic",
+                                                       antialias=True)
 
                 rgb_to_noise = neighbor_images[:, :noisy_cond_views].permute(0, 1, 4, 2, 3).flatten(0, 1)
                 if rgb_to_noise.shape[-1] != self.config.image_dim:
                     with torch.inference_mode():
-                        rgb_to_noise = F.interpolate(rgb_to_noise, self.config.image_dim, mode="bicubic")
+                        rgb_to_noise = F.interpolate(rgb_to_noise, self.config.image_dim, mode="bicubic",
+                                                     antialias=True)
 
                 rgbd_to_noise = torch.cat([rgb_to_noise * 2 - 1,
                                            self.encode_depth(depth_to_noise / depth_scale_factor)], 1)
-                noisy_rgbd = self.ddpm_scheduler.add_noise(
-                    rgbd_to_noise, noise.repeat_interleave(noisy_cond_views, dim=0),
-                    timesteps.repeat_interleave(noisy_cond_views))
+
+                noise_masks = torch.cat([fg_masks.unsqueeze(1), neighbor_fg_masks], 1) if fg_masks is not None else None
+
+                input_gt, _ = self.project_encoded_rgbd(
+                    torch.cat([input_gt.unsqueeze(1),
+                               rgbd_to_noise.view(cameras.shape[0], noisy_cond_views, *rgbd_to_noise.shape[1:])], 1),
+                    cameras, c2ws_for_noisy, camera_w2cs_opencv, depth_fx.view(-1, 1), depth_fy.view(-1, 1),
+                    depth_cx.view(-1, 1), depth_cy.view(-1, 1), bg_colors, noise_masks, noise_scale_mult,
+                    depth_scale_factor)
+                input_gt = input_gt[:, :-1]
+
+                if self.config.noise_after_reproj:
+                    noisy_input_gt = self.ddpm_scheduler.add_noise(input_gt, noise, timesteps)
+
+                if self.config.independent_noise:
+                    noise_to_add = torch.randn_like(rgbd_to_noise)
+                else:
+                    noise_to_add = noise.repeat_interleave(noisy_cond_views, dim=0)
+
+                noisy_rgbd = self.ddpm_scheduler.add_noise(rgbd_to_noise, noise_to_add,
+                                                           timesteps.repeat_interleave(noisy_cond_views))
 
                 noisy_input_gt, _ = self.project_encoded_rgbd(
                     torch.cat([noisy_input_gt.unsqueeze(1),
                                noisy_rgbd.view(cameras.shape[0], noisy_cond_views, *noisy_rgbd.shape[1:])], 1), cameras,
                     c2ws_for_noisy, camera_w2cs_opencv, depth_fx.view(-1, 1), depth_fy.view(-1, 1),
-                    depth_cx.view(-1, 1), depth_cy.view(-1, 1), bg_colors,
-                    torch.cat([fg_masks.unsqueeze(1), neighbor_fg_masks], 1) if fg_masks is not None else None,
-                    torch.cat([camera_scale_mult, noisy_scale_mult], 1),
+                    depth_cx.view(-1, 1), depth_cy.view(-1, 1), bg_colors, noise_masks, noise_scale_mult,
                     depth_scale_factor)
-
                 noisy_input_gt = noisy_input_gt[:, :-1]
 
                 alpha_prod_t = self.ddpm_scheduler.alphas_cumprod.to(self.device)[timesteps]
@@ -608,10 +621,14 @@ class RGBDDiffusionIF(Model):
                 noise = (noisy_input_gt - input_gt * alpha_prod_t.view(-1, 1, 1, 1) ** 0.5) / (
                         beta_prod_t.view(-1, 1, 1, 1) ** 0.5)
 
-                # lol = (torch.cat([input_gt_old, input_gt, noisy_input_gt_old, noisy_input_gt], -1).permute(0, 2, 3, 1).flatten(0, 1)[..., :3] + 1) / 2
-                # Image.fromarray((lol * 255).byte().cpu().numpy()).save('/scratch/hturki/nt.png')
-                # lol2 = (torch.cat([c_concat, c_concat_old], -1).permute(0, 2, 3, 1).flatten(0, 1)[..., :3] + 1) / 2
-                # Image.fromarray((lol2 * 255).byte().cpu().numpy()).save('/scratch/hturki/nt2.png')
+                # if self.config.image_dim_project is not None:
+                #     lol = (torch.cat([input_gt_old, input_gt, noisy_input_gt_old, noisy_input_gt], -1).permute(0, 2, 3,  1).flatten( 0, 1)[..., :3] + 1) / 2
+                #     from PIL import Image
+                #     Image.fromarray((lol * 255).byte().cpu().numpy()).save('/scratch/hturki/nt.png')
+                #     import pdb;
+                #     pdb.set_trace()
+                #     lol2 = (noisy_rgbd.permute(0, 2, 3, 1).flatten(0, 1)[..., :3] + 1) / 2
+                #     Image.fromarray((lol2 * 255).byte().cpu().numpy()).save('/scratch/hturki/nt2.png')
 
                 pts3d = pts3d[:, noisy_cond_views:]
                 neighbor_depth = neighbor_depth[:, noisy_cond_views:]
@@ -655,7 +672,7 @@ class RGBDDiffusionIF(Model):
             elif self.ddpm_scheduler.config.prediction_type == "sample":
                 outputs["target"] = input_gt
             elif self.ddpm_scheduler.config.prediction_type == "v_prediction":
-                outputs["target"] = self.ddpm_scheduler.get_velocity(noisy_input_gt, noise, timesteps)
+                outputs["target"] = self.ddpm_scheduler.get_velocity(input_gt, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {self.ddpm_scheduler.config.prediction_type}")
 
@@ -694,7 +711,8 @@ class RGBDDiffusionIF(Model):
                 cond_rgbs,
                 neighbor_cameras.shape[1],
                 bg_colors,
-                depth_scale_factor
+                depth_scale_factor,
+                normalize_rgb=False,
             )
 
             concat_rgb = [torch.cat([*rendering[RGB]], 1)]
@@ -740,6 +758,11 @@ class RGBDDiffusionIF(Model):
                 self.ema_unet.store(self.unet.parameters())
                 self.ema_unet.copy_to(self.unet.parameters())
             try:
+                decoded = inference_rgbd.permute(0, 2, 3, 1)
+                samples_rgb.append(((torch.cat([*decoded[..., :3]], 1) + 1) / 2).clamp(0, 1))
+                decoded_depth = self.decode_depth(decoded[..., 3:]) * depth_scale_factor
+                samples_depth.append(torch.cat([*decoded_depth], 1))
+                # for t_index, t in enumerate(self.ddpm_scheduler.timesteps):
                 for t_index, t in enumerate(self.ddim_scheduler.timesteps):
                     if noisy_cond_views > 0:
                         decoded_depth = self.decode_depth(inference_rgbd[:, 3:]) * depth_scale_factor
@@ -764,17 +787,23 @@ class RGBDDiffusionIF(Model):
                             (inference_rgbd[:, :3].unsqueeze(0) + 1) / 2,
                             neighbor_cameras.shape[1],
                             bg_colors,
-                            depth_scale_factor
+                            depth_scale_factor,
+                            calc_compensations=False,
+                            normalize_rgb=True,
+                            opacity_multiplier=self.config.opacity_multiplier,
                         )
                         inference_rgbd = inference_rgbd[:, :-1]
 
-                        if t_index > self.config.ddim_steps - 10 and t_index % 2 == 0:
+                        # if t_index % 20 == 0:
+                        if t_index == 0 or (t_index > self.config.ddim_steps - 10 and t_index % 2 == 0):
                             concat_rgb.append(torch.cat([*rendering[RGB].clamp(0, 1)], 1))
                             concat_depth.append(torch.cat([*rendering[DEPTH]], 1))
                             concat_acc.append(torch.cat([*rendering[ACCUMULATION]], 1))
 
                     rgbd_input = torch.cat([inference_rgbd] * 2) \
                         if self.config.guidance_scale > 1 else inference_rgbd
+
+                    # rgbd_input = self.ddpm_scheduler.scale_model_input(rgbd_input, t)
                     rgbd_input = self.ddim_scheduler.scale_model_input(rgbd_input, t)
                     rgbd_input = torch.cat([rgbd_input, c_concat], dim=1)
                     noise_pred = self.unet(rgbd_input, t, c_crossattn_inference, return_dict=False)[0]
@@ -784,8 +813,10 @@ class RGBDDiffusionIF(Model):
                         noise_pred = noise_pred_uncond + self.config.guidance_scale * \
                                      (noise_pred_cond - noise_pred_uncond)
 
+                    # inference_rgbd = self.ddpm_scheduler.step(noise_pred, t, inference_rgbd, return_dict=False)[0]
                     inference_rgbd = self.ddim_scheduler.step(noise_pred, t, inference_rgbd, return_dict=False)[0]
-                    if t_index > self.config.ddim_steps - 10 and t_index % 2 == 0:
+                    # if t_index % 20 == 0:
+                    if t_index == 0 or (t_index > self.config.ddim_steps - 10 and t_index % 2 == 0):
                         decoded = inference_rgbd.permute(0, 2, 3, 1)
                         samples_rgb.append(((torch.cat([*decoded[..., :3]], 1) + 1) / 2).clamp(0, 1))
                         decoded_depth = self.decode_depth(decoded[..., 3:]) * depth_scale_factor
@@ -842,15 +873,16 @@ class RGBDDiffusionIF(Model):
         cond_rgb_gt = batch["image"].to(outputs[RGB].device)
         cond_depth_gt = outputs[DEPTH_GT]
         if cond_depth_gt.shape[0] != cond_rgb_gt.shape[1]:
-            cond_depth_gt = F.interpolate(cond_depth_gt.squeeze(-1).unsqueeze(0).unsqueeze(0),
-                                          cond_rgb_gt.shape[:2], mode="bicubic").view(*cond_rgb_gt.shape[:2], 1)
+            cond_depth_gt = F.interpolate(
+                cond_depth_gt.squeeze(-1).unsqueeze(0).unsqueeze(0),
+                cond_rgb_gt.shape[:2], mode="bicubic", antialias=True).view(*cond_rgb_gt.shape[:2], 1)
         cond_depth_gt = colormaps.apply_depth_colormap(cond_depth_gt)
         cond_gt = torch.cat([cond_rgb_gt, cond_depth_gt], 1)
 
         neighbor_images = batch[NEIGHBOR_IMAGES].squeeze(0)
         if neighbor_images.shape[-2] != self.config.image_dim:
             neighbor_images = F.interpolate(neighbor_images.permute(0, 3, 1, 2), self.config.image_dim,
-                                            mode="bicubic").permute(0, 2, 3, 1)
+                                            mode="bicubic", antialias=True).permute(0, 2, 3, 1)
         image_gt = torch.cat([*neighbor_images.to(outputs[RGB].device)], 1)
         cond_rgb = torch.cat([outputs[RGB], image_gt])
         samples_rgb = torch.cat([outputs["samples_rgb"], image_gt])
@@ -865,7 +897,7 @@ class RGBDDiffusionIF(Model):
             depth_gt = outputs[NEIGHBOR_DEPTH]
             if depth_gt.shape[1] != self.config.image_dim:
                 depth_gt = F.interpolate(depth_gt.squeeze(-1).unsqueeze(0),
-                                         self.config.image_dim, mode="bicubic").squeeze(0).unsqueeze(-1)
+                                         self.config.image_dim, mode="bicubic", antialias=True).squeeze(0).unsqueeze(-1)
             depth_gt = torch.cat([*depth_gt], 1)
             near_plane = depth_gt.min()
             far_plane = depth_gt.max()

@@ -15,19 +15,14 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, profiler
 from nerfstudio.utils.comms import get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
-from pytorch_msssim import SSIM
 from torch import nn
 from torch.nn import Parameter
 from torch_scatter import scatter_min
-from torchmetrics import PeakSignalNoiseRatio
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchvision.transforms import transforms
 from transformers import CLIPVisionModelWithProjection
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
-from generfstudio.fields.dino_v2_encoder import DinoV2Encoder
 from generfstudio.fields.dust3r_field import Dust3rField
-from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, RGB, ACCUMULATION, DEPTH, \
     ALIGNMENT_LOSS, PTS3D, VALID_ALIGNMENT, \
     NEIGHBOR_DEPTH, DEPTH_GT, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
@@ -58,8 +53,9 @@ class RGBDDiffusionIFConfig(ModelConfig):
     independent_noise: bool = False
     noise_after_reproj: bool = False
     project_overlay: bool = False
+    opacity_style: Literal["constant", "increasing", "decreasing"] = "constant"
 
-    opacity_multiplier: float = 50
+    opacity_multiplier: float = 1
     image_crossattn: Literal["clip-expand", "clip-replace", "unet-replace"] = "clip-expand"
     depth_mapping: Literal["simple", "disparity", "log"] = "log"
     center_depth: bool = False
@@ -336,7 +332,7 @@ class RGBDDiffusionIF(Model):
     def overlay_encoded_rgbd(self, encoded: torch.Tensor, render_cameras: Cameras, c2ws: torch.Tensor,
                              w2cs: torch.Tensor, depth_fx: torch.Tensor, depth_fy: torch.Tensor, depth_cx: torch.Tensor,
                              depth_cy: torch.Tensor, fg_masks: Optional[torch.Tensor],
-                             depth_scale_factor: torch.Tensor):
+                             depth_scale_factor: torch.Tensor, alpha: torch.Tensor):
         rgb = (encoded[:, :, :3] + 1) / 2
         depth = self.decode_depth(encoded[:, :, 3:]) * depth_scale_factor.unsqueeze(1)
 
@@ -386,14 +382,27 @@ class RGBDDiffusionIF(Model):
             v = torch.round(uv[..., 1]).long().clamp(0, image_dim - 1)
             z = torch.where(is_valid_point, z_pos, max_val)
             camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
-            depth_map = depth[:, 0].permute(0, 2, 3, 1).clone()
+            depth_original = depth[:, 0].permute(0, 2, 3, 1)
+            depth_map = depth_original.clone()
             indices = (camera_index * image_dim * image_dim + v * image_dim + u).view(-1)
             _, min_indices = scatter_min(z.view(-1), indices, out=depth_map.view(-1))
 
             rgb_to_fill = min_indices[min_indices <= indices.shape[0] - 1]
-            rgb_map = rgb[:, 0].permute(0, 2, 3, 1).reshape(-1, 3).clone()
+            rgb_original = rgb[:, 0]
+            rgb_map = rgb_original.permute(0, 2, 3, 1).reshape(-1, 3).clone()
             rgb_map[indices[rgb_to_fill]] = rgb.permute(0, 1, 3, 4, 2)[:, 1:].reshape(-1, 3)[rgb_to_fill]
             rgb_map = rgb_map.view(*depth_map.shape[:-1], 3).permute(0, 3, 1, 2)
+
+            if self.config.opacity_style == "constant":
+                pass
+            elif self.config.opacity_style == "increasing":
+                rgb_map = alpha * rgb_map + (1 - alpha) * rgb_original
+                depth_map = alpha * depth_map + (1 - alpha) * depth_original
+            elif self.config.opacity_style == "decreasing":
+                rgb_map = (1 - alpha) * rgb_map + alpha * rgb_original
+                depth_map = (1 - alpha) * depth_map + alpha * depth_original
+            else:
+                raise Exception(self.config.opacity_style)
 
             if self.config.rgb_only:
                 concat_list = [rgb_map * 2 - 1]
@@ -656,17 +665,18 @@ class RGBDDiffusionIF(Model):
                     depth_fy = neighbor_cameras.fy[:, :noisy_cond_views].view(-1, 1) * noisy_scale_factor
                     depth_cx = neighbor_cameras.cx[:, :noisy_cond_views].view(-1, 1) * noisy_scale_factor
                     depth_cy = neighbor_cameras.cy[:, :noisy_cond_views].view(-1, 1) * noisy_scale_factor
+                    alpha = self.ddpm_scheduler.alphas_cumprod.to(device=self.device)[timesteps].view(-1, 1, 1, 1)
                     input_gt = self.overlay_encoded_rgbd(
                         torch.cat([input_gt.unsqueeze(1),
                                    rgbd_to_noise.view(cameras.shape[0], noisy_cond_views, *rgbd_to_noise.shape[1:])],
                                   1), cameras, c2ws_for_noisy[:, 1:], camera_w2cs_opencv, depth_fx, depth_fy, depth_cx,
-                        depth_cy, neighbor_fg_masks, depth_scale_factor)
+                        depth_cy, neighbor_fg_masks, depth_scale_factor, torch.ones_like(alpha))
 
                     noisy_input_gt = self.overlay_encoded_rgbd(
                         torch.cat([noisy_input_gt.unsqueeze(1),
                                    noisy_rgbd.view(cameras.shape[0], noisy_cond_views, *noisy_rgbd.shape[1:])], 1),
                         cameras, c2ws_for_noisy[:, 1:], camera_w2cs_opencv, depth_fx, depth_fy, depth_cx, depth_cy,
-                        neighbor_fg_masks, depth_scale_factor)
+                        neighbor_fg_masks, depth_scale_factor, alpha)
                 else:
                     depth_fx = torch.cat([cameras.fx.unsqueeze(1), neighbor_cameras.fx[:, :noisy_cond_views]],
                                          1) * noisy_scale_factor
@@ -815,12 +825,18 @@ class RGBDDiffusionIF(Model):
             concat_depth = [torch.cat([*rendering[DEPTH]], 1)]
             concat_acc = [torch.cat([*rendering[ACCUMULATION]], 1)]
 
+            # noise = torch.randn_like(c_concat[:, :-1])
+            # inference_rgbd = self.ddim_scheduler.add_noise(c_concat[:, :-1], noise,
+            #                                                torch.full((neighbor_cameras.shape[1],),
+            #                                                           self.ddim_scheduler.num_train_timesteps - 1,
+            #                                                           device=self.device,
+            #                                                           dtype=torch.long))
             self.ddim_scheduler.set_timesteps(self.config.ddim_steps, device=self.device)
 
             inference_rgbd = randn_tensor(
-                (neighbor_cameras.shape[1], 4, self.config.image_dim, self.config.image_dim),
+                (1, 4, self.config.image_dim, self.config.image_dim),
                 device=c_concat.device,
-                dtype=c_concat.dtype)
+                dtype=c_concat.dtype).expand(neighbor_cameras.shape[1], -1, -1, -1)
 
             if noisy_cond_views > 0:
                 neighbor_c2ws_opencv = torch.eye(4, device=cameras.device).view(1, 4, 4).repeat(
@@ -887,7 +903,8 @@ class RGBDDiffusionIF(Model):
                                     if neighbor_index == other_neighbor_index:
                                         continue
                                     cur_pts3d_to_render.append(decoded_pts3d[other_neighbor_index])
-                                    cur_rgb_to_overlay.append(decoded_rgb[other_neighbor_index].view(-1, 3))
+                                    to_overlay = decoded_rgb[other_neighbor_index].view(-1, 3)
+                                    cur_rgb_to_overlay.append(to_overlay)
 
                                 pts3d_to_render.append(torch.cat(cur_pts3d_to_render, -1))
                                 rgb_to_overlay.append(torch.cat(cur_rgb_to_overlay, -1))
@@ -924,7 +941,20 @@ class RGBDDiffusionIF(Model):
                                 rgb_to_fill = min_indices[min_indices <= indices.shape[0] - 1]
                                 rgb_map = decoded_rgb.reshape(-1, 3).clone()
                                 rgb_map[indices[rgb_to_fill]] = rgb_to_overlay.view(-1, 3)[rgb_to_fill]
+
                                 rgb_map = rgb_map.view(*depth_map.shape[:-1], 3)
+                                if self.config.opacity_style == "constant":
+                                    pass
+                                elif self.config.opacity_style == "increasing":
+                                    alpha = self.ddim_scheduler.alphas_cumprod.to(device=self.device)[t]
+                                    rgb_map = alpha * rgb_map + (1 - alpha) * decoded_rgb
+                                    depth_map = alpha * depth_map + (1 - alpha) * decoded_depth.permute(0, 2, 3, 1)
+                                elif self.config.opacity_style == "decreasing":
+                                    alpha = self.ddim_scheduler.alphas_cumprod.to(device=self.device)[t]
+                                    rgb_map = (1 - alpha) * rgb_map + alpha * decoded_rgb
+                                    depth_map = (1 - alpha) * depth_map + alpha * decoded_depth.permute(0, 2, 3, 1)
+                                else:
+                                    raise Exception(self.config.opacity_style)
 
                                 encoded_depth = (self.encode_depth(depth_map / depth_scale_factor)).permute(0, 3, 1, 2)
                                 inference_rgbd = torch.cat([rgb_map.permute(0, 3, 1, 2) * 2 - 1, encoded_depth], 1)

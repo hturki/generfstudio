@@ -33,8 +33,8 @@ from generfstudio.fields.image_encoder import ImageEncoder
 from generfstudio.fields.pixelnerf_field import PixelNeRFField
 from generfstudio.fields.spatial_encoder import SpatialEncoder
 from generfstudio.fields.unet import UNet
-from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, NEAR, FAR, \
-    IMAGE_FEATURES, FEATURE_SCALING, GLOBAL_LATENT, DEFAULT_SCENE_METADATA
+from generfstudio.generfstudio_constants import NEAR, FAR, IMAGE_FEATURES, FEATURE_SCALING, GLOBAL_LATENT, \
+    DEFAULT_SCENE_METADATA
 from generfstudio.pixelnerf_utils.pdf_and_depth_sampler import PDFAndDepthSampler
 
 

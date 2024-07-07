@@ -23,9 +23,8 @@ from transformers import CLIPVisionModelWithProjection
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.fields.dust3r_field import Dust3rField
-from generfstudio.generfstudio_constants import NEIGHBOR_IMAGES, NEIGHBOR_CAMERAS, RGB, ACCUMULATION, DEPTH, \
-    ALIGNMENT_LOSS, PTS3D, VALID_ALIGNMENT, \
-    NEIGHBOR_DEPTH, DEPTH_GT, NEIGHBOR_FG_MASK, FG_MASK, BG_COLOR
+from generfstudio.generfstudio_constants import RGB, ACCUMULATION, DEPTH, ALIGNMENT_LOSS, PTS3D, VALID_ALIGNMENT, \
+    DEPTH_GT, FG_MASK, BG_COLOR
 from generfstudio.models.rgbd_diffusion import RGBDDiffusion
 
 
@@ -34,11 +33,9 @@ class RGBDDiffusionIFConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: RGBDDiffusionIF)
 
     uncond: float = 0.05
-    ddim_steps = 50
 
-    cond_image_encoder_type: Literal["unet", "resnet", "dino"] = "resnet"
-    cond_feature_out_dim: int = 0
-    freeze_cond_image_encoder: bool = False
+    use_ddim: bool = True
+    ddim_steps: int = 50
 
     unet_pretrained_path: str = "DeepFloyd/IF-I-L-v1.0"
     image_encoder_pretrained_path: str = "lambdalabs/sd-image-variations-diffusers"
@@ -48,10 +45,10 @@ class RGBDDiffusionIFConfig(ModelConfig):
     prediction_type: str = "epsilon"
 
     dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
-    noisy_cond_views: int = 0
-    calc_compensations: bool = False
+
+    target_views: int = 1
+
     independent_noise: bool = False
-    noise_after_reproj: bool = False
     project_overlay: bool = False
     opacity_style: Literal["constant", "increasing", "decreasing"] = "constant"
 
@@ -160,17 +157,8 @@ class RGBDDiffusionIF(Model):
         self.unet.enable_xformers_memory_efficient_attention()
 
         if self.config.use_ema:
-            ema_unet = UNet2DConditionModel.from_pretrained(self.config.unet_pretrained_path, subfolder="unet",
-                                                            in_channels=unet_in_channels,
-                                                            out_channels=4,
-                                                            low_cpu_mem_usage=False,
-                                                            ignore_mismatched_sizes=True,
-                                                            encoder_hid_dim=768 if self.config.image_crossattn == "unet-replace" else unet_base.config.encoder_hid_dim,
-                                                            )
-            ema_unet.load_state_dict(new_state)
-
-            self.ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel,
-                                     model_config=ema_unet.config)
+            self.ema_unet = EMAModel(self.unet.parameters(), model_cls=UNet2DConditionModel,
+                                     model_config=self.unet.config)
 
         self.ddpm_scheduler = DDPMScheduler.from_pretrained(self.config.scheduler_pretrained_path,
                                                             subfolder="scheduler",

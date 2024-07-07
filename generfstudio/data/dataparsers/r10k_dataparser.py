@@ -45,7 +45,7 @@ class R10KDataParserConfig(DataParserConfig):
 
     conversion_threads: int = 16
 
-    neighbor_window_size: Optional[int] = 40
+    neighbor_window_size: Optional[int] = 100
 
 
 def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop: Optional[int]) -> bool:

@@ -11,7 +11,7 @@ from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
 
-from generfstudio.generfstudio_constants import NEIGHBOR_CAMERAS, IMAGE_FEATURES, FEATURE_SCALING
+from generfstudio.generfstudio_constants import IMAGE_FEATURES, FEATURE_SCALING
 from generfstudio.generfstudio_utils import repeat_interleave, get_pixel_aligned_features
 from generfstudio.pixelnerf_utils.scaled_nerf_encoding import ScaledNeRFEncoding
 

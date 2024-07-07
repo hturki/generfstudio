@@ -51,7 +51,7 @@ class DL3DVDataParserConfig(DataParserConfig):
 
     neighbor_overlap_threshold: Optional[Tuple[float, float]] = None # (0.3, 0.5)
 
-    neighbor_window_size: Optional[int] = 40
+    neighbor_window_size: Optional[int] = 100
 
     conversion_threads: int = 96
 

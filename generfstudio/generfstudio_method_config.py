@@ -228,17 +228,13 @@ rgbd_diffusion_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=2,
-                image_batch_size=64,
+                views_size_train=1,
+                batch_size=64,
                 dataparser=DL3DVDataParserConfig(),
             ),
             model=RGBDDiffusionConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -266,17 +262,13 @@ rgbd_diffusion_ddp_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=2,
-                image_batch_size=256,
+                views_size_train=1,
+                batch_size=256,
                 dataparser=DL3DVDataParserConfig(),
             ),
             model=RGBDDiffusionConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
             "fields": {
                 "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -305,17 +297,13 @@ rgbd_diffusion_union_method = MethodSpecification(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=2,
-                    image_batch_size=64,
+                    views_size_train=1,
+                    batch_size=64,
                 ),
             ),
             model=RGBDDiffusionConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -344,17 +332,13 @@ rgbd_diffusion_union_ddp_method = MethodSpecification(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=2,
-                    image_batch_size=256,
+                    views_size_train=1,
+                    batch_size=256,
                 ),
             ),
             model=RGBDDiffusionConfig(),
         ),
         optimizers={
-            "cond_encoder": {
-                "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            },
             "fields": {
                 "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -382,8 +366,8 @@ rgbd_diffusion_if_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                neighboring_views_size=2,
-                image_batch_size=16,
+                views_size_train=2,
+                batch_size=16,
                 dataparser=DL3DVDataParserConfig(),
             ),
             model=RGBDDiffusionIFConfig(),
@@ -421,8 +405,8 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    neighboring_views_size=2,
-                    image_batch_size=64,
+                    views_size_train=2,
+                    batch_size=64,
                 ),
             ),
             model=RGBDDiffusionIFConfig(),

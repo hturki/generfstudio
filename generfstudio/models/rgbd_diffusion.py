@@ -32,8 +32,8 @@ class RGBDDiffusionConfig(RGBDDiffusionBaseConfig):
     scheduler_pretrained_path: str = "Intel/ldm3d-4c"
 
     beta_schedule: str = "scaled_linear"
-    prediction_type: str = "epsilon"
 
+    predict_with_projection: bool = False
     rgbd_concat_strategy: Literal["mode", "sample", "mean_std", "downsample"] = "sample"
     rgb_only: bool = False
 
@@ -44,6 +44,10 @@ class RGBDDiffusion(RGBDDiffusionBase):
     def populate_modules(self):
         """Set the fields and modules."""
         super().populate_modules()
+
+        if self.config.predict_with_projection:
+            assert self.config.prediction_type == "sample", self.config.prediction_type
+            assert not self.config.rgb_only
 
         self.vae = AutoencoderKL.from_pretrained(self.config.vae_pretrained_path, subfolder="vae")
         self.vae.requires_grad_(False)
@@ -124,7 +128,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
     def decode_with_vae(self, to_decode: torch.Tensor, depth_scaling_factor: torch.Tensor) -> Tuple[
         torch.Tensor, Optional[torch.Tensor]]:
         decoded = self.decode_with_vae_inner(to_decode).permute(0, 2, 3, 1)
-        rgb = 0.5 * (decoded[..., :3] + 1)
+        rgb = (0.5 * (decoded[..., :3] + 1)).clamp(0, 1)
         if self.config.rgb_only:
             return rgb, None
 
@@ -137,7 +141,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
         if autocast_enabled:
             to_upcast = torch.logical_not(torch.isfinite(decoded.view(decoded.shape[0], -1)).all(dim=-1))
             if to_upcast.any():
-                decoded[to_upcast] = self.decode_with_vae_inner(decoded[to_upcast], False)
+                decoded[to_upcast] = self.decode_with_vae_inner(decoded[to_upcast].float(), False)
 
         return decoded
 
@@ -184,7 +188,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
                 concat_list = [rendered_rgb.permute(0, 3, 1, 2) * 2 - 1, rendered_accumulation]
         else:
             rendered_depth = rendering[DEPTH]
-            if self.config.rgbd_concat_strategy != "none":
+            if self.config.rgbd_concat_strategy != "downsample":
                 encoded = self.encode_with_vae(rendered_rgb, rendered_depth, depth_scaling_factor)
 
                 with torch.inference_mode():
@@ -294,6 +298,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :1]).squeeze(1)
 
             cond_pts3d = pts3d[:, 1:]
+            scales = depth[:, 1:].flatten(-2, -1) * scale_mult
             opacity = fg_masks[:, 1:].view(pts3d[..., :1].shape).float() if fg_masks is not None \
                 else torch.ones_like(cond_pts3d[..., :1])
 
@@ -301,7 +306,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
                 target_w2cs_opencv,
                 cameras[:, 0],
                 cond_pts3d,
-                depth[:, 1:].flatten(-2, -1) * scale_mult,
+                scales,
                 opacity,
                 rgbs_to_project[:, 1:],
                 1,
@@ -328,6 +333,56 @@ class RGBDDiffusion(RGBDDiffusionBase):
                         depth_to_encode = F.interpolate(depth_to_encode, image_dim, mode="bicubic",
                                                         antialias=True)
                 depth_to_encode = depth_to_encode.permute(0, 2, 3, 1)
+
+                if self.config.predict_with_projection:
+                    focals_for_encode = torch.cat([cameras.fx[:, 0], cameras.fy[:, 0]], -1)
+                    pp_for_encode = torch.cat([cameras.cx[:, 0], cameras.cy[:, 0]], -1)
+                    pixels_im = torch.stack(
+                        torch.meshgrid(
+                            torch.arange(image_dim, dtype=torch.float32, device=cameras.device),
+                            torch.arange(image_dim, dtype=torch.float32, device=cameras.device),
+                            indexing="ij")).permute(2, 1, 0)
+                    pixels_for_encode = pixels_im.reshape(-1, 2)
+
+                    if self.config.scale_with_pixel_area:
+                        to_encode_scale_mult = self.get_pixel_area_scale_mult(cameras[:, 0], image_dim).view(
+                            cameras.shape[0], -1)
+                    else:
+                        to_encode_scale_mult = 1 / cameras[:, 0].fx
+
+                    with torch.inference_mode():
+                        target_c2ws_opencv = torch.eye(4, device=cameras.device).view(1, 4, 4).repeat(
+                            target_w2cs_opencv.shape[0],
+                            1, 1)
+                        target_c2ws_opencv[:, :3] = cameras.camera_to_worlds[:, 0]
+                        target_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
+
+                        pts3d_to_encode = self.depth_to_pts3d(depth_to_encode, target_c2ws_opencv, pixels_for_encode,
+                                                              focals_for_encode, pp_for_encode)
+
+                        scales_for_encode = (
+                                depth_to_encode.view(cameras.shape[0], -1) * to_encode_scale_mult).unsqueeze(-1)
+                        opacity_to_encode = fg_masks[:, 0].view(
+                            pts3d_to_encode[..., 0].shape).float() if fg_masks is not None \
+                            else torch.ones_like(pts3d_to_encode[..., 0])
+
+                        rendering_to_encode = self.splat_gaussians(
+                            target_w2cs_opencv,
+                            cameras.fx[:, 0],
+                            cameras.fy[:, 0],
+                            cameras.cx[:, 0],
+                            cameras.cy[:, 0],
+                            pts3d_to_encode,
+                            scales_for_encode.expand(-1, -1, 3),
+                            opacity_to_encode,
+                            rgb_to_encode.reshape(cameras.shape[0], -1, 3),
+                            image_dim,
+                            True,
+                            1,
+                            bg_colors,
+                        )
+                        rgb_to_encode = rendering_to_encode[RGB]
+                        depth_to_encode = rendering_to_encode[DEPTH]
             else:
                 depth_to_encode = None
 
@@ -337,14 +392,47 @@ class RGBDDiffusion(RGBDDiffusionBase):
             if self.ddpm_scheduler.config.prediction_type == "epsilon":
                 outputs["target"] = noise
             elif self.ddpm_scheduler.config.prediction_type == "sample":
-                outputs["target"] = latents
+                if self.config.predict_with_projection:
+                    # Scale target depth to make loss scale invariant
+                    outputs["target"] = torch.cat(
+                        [rgb_to_encode, self.encode_depth(depth_to_encode, depth_scaling_factor)], -1)
+                else:
+                    outputs["target"] = latents
             elif self.ddpm_scheduler.config.prediction_type == "v_prediction":
                 outputs["target"] = self.ddpm_scheduler.get_velocity(latents, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {self.ddpm_scheduler.config.prediction_type}")
 
             noisy_latents = self.ddpm_scheduler.add_noise(latents, noise, timesteps)
-            outputs["model_output"] = self.unet(torch.cat([noisy_latents, c_concat], 1), timesteps, c_crossattn).sample
+            model_pred = self.unet(torch.cat([noisy_latents, c_concat], 1), timesteps, c_crossattn).sample
+            if self.config.predict_with_projection:
+                decoded_rgb, decoded_depth = self.decode_with_vae(model_pred, depth_scaling_factor)
+                decoded_pts3d = self.depth_to_pts3d(decoded_depth, target_c2ws_opencv, pixels_for_encode,
+                                                    focals_for_encode, pp_for_encode)
+                decoded_scales = (decoded_depth.view(cameras.shape[0], -1) * to_encode_scale_mult).unsqueeze(-1)
+
+                decoded_rendering = self.splat_gaussians(
+                    target_w2cs_opencv,
+                    cameras.fx[:, 0],
+                    cameras.fy[:, 0],
+                    cameras.cx[:, 0],
+                    cameras.cy[:, 0],
+                    torch.cat([cond_pts3d.view(cameras.shape[0], -1, 3), decoded_pts3d], 1),
+                    torch.cat([scales.view(cameras.shape[0], -1, 1), decoded_scales], 1).expand(-1, -1, 3),
+                    torch.cat([opacity.view(cameras.shape[0], -1), torch.ones_like(decoded_pts3d[..., 0])], 1),
+                    torch.cat([rgbs_to_project[:, 1:].reshape(cameras.shape[0], -1, 3),
+                               decoded_rgb.reshape(cameras.shape[0], -1, 3)], 1),
+                    image_dim,
+                    True,
+                    1,
+                    bg_colors,
+                )
+
+                outputs["model_output"] = torch.cat(
+                    [decoded_rendering[RGB], self.encode_depth(decoded_rendering[DEPTH], depth_scaling_factor)], -1)
+            else:
+                outputs["model_output"] = model_pred
+
         else:
             assert cameras.shape[0] == 1, cameras.shape
             target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :-1]).squeeze(0)
@@ -361,6 +449,12 @@ class RGBDDiffusion(RGBDDiffusionBase):
                     torch.arange(image_dim, dtype=torch.float32, device=cameras.device),
                     indexing="ij")).permute(2, 1, 0)
             pixels_for_decode = pixels_im.reshape(-1, 2)
+
+            if self.config.scale_with_pixel_area:
+                decode_scale_mult = self.get_pixel_area_scale_mult(cameras[:, :-1].flatten(), image_dim).view(
+                    *cameras[:, :-1].shape, -1)
+            else:
+                decode_scale_mult = 1 / cameras[:, :-1].fx
 
             if self.config.use_ddim:
                 scheduler = self.ddim_scheduler
@@ -438,23 +532,20 @@ class RGBDDiffusion(RGBDDiffusionBase):
 
                     sample_order.append(cur_render)
                     decoded_rgb, decoded_depth = self.decode_with_vae(inference_latents, depth_scaling_factor)
-                    samples_rgb.append(decoded_rgb.clamp(0, 1))
+                    samples_rgb.append(decoded_rgb)
 
                     if not self.config.rgb_only:
                         samples_depth.append(decoded_depth)
+                        decoded_pts3d = self.depth_to_pts3d(decoded_depth,
+                                                            target_c2ws_opencv[cur_render:cur_render + 1],
+                                                            pixels_for_decode,
+                                                            focals_for_decode[cur_render:cur_render + 1],
+                                                            pp_for_decode[cur_render:cur_render + 1]).unsqueeze(0)
 
-                        decoded_pts3d_cam = fast_depthmap_to_pts3d(
-                            decoded_depth.view(decoded_depth.shape[0], -1),
-                            pixels_for_decode,
-                            focals_for_decode[cur_render:cur_render + 1],
-                            pp_for_decode[cur_render:cur_render + 1])
-                        decoded_pts3d = (target_c2ws_opencv[cur_render:cur_render + 1]
-                                         @ torch.cat([decoded_pts3d_cam,
-                                                      torch.ones_like(decoded_pts3d_cam[..., :1])], -1).transpose(1, 2))
-                        decoded_pts3d = decoded_pts3d.transpose(1, 2)[..., :3].unsqueeze(0)
                         cond_pts3d = torch.cat([cond_pts3d, decoded_pts3d], -2)
                         scales = torch.cat(
-                            [scales, decoded_depth.view(1, 1, -1) * scale_mult[:, cur_render:cur_render + 1]], -1)
+                            [scales, decoded_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]],
+                            -1)
                         opacity = torch.cat([opacity, torch.ones_like(decoded_pts3d[..., :1])], -2)
                         cond_rgbs = torch.cat([cond_rgbs, decoded_rgb.view(1, -1, 3)], 1)
             finally:

@@ -256,7 +256,6 @@ rgbd_diffusion_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 1,
             "fields": 1
         },
         pipeline=VanillaPipelineConfig(
@@ -290,7 +289,6 @@ rgbd_diffusion_union_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 4,
             "fields": 4
         },
         pipeline=VanillaPipelineConfig(
@@ -325,7 +323,6 @@ rgbd_diffusion_union_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 1,
             "fields": 1
         },
         pipeline=VanillaPipelineConfig(
@@ -360,7 +357,6 @@ rgbd_diffusion_if_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 16,
             "fields": 16
         },
         pipeline=VanillaPipelineConfig(
@@ -373,10 +369,6 @@ rgbd_diffusion_if_method = MethodSpecification(
             model=RGBDDiffusionIFConfig(),
         ),
         optimizers={
-            # "cond_encoder": {
-            #     "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
-            #     "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            # },
             "fields": {
                 "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
@@ -398,7 +390,6 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "cond_encoder": 4,
             "fields": 4
         },
         pipeline=VanillaPipelineConfig(
@@ -412,10 +403,6 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
             model=RGBDDiffusionIFConfig(),
         ),
         optimizers={
-            # "cond_encoder": {
-            #     "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
-            #     "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
-            # },
             "fields": {
                 "optimizer": ZeroRedundancyOptimizerConfig(lr=1e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),

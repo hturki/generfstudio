@@ -15,6 +15,7 @@ from nerfstudio.utils import profiler
 from nerfstudio.utils.rich_utils import CONSOLE
 from torchvision.transforms import transforms
 
+from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.fields.dust3r_field import Dust3rField
 from generfstudio.generfstudio_constants import DEPTH, ACCUMULATION, RGB
 
@@ -33,7 +34,7 @@ class RGBDDiffusionBaseConfig(ModelConfig):
 
     depth_mapping: Literal["scaled", "disparity", "log"] = "disparity"
 
-    scale_with_pixel_area: bool = False
+    scale_with_pixel_area: bool = True
 
     guidance_scale: float = 2.0
 
@@ -167,6 +168,17 @@ class RGBDDiffusionBase(Model):
         inv_T = -torch.bmm(R_inv.view(-1, 3, 3), T.view(-1, 3, 1))
         w2cs[:, :, :3, 3:] = inv_T.view(w2cs[:, :, :3, 3:].shape)
         return w2cs
+
+    @torch.cuda.amp.autocast(enabled=False)
+    def depth_to_pts3d(self, depth: torch.Tensor, c2ws_opencv: torch.Tensor, pixels: torch.Tensor, focals: torch.Tensor,
+                       pp: torch.Tensor) -> torch.Tensor:
+        pts3d_cam = fast_depthmap_to_pts3d(
+            depth.view(depth.shape[0], -1),
+            pixels,
+            focals,
+            pp)
+        pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
+        return pts3d.transpose(1, 2)[..., :3]
 
     @profiler.time_function
     @torch.cuda.amp.autocast(enabled=False)

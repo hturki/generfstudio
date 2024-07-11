@@ -40,6 +40,7 @@ class RGBDDiffusionBaseConfig(ModelConfig):
 
     use_ema: bool = True
     allow_tf32: bool = False
+    rgb_only: bool = False
 
 
 class RGBDDiffusionBase(Model):
@@ -62,30 +63,30 @@ class RGBDDiffusionBase(Model):
         self.ddpm_scheduler = DDPMScheduler.from_pretrained(self.config.unet_pretrained_path,
                                                             subfolder="scheduler",
                                                             beta_schedule=self.config.beta_schedule,
-                                                            prediction_type=self.config.prediction_type)
+                                                            prediction_type=self.config.prediction_type,
+                                                            variance_type="fixed_small")
         if self.config.use_ddim:
             self.ddim_scheduler = DDIMScheduler.from_pretrained(self.config.unet_pretrained_path,
                                                                 subfolder="scheduler",
                                                                 beta_schedule=self.config.beta_schedule,
                                                                 prediction_type=self.config.prediction_type)
-            CONSOLE.log(f"DDIM Scheduler: {self.ddim_scheduler.config}")
 
         self.dust3r_field = Dust3rField(model_name=self.config.dust3r_model_name,
                                         depth_precomputed=self.depth_available)
-        self.image_encoder_resize_dust3r = transforms.Resize(
+        self.dust3r_resize = transforms.Resize(
             (224, 224),
             interpolation=transforms.InterpolationMode.BICUBIC,
-            antialias=False,
+            antialias=True,
         )
 
         # https://huggingface.co/lambdalabs/sd-image-variations-diffusers - apparently the image encoder
         # was trained without anti-aliasing
-        self.image_encoder_resize_clip = transforms.Resize(
+        self.clip_resize = transforms.Resize(
             (224, 224),
             interpolation=transforms.InterpolationMode.BICUBIC,
             antialias=False,
         )
-        self.image_encoder_normalize_clip = transforms.Normalize(
+        self.clip_normalize = transforms.Normalize(
             [0.48145466, 0.4578275, 0.40821073],
             [0.26862954, 0.26130258, 0.27577711])
 

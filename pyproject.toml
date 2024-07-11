@@ -42,6 +42,7 @@ rgbd_diffusion_union = "generfstudio.generfstudio_method_config:rgbd_diffusion_u
 rgbd_diffusion_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_ddp_method"
 rgbd_diffusion_union_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_union_ddp_method"
 rgbd_diffusion_if = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_method"
+rgbd_diffusion_if_union = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_union_method"
 rgbd_diffusion_if_union_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_union_ddp_method"
 
 [project.entry-points."nerfstudio.dataparser_configs"]

@@ -362,9 +362,43 @@ rgbd_diffusion_if_method = MethodSpecification(
         pipeline=VanillaPipelineConfig(
             datamanager=NeighboringViewsDatamanagerConfig(
                 _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                views_size_train=2,
+                views_size_train=1,
                 batch_size=16,
                 dataparser=DL3DVDataParserConfig(),
+            ),
+            model=RGBDDiffusionIFConfig(),
+        ),
+        optimizers={
+            "fields": {
+                "optimizer": AdamWOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_pre_warmup=1e-10, warmup_steps=100),
+            },
+        },
+        vis="wandb",
+    ),
+    description='Training a multi-view RGBD diffusion model',
+)
+
+rgbd_diffusion_if_union_method = MethodSpecification(
+    config=TrainerConfig(
+        method_name="rgbd-diffusion-if-union",
+        steps_per_eval_image=1000,
+        steps_per_eval_batch=0,
+        steps_per_save=1000,
+        steps_per_eval_all_images=1000000,
+        max_num_iterations=1000000,
+        mixed_precision=True,
+        log_gradients=False,
+        gradient_accumulation_steps={
+            "fields": 16
+        },
+        pipeline=VanillaPipelineConfig(
+            datamanager=UnionDatamanagerConfig(
+                inner=NeighboringViewsDatamanagerConfig(
+                    _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
+                    views_size_train=1,
+                    batch_size=16,
+                ),
             ),
             model=RGBDDiffusionIFConfig(),
         ),
@@ -390,14 +424,14 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "fields": 4
+            "fields": 2
         },
         pipeline=VanillaPipelineConfig(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
-                    views_size_train=2,
-                    batch_size=64,
+                    views_size_train=1,
+                    batch_size=128,
                 ),
             ),
             model=RGBDDiffusionIFConfig(),

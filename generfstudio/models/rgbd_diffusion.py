@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Union, Type, Optional, Literal, Any
+from typing import Dict, List, Tuple, Union, Type, Optional, Literal
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +16,6 @@ from torch import nn
 from torch.nn import Parameter
 from transformers import CLIPVisionModelWithProjection
 
-from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
 from generfstudio.generfstudio_constants import RGB, ACCUMULATION, DEPTH, ALIGNMENT_LOSS, PTS3D, VALID_ALIGNMENT, \
     DEPTH_GT, FG_MASK, BG_COLOR
 from generfstudio.models.rgbd_diffusion_base import RGBDDiffusionBaseConfig, RGBDDiffusionBase
@@ -35,7 +34,6 @@ class RGBDDiffusionConfig(RGBDDiffusionBaseConfig):
 
     predict_with_projection: bool = False
     rgbd_concat_strategy: Literal["mode", "sample", "mean_std", "downsample"] = "sample"
-    rgb_only: bool = False
 
 
 class RGBDDiffusion(RGBDDiffusionBase):
@@ -191,8 +189,8 @@ class RGBDDiffusion(RGBDDiffusionBase):
             if self.config.rgbd_concat_strategy != "downsample":
                 encoded = self.encode_with_vae(rendered_rgb, rendered_depth, depth_scaling_factor)
 
-                with torch.inference_mode():
-                    encoded_accumulation = F.interpolate(rendered_accumulation, encoded.shape[2:], mode="bicubic")
+                encoded_accumulation = F.interpolate(rendered_accumulation, encoded.shape[2:],
+                                                     mode="bicubic", antialias=True).clamp_min(0)
 
                 concat_list = [encoded, encoded_accumulation]
             else:
@@ -225,7 +223,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             project_dim = 224
 
             with torch.inference_mode():
-                rgbs_to_project_chw = self.image_encoder_resize_dust3r(rgbs_chw.flatten(0, 1))
+                rgbs_to_project_chw = self.dust3r_resize(rgbs_chw.flatten(0, 1)).clamp(0, 1)
                 rgbs_to_project_chw = rgbs_to_project_chw.view(cameras.shape[0], -1, *rgbs_to_project_chw.shape[1:])
 
             rgbs_to_project = rgbs_to_project_chw.permute(0, 1, 3, 4, 2)
@@ -233,7 +231,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             if FG_MASK in cameras.metadata:
                 fg_masks = cameras.metadata[FG_MASK]
                 with torch.inference_mode():
-                    fg_masks = self.image_encoder_resize_dust3r(fg_masks.flatten(0, 1).unsqueeze(1).float()).squeeze(
+                    fg_masks = self.dust3r_resize(fg_masks.flatten(0, 1).unsqueeze(1).float()).squeeze(
                         1).bool()
                     fg_masks = fg_masks.view(cameras.shape[0], -1, *fg_masks.shape[1:])
             else:
@@ -263,7 +261,6 @@ class RGBDDiffusion(RGBDDiffusionBase):
                 if valid_alignment.any():
                     cameras = cameras[valid_alignment]
                     images = images[valid_alignment]
-                    # camera_w2cs_opencv = camera_w2cs_opencv[valid_alignment]
                     pts3d = pts3d[valid_alignment]
                     depth = depth[valid_alignment]
                     rgbs_to_project = rgbs_to_project[valid_alignment]
@@ -281,7 +278,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
         with torch.inference_mode():
             # Get CLIP embeddings for cross attention
             c_crossattn = self.image_encoder(
-                self.image_encoder_normalize_clip(self.image_encoder_resize_clip(clip_rgbs.flatten(0, 1)))).image_embeds
+                self.clip_normalize(self.clip_resize(clip_rgbs.flatten(0, 1)).clamp(0, 1))).image_embeds
             c_crossattn = c_crossattn.view(cameras.shape[0], clip_rgbs.shape[1], c_crossattn.shape[-1])
 
         to_project = cameras[:, 1:] if self.training else cameras
@@ -331,7 +328,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
                 if depth_to_encode.shape[-1] != image_dim:
                     with torch.inference_mode():
                         depth_to_encode = F.interpolate(depth_to_encode, image_dim, mode="bicubic",
-                                                        antialias=True)
+                                                        antialias=True).clamp_min(0)
                 depth_to_encode = depth_to_encode.permute(0, 2, 3, 1)
 
                 if self.config.predict_with_projection:
@@ -571,7 +568,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             depth_gt = depth.squeeze(0).unsqueeze(1)
             if depth_gt.shape[-1] != image_dim:
                 with torch.inference_mode():
-                    depth_gt = F.interpolate(depth_gt, image_dim, mode="bicubic", antialias=True)
+                    depth_gt = F.interpolate(depth_gt, image_dim, mode="bicubic", antialias=True).clamp_min(0)
             outputs[DEPTH_GT] = depth_gt.permute(0, 2, 3, 1)
 
             if not self.config.rgb_only:

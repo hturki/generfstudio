@@ -193,8 +193,8 @@ class SplatfactoSDSModelConfig(ModelConfig):
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
     """Config of the camera optimizer to use"""
 
-    diffusion_checkpoint_path: Path = Path(
-        "outputs/rgbd-diffusion-union-no-oxl-resnet-False-ldm3d-nv-1-DI-False-4-nofeat/rgbd-diffusion-union-ddp/2024-06-08_163402/nerfstudio_models/step-000049000.ckpt")
+    # diffusion_checkpoint_path: Path = Path(
+    #     "outputs/rgbd-diffusion-union-no-oxl-resnet-False-ldm3d-nv-1-DI-False-4-nofeat/rgbd-diffusion-union-ddp/2024-06-08_163402/nerfstudio_models/step-000049000.ckpt")
     cond_feature_out_dim: int = 0
     ddim_steps: int = 50
     guidance_scale: float = 3.0
@@ -323,48 +323,48 @@ class SplatfactoSDSModel(Model):
             self.background_color = get_color(self.config.background_color)
 
         # our stuff
-        self.vae = AutoencoderKL.from_pretrained("Intel/ldm3d-4c", subfolder="vae")
-        self.vae.requires_grad_(False)
+        # self.vae = AutoencoderKL.from_pretrained("Intel/ldm3d-4c", subfolder="vae")
+        # self.vae.requires_grad_(False)
+        #
+        # # 4 for latent + 4 for RGBD + 1 for accumulation + feature dim
+        # unet_base = UNet2DConditionModel.from_pretrained("Intel/ldm3d-4c", subfolder="unet",
+        #                                                  in_channels=4,
+        #                                                  low_cpu_mem_usage=False,
+        #                                                  ignore_mismatched_sizes=False)
+        #
+        # self.unet = UNet2DConditionModel.from_pretrained("Intel/ldm3d-4c", subfolder="unet",
+        #                                                  in_channels=9 + self.config.cond_feature_out_dim,
+        #                                                  low_cpu_mem_usage=False,
+        #                                                  ignore_mismatched_sizes=True)
+        # old_state = unet_base.state_dict()
+        # new_state = self.unet.state_dict()
+        # in_key = "conv_in.weight"
+        # # Check if we need to port weights from 4ch input
+        # if old_state[in_key].shape != new_state[in_key].shape:
+        #     CONSOLE.log(f"Manual init: {in_key}")
+        #     new_state[in_key].zero_()
+        #     new_state[in_key][:, :old_state[in_key].shape[1], :, :].copy_(old_state[in_key])
+        #     self.unet.load_state_dict(new_state)
+        #
+        # # self.unet.enable_xformers_memory_efficient_attention()
+        #
+        # self.noise_scheduler = DDPMScheduler.from_pretrained("Intel/ldm3d-4c", subfolder="scheduler")
+        # self.ddim_scheduler = DDIMScheduler.from_pretrained("Intel/ldm3d-4c", subfolder="scheduler")
 
-        # 4 for latent + 4 for RGBD + 1 for accumulation + feature dim
-        unet_base = UNet2DConditionModel.from_pretrained("Intel/ldm3d-4c", subfolder="unet",
-                                                         in_channels=4,
-                                                         low_cpu_mem_usage=False,
-                                                         ignore_mismatched_sizes=False)
-
-        self.unet = UNet2DConditionModel.from_pretrained("Intel/ldm3d-4c", subfolder="unet",
-                                                         in_channels=9 + self.config.cond_feature_out_dim,
-                                                         low_cpu_mem_usage=False,
-                                                         ignore_mismatched_sizes=True)
-        old_state = unet_base.state_dict()
-        new_state = self.unet.state_dict()
-        in_key = "conv_in.weight"
-        # Check if we need to port weights from 4ch input
-        if old_state[in_key].shape != new_state[in_key].shape:
-            CONSOLE.log(f"Manual init: {in_key}")
-            new_state[in_key].zero_()
-            new_state[in_key][:, :old_state[in_key].shape[1], :, :].copy_(old_state[in_key])
-            self.unet.load_state_dict(new_state)
-
-        # self.unet.enable_xformers_memory_efficient_attention()
-
-        self.noise_scheduler = DDPMScheduler.from_pretrained("Intel/ldm3d-4c", subfolder="scheduler")
-        self.ddim_scheduler = DDIMScheduler.from_pretrained("Intel/ldm3d-4c", subfolder="scheduler")
-
-        ema_unet = EMAModel(self.unet.parameters(), model_cls=UNet2DConditionModel,
-                            model_config=self.unet.config)
-        diffusion_state = torch.load(self.config.diffusion_checkpoint_path, map_location="cpu")["pipeline"]
-        prefix = "ema_unet."
-        prefix_len = len(prefix)
-        ema_state_dict = {}
-        for key, val in diffusion_state.items():
-            if key.startswith(prefix):
-                ema_state_dict[key[prefix_len:]] = val
-
-        ema_unet.load_state_dict(ema_state_dict)
-        ema_unet.copy_to(self.unet.parameters())
-
-        self.register_buffer("alphas", self.noise_scheduler.alphas_cumprod)
+        # ema_unet = EMAModel(self.unet.parameters(), model_cls=UNet2DConditionModel,
+        #                     model_config=self.unet.config)
+        # diffusion_state = torch.load(self.config.diffusion_checkpoint_path, map_location="cpu")["pipeline"]
+        # prefix = "ema_unet."
+        # prefix_len = len(prefix)
+        # ema_state_dict = {}
+        # for key, val in diffusion_state.items():
+        #     if key.startswith(prefix):
+        #         ema_state_dict[key[prefix_len:]] = val
+        #
+        # ema_unet.load_state_dict(ema_state_dict)
+        # ema_unet.copy_to(self.unet.parameters())
+        #
+        # self.register_buffer("alphas", self.noise_scheduler.alphas_cumprod)
 
         self.clip_embeddings = None
         self.last_camera = None
@@ -402,7 +402,7 @@ class SplatfactoSDSModel(Model):
         # trigger = Path("/scratch/hturki/render_view")
         # if not trigger.exists():
         #     return
-
+        return
         if self.infer_index > len(self.sds_cameras) - 1:
             # print("DONE")
             return
@@ -1087,7 +1087,7 @@ class SplatfactoSDSModel(Model):
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            compute_means2d_absgrad=True,
+            absgrad=True,
             rasterize_mode=self.config.rasterize_mode,
             radius_clip=0 if self.training else 3,
         )
@@ -1185,15 +1185,15 @@ class SplatfactoSDSModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
-            "scale_reg": scale_reg,
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss * 0,
+            "scale_reg": scale_reg * 0,
         }
 
-        if self.training:
-            # Add loss from camera optimizer
-            self.camera_optimizer.get_loss_dict(loss_dict)
-
-            loss_dict["sds"] = self.config.sds_loss_mult * self.get_sds_loss()
+        # if self.training:
+        #     # Add loss from camera optimizer
+        #     self.camera_optimizer.get_loss_dict(loss_dict)
+        #
+        #     loss_dict["sds"] = self.config.sds_loss_mult * self.get_sds_loss()
 
         return loss_dict
 

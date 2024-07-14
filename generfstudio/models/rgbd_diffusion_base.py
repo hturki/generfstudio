@@ -127,7 +127,7 @@ class RGBDDiffusionBase(Model):
             return encoded_0_1 * 2 - 1
         elif self.config.depth_mapping == "log":
             scaled_depth = to_encode / depth_scaling_factor
-            return scaled_depth.float().clamp_min(1e-8).log()
+            return (scaled_depth.float() + 1e-3).log()
         else:
             raise Exception(self.config.depth_mapping)
 
@@ -142,7 +142,7 @@ class RGBDDiffusionBase(Model):
             scaled = 1 / (1 - to_decode_0_1.clamp(0, 0.999)) - 1
             return scaled * depth_scaling_factor
         elif self.config.depth_mapping == "log":
-            scaled = to_decode.float().exp()
+            scaled = (to_decode.float().exp() - 1e-3).clamp_min(0)
             return scaled * depth_scaling_factor
         else:
             raise Exception(self.config.depth_mapping)

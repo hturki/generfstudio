@@ -32,8 +32,8 @@ class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
     inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
-        # scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117"))
-        scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
+        scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117"))
+        # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
     # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""
 

@@ -599,7 +599,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
         assert torch.isfinite(loss).all(), loss
 
         if VALID_ALIGNMENT in outputs and outputs[VALID_ALIGNMENT] == 0:
-            CONSOLE.warn("No valid outputs, ignoring training batch")
+            CONSOLE.log("No valid outputs, ignoring training batch")
             loss = loss * 0  # Do this so that backprop doesn't complain
 
         return {"loss": loss}

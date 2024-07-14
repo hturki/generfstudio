@@ -54,14 +54,15 @@ class Dust3rField(nn.Module):
         with profiler.time_function("dust3r_inference"):
             pred1, pred2 = self.model(view1, view2)
 
-        scene = GlobalPointCloudOptimizer(
-            view1, view2, pred1, pred2, c2ws.view(-1, 4, 4), fx.view(-1, 1), fy.view(-1, 1), cx.view(-1, 1),
-            cy.view(-1, 1), rgbs.shape[1], fg_masks.flatten(0, 1) if fg_masks is not None else None,
-            verbose=not self.training)
+        with torch.cuda.amp.autocast(enabled=False):
+            scene = GlobalPointCloudOptimizer(
+                view1, view2, pred1, pred2, c2ws.view(-1, 4, 4), fx.view(-1, 1), fy.view(-1, 1), cx.view(-1, 1),
+                cy.view(-1, 1), rgbs.shape[1], fg_masks.flatten(0, 1) if fg_masks is not None else None,
+                verbose=not self.training)
 
-        alignment_loss, valid_alignment = scene.init_least_squares()
-        pts3d = scene.pts3d_world().detach()
-        depth = scene.depth().detach()
+            alignment_loss, valid_alignment = scene.init_least_squares()
+            pts3d = scene.pts3d_world().detach()
+            depth = scene.depth().detach()
 
         return pts3d, depth, alignment_loss, valid_alignment
 

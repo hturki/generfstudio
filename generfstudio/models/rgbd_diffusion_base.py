@@ -28,7 +28,7 @@ class RGBDDiffusionBaseConfig(ModelConfig):
 
     unet_pretrained_path: str = "Intel/ldm3d-4c"
     use_ddim: bool = True
-    ddim_steps = 50
+    inference_steps: int = 50
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
 

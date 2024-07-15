@@ -439,7 +439,7 @@ class SplatfactoSDSModel(Model):
         concat_list.append(F.interpolate(accumulation.unsqueeze(0), concat_list[0].shape[2:], mode="bicubic"))
         c_concat = torch.cat(concat_list, 1)
 
-        self.ddim_scheduler.set_timesteps(self.config.ddim_steps, device=self.device)
+        self.ddim_scheduler.set_timesteps(self.config.inference_steps, device=self.device)
         n_samples = 1
         vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         inference_latents = randn_tensor((n_samples, self.vae.config.latent_channels,

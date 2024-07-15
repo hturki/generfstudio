@@ -455,7 +455,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
 
             if self.config.use_ddim:
                 scheduler = self.ddim_scheduler
-                scheduler.set_timesteps(self.config.ddim_steps, device=self.device)
+                scheduler.set_timesteps(self.config.inference_steps, device=self.device)
             else:
                 scheduler = self.ddpm_scheduler
 

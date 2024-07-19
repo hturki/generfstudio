@@ -349,7 +349,7 @@ rgbd_diffusion_union_ddp_method = MethodSpecification(
 rgbd_diffusion_if_method = MethodSpecification(
     config=TrainerConfig(
         method_name="rgbd-diffusion-if",
-        steps_per_eval_image=1,
+        steps_per_eval_image=1000,
         steps_per_eval_batch=0,
         steps_per_save=1000,
         steps_per_eval_all_images=1000000,
@@ -424,14 +424,14 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "fields": 2
+            "fields": 4
         },
         pipeline=VanillaPipelineConfig(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                     views_size_train=1,
-                    batch_size=128,
+                    batch_size=64,
                 ),
             ),
             model=RGBDDiffusionIFConfig(),

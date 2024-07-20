@@ -275,9 +275,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
 
         # Used in mv_diffusion - DDP expects us to do all differentiable model computation in the forward function
         to_return.metadata["image"] = data["image"]  # .to(self.device)
-        if DEPTH in data:
-            to_return.metadata[DEPTH] = data[DEPTH].to(self.device)
-            del data[DEPTH]
 
         return to_return, data
 
@@ -323,9 +320,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             camera.metadata[PTS3D] = data[PTS3D].to(self.device)
             del data[PTS3D]
 
-        if DEPTH in data:
             data[DEPTH] = data[DEPTH].to(self.device)
-            # data[NEIGHBOR_DEPTH] = data[NEIGHBOR_DEPTH].to(self.device)
             camera.metadata[DEPTH] = data[DEPTH]
 
         return camera, data

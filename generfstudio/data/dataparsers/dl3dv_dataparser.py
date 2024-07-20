@@ -9,7 +9,7 @@ from typing import Type, Optional, Tuple
 
 import numpy as np
 import torch
-from dust3r.model import AsymmetricCroCo3DStereo
+from mast3r.model import AsymmetricMASt3R
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig

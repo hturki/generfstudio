@@ -22,8 +22,9 @@ from generfstudio.generfstudio_constants import DEPTH, ACCUMULATION, RGB
 
 @dataclass
 class RGBDDiffusionBaseConfig(ModelConfig):
-    dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
-
+    # dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
+    dust3r_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+    min_conf_thresh: float = 1.5
     uncond: float = 0.05
 
     unet_pretrained_path: str = "Intel/ldm3d-4c"

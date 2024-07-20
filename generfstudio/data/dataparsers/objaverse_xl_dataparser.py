@@ -89,7 +89,7 @@ class ObjaverseXL(DataParser):
         max_bounds = None
         near = 1e10
         far = -1
-        for scene in tqdm(scenes):
+        for scene in tqdm(scenes[:10]):
             dest = self.config.data / scene
             transforms = dest / "transforms.json"
 

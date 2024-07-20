@@ -1,9 +1,11 @@
 from typing import Optional
 
 import torch
-from dust3r.model import AsymmetricCroCo3DStereo
+from mast3r.model import AsymmetricMASt3R
+# from dust3r.model import AsymmetricCroCo3DStereo
 from nerfstudio.utils import profiler
 from torch import nn
+from torch_scatter import scatter_max
 
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 
@@ -18,12 +20,12 @@ class Dust3rField(nn.Module):
         super().__init__()
 
         if not depth_precomputed:
-            self.model = AsymmetricCroCo3DStereo.from_pretrained(model_name)
+            self.model = AsymmetricMASt3R.from_pretrained(model_name)
+            # self.model = AsymmetricCroCo3DStereo.from_pretrained(model_name)
             for p in self.model.parameters():
                 p.requires_grad_(False)
         else:
             self.model = None
-
 
     # Intrinsics should be passed for image size inferred by rgb
     @profiler.time_function
@@ -64,5 +66,11 @@ class Dust3rField(nn.Module):
             pts3d = scene.pts3d_world().detach()
             depth = scene.depth().detach()
 
-        return pts3d, depth, alignment_loss, valid_alignment
+        indices_base = torch.arange(depth.shape[-1], device=depth.device).unsqueeze(0).expand(pred1["conf"].shape[0],
+                                                                                              -1)
+        pred_1_indices = (scene.view1_idx.unsqueeze(-1) * depth.shape[-1]) + indices_base
+        confs = scatter_max(pred1["conf"].view(-1), pred_1_indices.view(-1))[0]
+        pred_2_indices = (scene.view1_idx.unsqueeze(-1) * depth.shape[-1]) + indices_base
+        scatter_max(pred2["conf"].view(-1), pred_2_indices.view(-1), out=confs)
 
+        return pts3d, depth, alignment_loss, valid_alignment, confs.view(depth.shape)

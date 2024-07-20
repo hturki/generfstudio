@@ -33,15 +33,15 @@ class RGBDDiffusionIFConfig(RGBDDiffusionBaseConfig):
     beta_schedule: str = "squaredcos_cap_v2"
     prediction_type: str = "epsilon"
 
-    image_crossattn: Literal["clip-expand", "clip-replace", "unet-replace"] = "clip-replace"
+    image_crossattn: Literal["clip-expand", "clip-replace", "unet-replace", "none"] = "clip-replace"
 
     use_points: bool = False
     infer_with_projection: bool = True
 
     image_dim: int = 64
-    image_dim_project: Optional[int] = None
 
     rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
+    depth_mapping: Literal["scaled", "disparity", "log"] = "scaled"
 
     is_upscaler: bool = False
     upscaler_noise_level: int = 250
@@ -93,6 +93,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
                 self.config.image_encoder_pretrained_path, subfolder="image_encoder")
             self.image_encoder.requires_grad_(False)
+        elif self.config.image_crossattn == "none":
+            pass
         else:
             raise Exception(self.config.image_crossattn)
 
@@ -106,15 +108,24 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                                                          low_cpu_mem_usage=False,
                                                          ignore_mismatched_sizes=False)
 
+        if self.config.image_crossattn == "clip-expand" or self.config.image_crossattn == "clip-replace":
+            encoder_hid_dim = unet_base.config.encoder_hid_dim
+        elif self.config.image_crossattn == "unet-replace":
+            encoder_hid_dim = 768
+        elif self.config.image_crossattn == "none":
+            encoder_hid_dim = None
+        else:
+            raise Exception(self.config.image_crossattn)
+
         # 4 for noise + 4 for RGBD cond + 1 for accumulation
         unet_in_channels = 4 + 4 + (0 if self.config.is_upscaler else 1)
+        unet_out_channels = 3 if self.config.rgb_only else 4
         self.unet = UNet2DConditionModel.from_pretrained(self.config.unet_pretrained_path, subfolder="unet",
                                                          in_channels=unet_in_channels,
-                                                         out_channels=3 if self.config.rgb_only else 4,
+                                                         out_channels=unet_out_channels,
                                                          low_cpu_mem_usage=False,
                                                          ignore_mismatched_sizes=True,
-                                                         encoder_hid_dim=768 if self.config.image_crossattn == "unet-replace" else unet_base.config.encoder_hid_dim,
-                                                         )
+                                                         encoder_hid_dim=encoder_hid_dim)
         old_state = unet_base.state_dict()
         new_state = self.unet.state_dict()
         in_key = "conv_in.weight"
@@ -181,7 +192,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {"fields": list(self.unet.parameters())}
-        if self.config.image_crossattn != "unet-replace":
+        if self.config.image_crossattn == "clip-expand" or self.config.image_crossattn == "clip-replace":
             param_groups["fields"] += list(self.image_encoder.visual_projection.parameters())
 
         return param_groups
@@ -231,8 +242,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
         cx = cameras.cx.view(w2cs.shape[0], 1)
         cy = cameras.cy.view(w2cs.shape[0], 1)
 
-        image_dim = self.config.image_dim_project \
-            if (not self.config.use_points and self.config.image_dim_project is not None) else self.config.image_dim
+        image_dim = self.config.image_dim
         if camera_dim != image_dim:
             scale_factor = image_dim / camera_dim
             camera_dim = image_dim
@@ -267,11 +277,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                 bg_colors,
             )
 
-            if self.config.image_dim_project is not None:
-                for key in rendering:
-                    rendering[key] = F.interpolate(rendering[key].permute(0, 3, 1, 2), self.config.image_dim,
-                                                   mode="bicubic", antialias=True).permute(0, 2, 3, 1)
-
         concat_list = [self.encode_rgbd(rendering[RGB],
                                         rendering[DEPTH] if not self.config.rgb_only else None, depth_scaling_factor),
                        rendering[ACCUMULATION].permute(0, 3, 1, 2)]
@@ -298,9 +303,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             depth_map = existing_depth.view(-1).clone()
 
         with torch.cuda.amp.autocast(enabled=False):
-            # pts3d = c2ws.reshape(-1, 4, 4) @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(
-            #     1, 2)
-
             pts3d_cam_render = w2cs @ torch.cat([pts3d, torch.ones_like(pts3d[..., :1])], -1).transpose(1, 2)
             pts3d_cam_render = pts3d_cam_render.transpose(1, 2)[..., :3]
             z_pos = pts3d_cam_render[..., 2]
@@ -339,38 +341,58 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                 ACCUMULATION: acc_map.float(),
             }
 
+    def not_in_existing_predictions(self, w2cs: torch.Tensor, pts3d: torch.Tensor, fx: torch.Tensor,
+                                    fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                                    existing_depth: torch.Tensor) -> torch.Tensor:
+        image_dim = self.config.image_dim
+
+        depth_map = existing_depth.view(-1).clone()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            pts3d_cam_render = w2cs @ torch.cat([pts3d, torch.ones_like(pts3d[..., :1])], -1).transpose(1, 2)
+            pts3d_cam_render = pts3d_cam_render.transpose(1, 2)[..., :3]
+            z_pos = pts3d_cam_render[..., 2]
+
+            uv = pts3d_cam_render[:, :, :2] / pts3d_cam_render[:, :, 2:]
+            focal = torch.cat([fx.view(-1, 1), fy.view(-1, 1)], -1)
+            uv *= focal.unsqueeze(1)
+            center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
+            uv += center.unsqueeze(1)
+
+            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim - 1)
+            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim - 1)
+            is_valid_z = z_pos > 0
+            is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
+
+            max_val = torch.finfo(torch.float32).max
+            u = torch.round(uv[..., 0]).long().clamp(0, image_dim - 1)
+            v = torch.round(uv[..., 1]).long().clamp(0, image_dim - 1)
+            z = torch.where(is_valid_point, z_pos, max_val)
+            camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
+
+            indices = (camera_index * image_dim * image_dim + v * image_dim + u).view(-1)
+            _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
+            depth_map = depth_map.view(w2cs.shape[0], image_dim, image_dim, 1)
+
+            return (depth_map >= existing_depth).min(dim=0, keepdim=True)[0]
+
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         outputs = {}
         images = cameras.metadata["image"]
-        cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
 
-        input_dim = cameras.width[0, 0].item()
         bg_colors = cameras.metadata.get(BG_COLOR, None)
 
         if PTS3D in cameras.metadata:
             clip_rgbs = (images[:, 1:] if self.training else images[:, -1:]).permute(0, 1, 4, 2, 3)
             pts3d = cameras.metadata[PTS3D]
             depth = cameras.metadata[DEPTH]
-            fg_masks = cameras.metadata.get(FG_MASK, None)
-            rgbs_to_project = images
-            project_dim = input_dim
-            project_scale_factor = 1
+            fg_masks = cameras.metadata.get(FG_MASK, torch.ones_like(pts3d[..., :1]))
         else:
             rgbs_chw = images.permute(0, 1, 4, 2, 3)
             clip_rgbs = (rgbs_chw[:, 1:] if self.training else rgbs_chw[:, -1:])
-            project_dim = 224
-
-            with torch.inference_mode():
-                rgbs_to_project_chw = self.dust3r_resize(rgbs_chw.flatten(0, 1)).clamp(0, 1)
-                rgbs_to_project_chw = rgbs_to_project_chw.view(cameras.shape[0], -1, *rgbs_to_project_chw.shape[1:])
-
-            rgbs_to_project = rgbs_to_project_chw.permute(0, 1, 3, 4, 2)
 
             if FG_MASK in cameras.metadata:
                 fg_masks = cameras.metadata[FG_MASK]
-                with torch.inference_mode():
-                    fg_masks = self.dust3r_resize(fg_masks.flatten(0, 1).unsqueeze(1).float()).squeeze(1).bool()
-                    fg_masks = fg_masks.view(cameras.shape[0], -1, *fg_masks.shape[1:])
             else:
                 fg_masks = None
 
@@ -379,32 +401,30 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             c2ws_opencv[:, :, :3] = cameras.camera_to_worlds
             c2ws_opencv[:, :, :, 1:3] *= -1  # opengl to opencv
 
-            project_scale_factor = 224 / input_dim
-            fx = cameras.fx * project_scale_factor
-            fy = cameras.fy * project_scale_factor
-            cx = cameras.cx * project_scale_factor
-            cy = cameras.cy * project_scale_factor
+            pts3d, depth, alignment_loss, valid_alignment, confs = self.dust3r_field.get_pts3d_and_depth(
+                rgbs_chw, fg_masks, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
 
-            pts3d, depth, alignment_loss, valid_alignment = self.dust3r_field.get_pts3d_and_depth(
-                rgbs_to_project_chw, fg_masks, c2ws_opencv, fx, fy, cx, cy)
+            depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
 
-            depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_to_project_chw.shape[3:])
+            conf_mask = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+            fg_masks = torch.logical_and(fg_masks, conf_mask) if fg_masks is not None else conf_mask
             pts3d = pts3d.view(*cameras.shape[:2], *pts3d.shape[1:])
 
             if self.training:
-                max_camera_depth = depth[:, 0].flatten(1, 2).max(dim=-1)[0]
-                valid_alignment = torch.logical_and(valid_alignment, max_camera_depth > 0)
+                camera_scaling_factor = self.get_depth_scaling_factor(depth[:, 0].view(
+                    cameras.shape[0], -1)).view(cameras.shape[0], -1).max(dim=-1)[0]
+                valid_alignment = torch.logical_and(valid_alignment, camera_scaling_factor > 0)
 
                 if valid_alignment.any():
+                    cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
                     cameras = cameras[valid_alignment]
                     images = images[valid_alignment]
                     pts3d = pts3d[valid_alignment]
                     depth = depth[valid_alignment]
-                    rgbs_to_project = rgbs_to_project[valid_alignment]
                     clip_rgbs = clip_rgbs[valid_alignment]
+                    fg_masks = fg_masks[valid_alignment]
 
-                    if fg_masks is not None:
-                        fg_masks = fg_masks[valid_alignment]
+                    if bg_colors is not None:
                         bg_colors = bg_colors[valid_alignment]
 
             outputs[ALIGNMENT_LOSS] = alignment_loss
@@ -412,16 +432,20 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
 
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))
 
-        # Get CLIP embeddings for cross attention
-        c_crossattn = self.image_encoder(
-            self.clip_normalize(self.clip_resize(clip_rgbs.flatten(0, 1)).clamp(0, 1))).image_embeds
-        c_crossattn = c_crossattn.view(cameras.shape[0], clip_rgbs.shape[1], c_crossattn.shape[-1])
+        if self.config.image_crossattn == "none":
+            c_crossattn = torch.zeros(cameras.shape[0], 1, 1280, device=cameras.device)
+        else:
+            # Get CLIP embeddings for cross attention
+            c_crossattn = self.image_encoder(
+                self.clip_normalize(self.clip_resize(clip_rgbs.flatten(0, 1)).clamp(0, 1))).image_embeds
+            c_crossattn = c_crossattn.view(cameras.shape[0], clip_rgbs.shape[1], c_crossattn.shape[-1])
 
         to_project = cameras[:, 1:] if self.training else cameras[:, -1:]
         if self.config.scale_with_pixel_area:
-            scale_mult = self.get_pixel_area_scale_mult(to_project.flatten(), project_dim).view(*to_project.shape, -1)
+            scale_mult = self.get_pixel_area_scale_mult(to_project.flatten(),
+                                                        cameras.width[0, 0].item()).view(*to_project.shape, -1)
         else:
-            scale_mult = 1 / (to_project.fx * project_scale_factor)
+            scale_mult = 1 / to_project.fx
 
         if self.training:
             timesteps = torch.randint(0, self.ddpm_scheduler.config.num_train_timesteps, (cameras.shape[0],),
@@ -472,17 +496,13 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                 target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :1]).squeeze(1)
 
                 cond_pts3d = pts3d[:, 1:]
-                scales = depth[:, 1:].flatten(-2, -1) * scale_mult
-                opacity = fg_masks[:, 1:].view(pts3d[..., :1].shape).float() if fg_masks is not None \
-                    else torch.ones_like(cond_pts3d[..., :1])
-
                 c_concat, _ = self.get_concat(
                     target_w2cs_opencv,
                     cameras[:, 0],
                     cond_pts3d,
-                    scales,
-                    opacity,
-                    rgbs_to_project[:, 1:],
+                    depth[:, 1:].flatten(-2, -1) * scale_mult,
+                    fg_masks[:, 1:].view(cond_pts3d[..., :1].shape).float(),
+                    images[:, 1:],
                     1,
                     bg_colors,
                     depth_scaling_factor
@@ -495,6 +515,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                                   random_mask < 3 * self.config.uncond)).float().unsqueeze(-1)
 
             c_crossattn = torch.where(prompt_mask, 0, c_crossattn)
+
             c_concat = input_mask * c_concat
 
             noise = torch.randn_like(input_gt)
@@ -515,6 +536,9 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             outputs["model_output"] = model_output
 
             if not torch.isfinite(outputs["model_output"]).all():
+                torch.save([outputs, images, depth, input_gt, image_gt, depth_gt, depth_scaling_factor, noisy_input_gt,
+                            c_concat, c_crossattn, timesteps],
+                           "/scratch/hturki/nan-debug.pt")
                 import pdb;
                 pdb.set_trace()
         else:
@@ -532,10 +556,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             target_c2ws_opencv[:, :3] = cameras.camera_to_worlds[0, :-1]
             target_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
             decode_scale_factor = self.config.image_dim / cameras.width[0, 0].item()
-            focals_for_decode = torch.cat([cameras.fx[:, :-1].view(-1, 1), cameras.fy[:, :-1].view(-1, 1)],
-                                          -1) * decode_scale_factor
-            pp_for_decode = torch.cat([cameras.cx[:, :-1].view(-1, 1), cameras.cy[:, :-1].view(-1, 1)],
-                                      -1) * decode_scale_factor
+            focals_for_decode = torch.cat([cameras.fx.view(-1, 1), cameras.fy.view(-1, 1)], -1) * decode_scale_factor
+            pp_for_decode = torch.cat([cameras.cx.view(-1, 1), cameras.cy.view(-1, 1)], -1) * decode_scale_factor
 
             if self.config.scale_with_pixel_area:
                 decode_scale_mult = self.get_pixel_area_scale_mult(
@@ -560,10 +582,18 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             concat_depth = []
             concat_acc = []
             cond_pts3d = pts3d[:, -1:]
-            opacity = fg_masks[:, -1:].view(pts3d[..., -1:].shape).float() if fg_masks is not None \
-                else torch.ones_like(cond_pts3d[..., :1])
+            opacity = fg_masks[:, -1:].view(cond_pts3d[..., :1].shape).float()
             scales = depth[:, -1:].flatten(-2, -1) * scale_mult
-            cond_rgbs = rgbs_to_project[:, -1:].view(1, -1, 3)
+            cond_rgbs = images[:, -1:].view(1, -1, 3)
+
+            rendered_w2cs = [self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, -1:]).squeeze(0)]
+
+            is_valid = fg_masks[:, -1:]
+            if is_valid.shape[-1] != self.config.image_dim:
+                with torch.inference_mode():
+                    is_valid = self.unet_resize(is_valid.float()).bool()
+
+            rendered_depths = [torch.where(is_valid.view(outputs[DEPTH_GT][-1:].shape), outputs[DEPTH_GT][-1:], 0)]
 
             if self.config.is_upscaler:
                 to_upscale_rgb = images[0, :-1]
@@ -597,7 +627,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             try:
                 if self.config.guidance_scale > 1:
                     c_crossattn = torch.cat([torch.zeros_like(c_crossattn), c_crossattn])
-
                 while len(sample_order) < target_w2cs_opencv.shape[0]:
                     c_concat, rendering = self.get_concat(
                         target_w2cs_opencv,
@@ -709,7 +738,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
 
                         sample = torch.cat([sample_rgb, sample_depth], dim=1)
 
-                    sample_order.append(cur_render)
                     pred_rgb, pred_depth = self.decode_rgbd(sample, depth_scaling_factor)
                     samples_rgb.append(pred_rgb)
 
@@ -720,13 +748,25 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                                                          self.pixels,
                                                          focals_for_decode[cur_render:cur_render + 1],
                                                          pp_for_decode[cur_render:cur_render + 1]).unsqueeze(0)
+                        focal_indices = torch.LongTensor([target_w2cs_opencv.shape[0] - 1] + sample_order).to(
+                            pred_pts3d.device)
+                        valid_points = self.not_in_existing_predictions(
+                            torch.cat(rendered_w2cs), pred_pts3d.squeeze(0).expand(len(rendered_w2cs), -1, -1),
+                            focals_for_decode[focal_indices, :1], focals_for_decode[focal_indices, 1:],
+                            pp_for_decode[focal_indices, :1], pp_for_decode[focal_indices, 1:],
+                            torch.cat(rendered_depths))
 
-                        cond_pts3d = torch.cat([cond_pts3d, pred_pts3d], -2)
-                        scales = torch.cat(
-                            [scales, pred_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]],
-                            -1)
-                        opacity = torch.cat([opacity, torch.ones_like(pred_pts3d[..., :1])], -2)
-                        cond_rgbs = torch.cat([cond_rgbs, pred_rgb.view(1, -1, 3)], 1)
+                        valid_new_pts3d = pred_pts3d[valid_points.view(pred_pts3d[..., 0].shape)].view(1, 1, -1, 3)
+                        cond_pts3d = torch.cat([cond_pts3d, valid_new_pts3d], -2)
+                        new_scales = pred_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]
+                        scales = torch.cat([scales, new_scales[valid_points.view(1, 1, -1)].view(1, 1, -1)], -1)
+                        opacity = torch.cat([opacity, torch.ones_like(valid_new_pts3d[..., :1])], -2)
+                        cond_rgbs = torch.cat(
+                            [cond_rgbs, pred_rgb[valid_points.view(pred_rgb[..., 0].shape)].view(1, -1, 3)], 1)
+                        rendered_w2cs.append(target_c2ws_opencv[cur_render:cur_render + 1])
+                        rendered_depths.append(torch.where(valid_points, pred_depth, 0))
+
+                    sample_order.append(cur_render)
             finally:
                 if self.config.use_ema:
                     self.ema_unet.restore(self.unet.parameters())

@@ -44,6 +44,7 @@ class RGBDDiffusionIFConfig(RGBDDiffusionBaseConfig):
     depth_mapping: Literal["scaled", "disparity", "log"] = "scaled"
 
     is_upscaler: bool = False
+    custom_upscale: bool = False
     upscaler_noise_level: int = 250
 
 
@@ -55,12 +56,13 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
         super().populate_modules()
 
         if self.config.is_upscaler:
-            assert self.config.unet_pretrained_path == "DeepFloyd/IF-II-L-v1.0", self.config.unet_pretrained_path
+            assert self.config.unet_pretrained_path == "DeepFloyd/IF-II-L-v1.0" or self.config.unet_pretrained_path == "DeepFloyd/IF-II-M-v1.0", self.config.unet_pretrained_path
             assert self.config.image_dim == 256, self.config.image_dim
-            self.image_noising_scheduler = DDPMScheduler.from_pretrained(self.config.unet_pretrained_path,
-                                                                         subfolder="image_noising_scheduler",
-                                                                         beta_schedule=self.config.beta_schedule,
-                                                                         prediction_type=self.config.prediction_type)
+            if not self.config.custom_upscale:
+                self.image_noising_scheduler = DDPMScheduler.from_pretrained(self.config.unet_pretrained_path,
+                                                                             subfolder="image_noising_scheduler",
+                                                                             beta_schedule=self.config.beta_schedule,
+                                                                             prediction_type=self.config.prediction_type)
             self.unet_resize_downscaled = transforms.Resize(
                 (self.config.image_dim // 4, self.config.image_dim // 4),
                 interpolation=transforms.InterpolationMode.BICUBIC,
@@ -118,7 +120,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             raise Exception(self.config.image_crossattn)
 
         # 4 for noise + 4 for RGBD cond + 1 for accumulation
-        unet_in_channels = 4 + 4 + (0 if self.config.is_upscaler else 1)
+        unet_in_channels = 4 + 4 + (0 if self.config.is_upscaler else 1) + (5 if self.config.custom_upscale else 0)
         unet_out_channels = 3 if self.config.rgb_only else 4
         self.unet = UNet2DConditionModel.from_pretrained(self.config.unet_pretrained_path, subfolder="unet",
                                                          in_channels=unet_in_channels,
@@ -135,8 +137,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             if self.config.is_upscaler:
                 new_state[in_key][:, :old_state[in_key].shape[1] // 2, :, :].copy_(
                     old_state[in_key][:, :old_state[in_key].shape[1] // 2, :, :])
-                new_state[in_key][:, old_state[in_key].shape[1] // 2 + 1:-1, :, :].copy_(
-                    old_state[in_key][:, old_state[in_key].shape[1] // 2:, :, :])
+                new_state[in_key][:, old_state[in_key].shape[1] // 2 + 1:old_state[in_key].shape[1] // 2 + 4, :,
+                :].copy_(old_state[in_key][:, old_state[in_key].shape[1] // 2:, :, :])
             else:
                 new_state[in_key][:, :old_state[in_key].shape[1], :, :].copy_(old_state[in_key])
 
@@ -313,8 +315,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
             uv += center.unsqueeze(1)
 
-            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim - 1)
-            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim - 1)
+            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim)
+            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim)
             is_valid_z = z_pos > 0
             is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
 
@@ -345,7 +347,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                                     fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
                                     existing_depth: torch.Tensor) -> torch.Tensor:
         image_dim = self.config.image_dim
-
         depth_map = existing_depth.view(-1).clone()
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -359,8 +360,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
             uv += center.unsqueeze(1)
 
-            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim - 1)
-            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim - 1)
+            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim)
+            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim)
             is_valid_z = z_pos > 0
             is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
 
@@ -369,7 +370,6 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             v = torch.round(uv[..., 1]).long().clamp(0, image_dim - 1)
             z = torch.where(is_valid_point, z_pos, max_val)
             camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
-
             indices = (camera_index * image_dim * image_dim + v * image_dim + u).view(-1)
             _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
             depth_map = depth_map.view(w2cs.shape[0], image_dim, image_dim, 1)
@@ -379,22 +379,22 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         outputs = {}
         images = cameras.metadata["image"]
-
+        pts3d = cameras.metadata.get(PTS3D, None)
+        depth = cameras.metadata.get(DEPTH, None)
+        fg_masks = cameras.metadata.get(FG_MASK, None)
         bg_colors = cameras.metadata.get(BG_COLOR, None)
 
-        if PTS3D in cameras.metadata:
+        cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
+
+        if pts3d is not None:
             clip_rgbs = (images[:, 1:] if self.training else images[:, -1:]).permute(0, 1, 4, 2, 3)
-            pts3d = cameras.metadata[PTS3D]
-            depth = cameras.metadata[DEPTH]
-            fg_masks = cameras.metadata.get(FG_MASK, torch.ones_like(pts3d[..., :1]))
+            if fg_masks is None:
+                fg_masks = torch.ones_like(pts3d[..., :1])
+
+            valid_alignment = torch.ones(cameras.shape[0], dtype=torch.bool, device=cameras.device)
         else:
             rgbs_chw = images.permute(0, 1, 4, 2, 3)
             clip_rgbs = (rgbs_chw[:, 1:] if self.training else rgbs_chw[:, -1:])
-
-            if FG_MASK in cameras.metadata:
-                fg_masks = cameras.metadata[FG_MASK]
-            else:
-                fg_masks = None
 
             c2ws_opencv = torch.eye(4, device=cameras.device).view(1, 1, 4, 4).repeat(cameras.shape[0],
                                                                                       cameras.shape[1], 1, 1)
@@ -404,33 +404,32 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             pts3d, depth, alignment_loss, valid_alignment, confs = self.dust3r_field.get_pts3d_and_depth(
                 rgbs_chw, fg_masks, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
 
+            outputs[ALIGNMENT_LOSS] = alignment_loss
+            outputs[VALID_ALIGNMENT] = valid_alignment.float().mean()
+
             depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
 
             conf_mask = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
             fg_masks = torch.logical_and(fg_masks, conf_mask) if fg_masks is not None else conf_mask
             pts3d = pts3d.view(*cameras.shape[:2], *pts3d.shape[1:])
 
-            if self.training:
-                camera_scaling_factor = self.get_depth_scaling_factor(depth[:, 0].view(
-                    cameras.shape[0], -1)).view(cameras.shape[0], -1).max(dim=-1)[0]
-                valid_alignment = torch.logical_and(valid_alignment, camera_scaling_factor > 0)
-
-                if valid_alignment.any():
-                    cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
-                    cameras = cameras[valid_alignment]
-                    images = images[valid_alignment]
-                    pts3d = pts3d[valid_alignment]
-                    depth = depth[valid_alignment]
-                    clip_rgbs = clip_rgbs[valid_alignment]
-                    fg_masks = fg_masks[valid_alignment]
-
-                    if bg_colors is not None:
-                        bg_colors = bg_colors[valid_alignment]
-
-            outputs[ALIGNMENT_LOSS] = alignment_loss
-            outputs[VALID_ALIGNMENT] = valid_alignment.float().mean()
-
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))
+
+        if self.training:
+            valid_alignment = torch.logical_and(valid_alignment,
+                                                depth_scaling_factor.view(cameras.shape[0], -1).max(dim=-1)[0] > 0)
+
+            if valid_alignment.any():
+                cameras = cameras[valid_alignment]
+                images = images[valid_alignment]
+                pts3d = pts3d[valid_alignment]
+                depth = depth[valid_alignment]
+                clip_rgbs = clip_rgbs[valid_alignment]
+                fg_masks = fg_masks[valid_alignment]
+                depth_scaling_factor = depth_scaling_factor[valid_alignment]
+
+                if bg_colors is not None:
+                    bg_colors = bg_colors[valid_alignment]
 
         if self.config.image_crossattn == "none":
             c_crossattn = torch.zeros(cameras.shape[0], 1, 1280, device=cameras.device)
@@ -491,7 +490,24 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                     c_concat = self.unet_resize(
                         self.encode_rgbd(to_upscale_rgb, to_upscale_depth, depth_scaling_factor))
 
-                c_concat = self.ddpm_scheduler.add_noise(c_concat, noise, timesteps)
+                if self.config.custom_upscale:
+                    target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :1]).squeeze(1)
+
+                    cond_pts3d = pts3d[:, 1:]
+                    c_concat_2, _ = self.get_concat(
+                        target_w2cs_opencv,
+                        cameras[:, 0],
+                        cond_pts3d,
+                        depth[:, 1:].flatten(-2, -1) * scale_mult,
+                        fg_masks[:, 1:].view(cond_pts3d[..., :1].shape).float(),
+                        images[:, 1:],
+                        1,
+                        bg_colors,
+                        depth_scaling_factor
+                    )
+                    c_concat = torch.cat([c_concat, c_concat_2], dim=1)
+                else:
+                    c_concat = self.ddpm_scheduler.add_noise(c_concat, noise, timesteps)
             else:
                 target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :1]).squeeze(1)
 
@@ -520,9 +536,11 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
 
             noise = torch.randn_like(input_gt)
             noisy_input_gt = self.ddpm_scheduler.add_noise(input_gt, noise, timesteps)
-            model_output = self.unet(torch.cat([noisy_input_gt, c_concat], 1), timesteps,
-                                     c_crossattn, class_labels=timesteps if self.config.is_upscaler else None,
-                                     return_dict=False)[0]
+            model_output = self.unet(
+                torch.cat([noisy_input_gt, c_concat], 1), timesteps,
+                c_crossattn,
+                class_labels=timesteps if self.config.is_upscaler else None,
+                return_dict=False)[0]
 
             if self.ddpm_scheduler.config.prediction_type == "epsilon":
                 outputs["target"] = noise
@@ -586,14 +604,14 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             scales = depth[:, -1:].flatten(-2, -1) * scale_mult
             cond_rgbs = images[:, -1:].view(1, -1, 3)
 
-            rendered_w2cs = [self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, -1:]).squeeze(0)]
-
-            is_valid = fg_masks[:, -1:]
-            if is_valid.shape[-1] != self.config.image_dim:
-                with torch.inference_mode():
-                    is_valid = self.unet_resize(is_valid.float()).bool()
-
-            rendered_depths = [torch.where(is_valid.view(outputs[DEPTH_GT][-1:].shape), outputs[DEPTH_GT][-1:], 0)]
+            # rendered_w2cs = [self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, -1:]).squeeze(0)]
+            #
+            # is_valid = fg_masks[:, -1:]
+            # if is_valid.shape[-1] != self.config.image_dim:
+            #     with torch.inference_mode():
+            #         is_valid = self.unet_resize(is_valid.float()) > 0
+            #
+            # rendered_depths = [torch.where(is_valid.view(outputs[DEPTH_GT][-1:].shape), outputs[DEPTH_GT][-1:], 0)]
 
             if self.config.is_upscaler:
                 to_upscale_rgb = images[0, :-1]
@@ -615,10 +633,11 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                     upscaled = self.unet_resize(
                         self.encode_rgbd(to_upscale_rgb, to_upscale_depth, depth_scaling_factor))
 
-                noise_level = torch.tensor([self.config.upscaler_noise_level] * upscaled.shape[0],
-                                           device=upscaled.device)
-                upscaled_noise = randn_tensor(upscaled.shape, device=upscaled.device, dtype=upscaled.dtype)
-                upscaled = self.image_noising_scheduler.add_noise(upscaled, upscaled_noise, timesteps=noise_level)
+                if not self.config.custom_upscale:
+                    noise_level = torch.tensor([self.config.upscaler_noise_level] * upscaled.shape[0],
+                                               device=upscaled.device)
+                    upscaled_noise = randn_tensor(upscaled.shape, device=upscaled.device, dtype=upscaled.dtype)
+                    upscaled = self.image_noising_scheduler.add_noise(upscaled, upscaled_noise, timesteps=noise_level)
 
             if self.config.use_ema:
                 self.ema_unet.to(self.device)
@@ -628,7 +647,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                 if self.config.guidance_scale > 1:
                     c_crossattn = torch.cat([torch.zeros_like(c_crossattn), c_crossattn])
                 while len(sample_order) < target_w2cs_opencv.shape[0]:
-                    c_concat, rendering = self.get_concat(
+                    projected_concat, rendering = self.get_concat(
                         target_w2cs_opencv,
                         cameras[0, :-1],
                         cond_pts3d,
@@ -650,8 +669,13 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                     for already_rendered in sample_order:
                         acc_sums[already_rendered] = -1
                     cur_render = acc_sums.argmax()
-                    c_concat = upscaled[cur_render:cur_render + 1] if self.config.is_upscaler \
-                        else c_concat[cur_render:cur_render + 1]
+
+                    if self.config.is_upscaler:
+                        c_concat = upscaled[cur_render:cur_render + 1]
+                        if self.config.custom_upscale:
+                            c_concat = torch.cat([c_concat, projected_concat[cur_render:cur_render + 1]], 1)
+                    else:
+                        c_concat = projected_concat[cur_render:cur_render + 1]
 
                     sample = scheduler.init_noise_sigma * randn_tensor((1, 3 if self.config.rgb_only else 4,
                                                                         self.config.image_dim, self.config.image_dim),
@@ -667,7 +691,8 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                         model_input = torch.cat([model_input, c_concat], dim=1)
 
                         if self.config.is_upscaler:
-                            class_labels = noise_level[cur_render:cur_render + 1]
+                            class_labels = torch.tensor([t], device=model_input.device) \
+                                if self.config.custom_upscale else noise_level[cur_render:cur_render + 1]
                             if self.config.guidance_scale > 1:
                                 class_labels = torch.cat([class_labels, class_labels])
                         else:
@@ -748,23 +773,30 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
                                                          self.pixels,
                                                          focals_for_decode[cur_render:cur_render + 1],
                                                          pp_for_decode[cur_render:cur_render + 1]).unsqueeze(0)
-                        focal_indices = torch.LongTensor([target_w2cs_opencv.shape[0] - 1] + sample_order).to(
-                            pred_pts3d.device)
-                        valid_points = self.not_in_existing_predictions(
-                            torch.cat(rendered_w2cs), pred_pts3d.squeeze(0).expand(len(rendered_w2cs), -1, -1),
-                            focals_for_decode[focal_indices, :1], focals_for_decode[focal_indices, 1:],
-                            pp_for_decode[focal_indices, :1], pp_for_decode[focal_indices, 1:],
-                            torch.cat(rendered_depths))
+                        cond_pts3d = torch.cat([cond_pts3d, pred_pts3d], -2)
+                        scales = torch.cat(
+                            [scales, pred_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]],
+                            -1)
+                        opacity = torch.cat([opacity, torch.ones_like(pred_pts3d[..., :1])], -2)
+                        cond_rgbs = torch.cat([cond_rgbs, pred_rgb.view(1, -1, 3)], 1)
 
-                        valid_new_pts3d = pred_pts3d[valid_points.view(pred_pts3d[..., 0].shape)].view(1, 1, -1, 3)
-                        cond_pts3d = torch.cat([cond_pts3d, valid_new_pts3d], -2)
-                        new_scales = pred_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]
-                        scales = torch.cat([scales, new_scales[valid_points.view(1, 1, -1)].view(1, 1, -1)], -1)
-                        opacity = torch.cat([opacity, torch.ones_like(valid_new_pts3d[..., :1])], -2)
-                        cond_rgbs = torch.cat(
-                            [cond_rgbs, pred_rgb[valid_points.view(pred_rgb[..., 0].shape)].view(1, -1, 3)], 1)
-                        rendered_w2cs.append(target_c2ws_opencv[cur_render:cur_render + 1])
-                        rendered_depths.append(torch.where(valid_points, pred_depth, 0))
+                        # focal_indices = torch.LongTensor([target_w2cs_opencv.shape[0] - 1] + sample_order).to(
+                        #     pred_pts3d.device)
+                        # valid_points = self.not_in_existing_predictions(
+                        #     torch.cat(rendered_w2cs), pred_pts3d.squeeze(0).expand(len(rendered_w2cs), -1, -1),
+                        #     focals_for_decode[focal_indices, :1], focals_for_decode[focal_indices, 1:],
+                        #     pp_for_decode[focal_indices, :1], pp_for_decode[focal_indices, 1:],
+                        #     torch.cat(rendered_depths))
+                        #
+                        # valid_new_pts3d = pred_pts3d[valid_points.view(pred_pts3d[..., 0].shape)].view(1, 1, -1, 3)
+                        # cond_pts3d = torch.cat([cond_pts3d, valid_new_pts3d], -2)
+                        # new_scales = pred_depth.view(1, 1, -1) * decode_scale_mult[:, cur_render:cur_render + 1]
+                        # scales = torch.cat([scales, new_scales[valid_points.view(1, 1, -1)].view(1, 1, -1)], -1)
+                        # opacity = torch.cat([opacity, torch.ones_like(valid_new_pts3d[..., :1])], -2)
+                        # cond_rgbs = torch.cat(
+                        #     [cond_rgbs, pred_rgb[valid_points.view(pred_rgb[..., 0].shape)].view(1, -1, 3)], 1)
+                        # rendered_w2cs.append(target_c2ws_opencv[cur_render:cur_render + 1])
+                        # rendered_depths.append(torch.where(valid_points, pred_depth, 0))
 
                     sample_order.append(cur_render)
             finally:

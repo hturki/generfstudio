@@ -33,8 +33,6 @@ disable = [
 include = ["extern*", "generfstudio*"]
 
 [project.entry-points."nerfstudio.method_configs"]
-nerfacto_sds = "generfstudio.generfstudio_method_config:nerfacto_sds_method"
-splatfacto_sds = "generfstudio.generfstudio_method_config:splatfacto_sds_method"
 depth_gaussians = "generfstudio.generfstudio_method_config:depth_gaussians_method"
 pixelnerf = "generfstudio.generfstudio_method_config:pixelnerf_method"
 rgbd_diffusion = "generfstudio.generfstudio_method_config:rgbd_diffusion_method"
@@ -43,13 +41,14 @@ rgbd_diffusion_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_ddp
 rgbd_diffusion_union_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_union_ddp_method"
 rgbd_diffusion_if = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_method"
 rgbd_diffusion_if_union = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_union_method"
-rgbd_diffusion_if_union_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_union_ddp_method"]
+rgbd_diffusion_if_union_ddp = "generfstudio.generfstudio_method_config:rgbd_diffusion_if_union_ddp_method"
 
 [project.entry-points."nerfstudio.dataparser_configs"]
 co3d-data = "generfstudio.generfstudio_data_config:co3d_dataparser"
 dl3dv-data = "generfstudio.generfstudio_data_config:dl3dv_dataparser"
+dp-data = "generfstudio.generfstudio_data_config:depth_providing_dataparser"
 dtu-data = "generfstudio.generfstudio_data_config:dtu_dataparser"
+m360-data = "generfstudio.generfstudio_data_config:mipnerf_dataparser"
 mvimgnet-data = "generfstudio.generfstudio_data_config:mvimgnet_dataparser"
 oxl-data = "generfstudio.generfstudio_data_config:oxl_dataparser"
 r10k-data = "generfstudio.generfstudio_data_config:r10k_dataparser"
-sds-data = "generfstudio.generfstudio_data_config:sds_dataparser"

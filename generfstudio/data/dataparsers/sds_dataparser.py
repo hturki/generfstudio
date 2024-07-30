@@ -10,16 +10,17 @@ import torch
 from PIL import Image
 
 from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
+from generfstudio.data.dataparsers.mipnerf_dataparser import MipNerf360DataParserConfig
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 
-try:
-    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-    from dust3r.image_pairs import make_pairs
-    from dust3r.inference import inference
-    from dust3r.utils.image import load_images
-    from dust3r.model import AsymmetricCroCo3DStereo
-except:
-    pass
+# try:
+#     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+#     from dust3r.image_pairs import make_pairs
+#     from dust3r.inference import inference
+#     from dust3r.utils.image import load_images
+#     from dust3r.model import AsymmetricCroCo3DStereo
+# except:
+#     pass
 
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
@@ -31,8 +32,11 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 class SDSDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: SDS)
     """target class to instantiate"""
-    inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
-        scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117"))
+
+    inner: DataParserConfig = field(default_factory=lambda: MipNerf360DataParserConfig())
+
+    # inner: DataParserConfig = field(default_factory=lambda: DL3DVDataParserConfig(
+    #     scene_id="7K/ebbbe07e9e87e488553e470ec266d6a2c967b891294cab928938a69055cac117"))
         # scene_id="1K/006771db3c057280f9277e735be6daa24339657ce999216c38da68002a443fed"))
     # scene_id="4K/ac41bb001ee989c3c0237341aa37f9f985e3e55b03cc70089ebffd938063bcdb"))
     """inner dataparser"""

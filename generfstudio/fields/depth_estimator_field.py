@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 from mast3r.model import AsymmetricMASt3R
-# from dust3r.model import AsymmetricCroCo3DStereo
 from nerfstudio.utils import profiler
 from torch import nn
 from torch_scatter import scatter_max
@@ -10,22 +9,17 @@ from torch_scatter import scatter_max
 from generfstudio.fields.batched_pc_optimizer import GlobalPointCloudOptimizer
 
 
-class Dust3rField(nn.Module):
+class DepthEstimatorField(nn.Module):
 
     def __init__(
             self,
             model_name: str,
-            depth_precomputed: bool = False,
     ) -> None:
         super().__init__()
 
-        if not depth_precomputed:
-            self.model = AsymmetricMASt3R.from_pretrained(model_name)
-            # self.model = AsymmetricCroCo3DStereo.from_pretrained(model_name)
-            for p in self.model.parameters():
-                p.requires_grad_(False)
-        else:
-            self.model = None
+        self.model = AsymmetricMASt3R.from_pretrained(model_name)
+        for p in self.model.parameters():
+            p.requires_grad_(False)
 
     # Intrinsics should be passed for image size inferred by rgb
     @profiler.time_function

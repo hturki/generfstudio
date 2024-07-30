@@ -4,9 +4,10 @@ Generfstudio data configuration file.
 import faulthandler
 import signal
 
+from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
-from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
+from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManagerConfig, ParallelDataManager
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -18,12 +19,14 @@ from generfstudio.adamw_optimizer_config import AdamWOptimizerConfig
 from generfstudio.data.datamanagers.neighboring_views_datamanager import NeighboringViewsDatamanagerConfig, \
     NeighboringViewsDatamanager
 from generfstudio.data.datamanagers.union_datamanager import UnionDatamanagerConfig
+from generfstudio.data.datamanagers.updating_full_images_datamanager import UpdatingFullImageDatamanagerConfig
+from generfstudio.data.dataparsers.depth_providing_dataparser import DepthProvidingDataParserConfig
 from generfstudio.data.dataparsers.dl3dv_dataparser import DL3DVDataParserConfig
 from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
 from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 from generfstudio.data.datasets.masked_dataset import MaskedDataset
 from generfstudio.data.datasets.neighboring_views_dataset import NeighboringViewsDataset
-from generfstudio.models.nerfacto_sds import NerfactoSDSModelConfig
+from generfstudio.models.depth_gaussians import DepthGaussiansModelConfig
 from generfstudio.models.pixelnerf import PixelNeRFModelConfig
 from generfstudio.models.rgbd_diffusion import RGBDDiffusionConfig
 from generfstudio.models.rgbd_diffusion_if import RGBDDiffusionIFConfig
@@ -136,22 +139,16 @@ depth_gaussians_method = MethodSpecification(
         steps_per_save=2000,
         steps_per_eval_all_images=1000,
         max_num_iterations=30000,
-        # mixed_precision=True,
         mixed_precision=False,
-        # gradient_accumulation_steps={"camera_opt": 100},
         pipeline=VanillaPipelineConfig(
-            datamanager=FullImageDatamanagerConfig(
-                _target=FullImageDatamanager[MaskedDataset],
-                dataparser=SDSDataParserConfig(),
+            datamanager=UpdatingFullImageDatamanagerConfig(
+                dataparser=DepthProvidingDataParserConfig(),
                 cache_images_type="uint8",
             ),
-            model=SplatfactoSDSModelConfig(
-                random_init=True,
-                background_color="white"
-            ),
+            model=DepthGaussiansModelConfig(),
         ),
         optimizers={
-            "xyz": {
+            "means": {
                 "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=1.6e-6,
@@ -166,15 +163,21 @@ depth_gaussians_method = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
                 "scheduler": None,
             },
-            "opacity": {
+            "opacities": {
                 "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
                 "scheduler": None,
             },
-            "scaling": {
+            "scales": {
                 "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
                 "scheduler": None,
             },
-            "rotation": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+            "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+            "camera_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=5e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                ),
+            },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",

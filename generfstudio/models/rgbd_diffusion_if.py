@@ -28,7 +28,6 @@ class RGBDDiffusionIFConfig(RGBDDiffusionBaseConfig):
     _target: Type = field(default_factory=lambda: RGBDDiffusionIF)
 
     unet_pretrained_path: str = "DeepFloyd/IF-I-L-v1.0"
-    image_encoder_pretrained_path: str = "lambdalabs/sd-image-variations-diffusers"
 
     beta_schedule: str = "squaredcos_cap_v2"
     prediction_type: str = "epsilon"
@@ -190,7 +189,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
         if get_world_size() > 1:
             CONSOLE.log("Using sync batchnorm for DDP")
             self.unet = nn.SyncBatchNorm.convert_sync_batchnorm(self.unet)
-            self.dust3r_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.dust3r_field)
+            self.depth_estimator_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.depth_estimator_field)
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {"fields": list(self.unet.parameters())}
@@ -401,7 +400,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             c2ws_opencv[:, :, :3] = cameras.camera_to_worlds
             c2ws_opencv[:, :, :, 1:3] *= -1  # opengl to opencv
 
-            pts3d, depth, alignment_loss, valid_alignment, confs = self.dust3r_field.get_pts3d_and_depth(
+            pts3d, depth, alignment_loss, valid_alignment, confs = self.depth_estimator_field.get_pts3d_and_depth(
                 rgbs_chw, fg_masks, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
 
             outputs[ALIGNMENT_LOSS] = alignment_loss
@@ -893,7 +892,7 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
         return {}, images_dict
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
-        for key, val in self.dust3r_field.state_dict().items():
-            dict[f"dust3r_field.{key}"] = val
+        for key, val in self.depth_estimator_field.state_dict().items():
+            dict[f"depth_estimator_field.{key}"] = val
 
         super().load_state_dict(dict, **kwargs)

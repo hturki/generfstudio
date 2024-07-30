@@ -27,7 +27,6 @@ class RGBDDiffusionConfig(RGBDDiffusionBaseConfig):
 
     unet_pretrained_path: str = "Intel/ldm3d-4c"
     vae_pretrained_path: str = "Intel/ldm3d-4c"
-    image_encoder_pretrained_path: str = "lambdalabs/sd-image-variations-diffusers"
 
     beta_schedule: str = "scaled_linear"
 
@@ -55,7 +54,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
                                                          low_cpu_mem_usage=False,
                                                          ignore_mismatched_sizes=False)
 
-        concat_channels = 5  # RGBD or VAE + acc mask + features = 4 + 4 + 1 = 9
+        concat_channels = 5  # RGBD or VAE + acc mask = 4 + 1 = 5
         if self.config.rgbd_concat_strategy == "mean_std":
             concat_channels += 4
 
@@ -90,7 +89,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
         if get_world_size() > 1:
             CONSOLE.log("Using sync batchnorm for DDP")
             self.unet = nn.SyncBatchNorm.convert_sync_batchnorm(self.unet)
-            self.dust3r_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.dust3r_field)
+            self.depth_estimator_field = nn.SyncBatchNorm.convert_sync_batchnorm(self.depth_estimator_field)
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         return {"fields": list(self.unet.parameters())}
@@ -251,7 +250,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             cx = cameras.cx * project_scale_factor
             cy = cameras.cy * project_scale_factor
 
-            pts3d, depth, alignment_loss, valid_alignment = self.dust3r_field.get_pts3d_and_depth(
+            pts3d, depth, alignment_loss, valid_alignment = self.depth_estimator_field.get_pts3d_and_depth(
                 rgbs_to_project_chw, fg_masks, c2ws_opencv, fx, fy, cx, cy)
 
             depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_to_project_chw.shape[3:])
@@ -612,8 +611,8 @@ class RGBDDiffusion(RGBDDiffusionBase):
         return {}, images_dict
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
-        for key, val in self.dust3r_field.state_dict().items():
-            dict[f"dust3r_field.{key}"] = val
+        for key, val in self.depth_estimator_field.state_dict().items():
+            dict[f"depth_estimator_field.{key}"] = val
 
         for key, val in self.image_encoder.state_dict().items():
             dict[f"image_encoder.{key}"] = val

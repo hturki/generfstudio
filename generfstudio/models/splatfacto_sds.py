@@ -460,7 +460,7 @@ class SplatfactoSDSModel(Model):
                 if self.config.guidance_scale > 1 else inference_latents
             latent_model_input = self.ddim_scheduler.scale_model_input(latent_model_input, t)
             latent_model_input = torch.cat([latent_model_input, c_concat_inference], dim=1)
-            noise_pred = self.unet(
+            noise_pred = self.unet_1(
                 latent_model_input,
                 t,
                 c_crossattn_inference,

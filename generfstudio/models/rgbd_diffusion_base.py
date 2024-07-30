@@ -16,18 +16,20 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from torchvision.transforms import transforms
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
-from generfstudio.fields.dust3r_field import Dust3rField
+from generfstudio.fields.depth_estimator_field import DepthEstimatorField
 from generfstudio.generfstudio_constants import DEPTH, ACCUMULATION, RGB
 
 
 @dataclass
 class RGBDDiffusionBaseConfig(ModelConfig):
     # dust3r_model_name: str = "/data/hturki/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_224_linear.pth"
-    dust3r_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+    depth_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
     min_conf_thresh: float = 1.5
     uncond: float = 0.05
 
     unet_pretrained_path: str = "Intel/ldm3d-4c"
+    image_encoder_pretrained_path: str = "lambdalabs/sd-image-variations-diffusers"
+
     use_ddim: bool = True
     inference_steps: int = 50
     beta_schedule: str = "scaled_linear"
@@ -72,13 +74,8 @@ class RGBDDiffusionBase(Model):
                                                                 beta_schedule=self.config.beta_schedule,
                                                                 prediction_type=self.config.prediction_type)
 
-        self.dust3r_field = Dust3rField(model_name=self.config.dust3r_model_name,
-                                        depth_precomputed=self.depth_available)
-        self.dust3r_resize = transforms.Resize(
-            (224, 224),
-            interpolation=transforms.InterpolationMode.BICUBIC,
-            antialias=True,
-        )
+        if not self.depth_available:
+            self.depth_estimator_field = DepthEstimatorField(model_name=self.config.depth_model_name)
 
         # https://huggingface.co/lambdalabs/sd-image-variations-diffusers - apparently the image encoder
         # was trained without anti-aliasing
@@ -182,9 +179,10 @@ class RGBDDiffusionBase(Model):
         pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
         return pts3d.transpose(1, 2)[..., :3]
 
-    @profiler.time_function
+    @staticmethod
     @torch.cuda.amp.autocast(enabled=False)
-    def splat_gaussians(self, w2cs: torch.Tensor, fx: torch.Tensor, fy: torch.Tensor, cx: torch.Tensor,
+    @profiler.time_function
+    def splat_gaussians(w2cs: torch.Tensor, fx: torch.Tensor, fy: torch.Tensor, cx: torch.Tensor,
                         cy: torch.Tensor, xyz: torch.Tensor, scales: torch.Tensor, opacity: torch.Tensor,
                         rgbs: Optional[torch.Tensor], camera_dim: int, return_depth: bool, cameras_per_scene: int,
                         bg_colors: Optional[torch.Tensor]):
@@ -263,7 +261,7 @@ class RGBDDiffusionBase(Model):
 
         # state_dict = {}
         # for key, val in base_state_dict.items():
-        #     if "dust3r_field." in key:
+        #     if "depth_estimator_field." in key:
         #         print("SKIP", key)
         #         continue
         #     state_dict[key] = val

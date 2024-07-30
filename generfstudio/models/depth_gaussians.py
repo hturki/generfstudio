@@ -207,9 +207,9 @@ class DepthGaussiansModelConfig(ModelConfig):
     beta_schedule: str = "scaled_linear"  # "squaredcos_cap_v2"
     prediction_type: str = "epsilon"
 
-    guidance_scale: float = 8.0
+    guidance_scale: float = 2.0
     inference_steps: int = 50
-    render_batch_size: int = 4
+    render_batch_size: int = 8
 
     # rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
     depth_mapping: Literal["scaled", "disparity", "log"] = "disparity"  # "scaled"
@@ -1461,13 +1461,22 @@ class DepthGaussiansModel(Model):
         other_pts3d = torch.stack(other_pts3d).view(w2cs.shape[0], -1, 3)
 
         scales = []
+        opacities = []
+        ordering = torch.randperm(w2cs.shape[0])
         for i in range(w2cs.shape[0]):
             cur_scales = []
+            cur_opacities = []
             for j in range(w2cs.shape[0]):
                 if i != j:
                     cur_scales.append(depth[j].view(-1) * decode_scale_mult[j])
+                    if ordering[i] < ordering[j]:
+                        cur_opacities.append(torch.zeros_like(cur_scales[-1]))
+                    else:
+                        cur_opacities.append(torch.ones_like(cur_scales[-1]))
             scales.append(torch.cat(cur_scales))
+            opacities.append(torch.cat(cur_opacities))
         scales = torch.stack(scales).unsqueeze(-1)
+        opacities = torch.stack(opacities)
 
         rendering = RGBDDiffusionBase.splat_gaussians(
             w2cs,
@@ -1479,7 +1488,7 @@ class DepthGaussiansModel(Model):
             torch.cat([self.scales.exp().unsqueeze(0).expand(other_pts3d.shape[0], -1, -1), scales.expand(-1, -1, 3)],
                       1),
             torch.cat([torch.sigmoid(self.opacities).T.expand(other_pts3d.shape[0], -1),
-                       torch.full_like(scales[..., 0], opacity)], 1),
+                       opacities], 1),
             torch.cat([torch.sigmoid(self.features_dc).unsqueeze(0).expand(other_pts3d.shape[0], -1, -1), other_rgbs],
                       1),
             256,

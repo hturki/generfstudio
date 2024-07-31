@@ -31,6 +31,8 @@ import torch
 from diffusers import DDIMScheduler, UNet2DConditionModel, EMAModel, AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
+from mast3r.model import AsymmetricMASt3R
+from torch_scatter import scatter_min
 from torchvision import transforms
 from transformers import CLIPVisionModelWithProjection
 
@@ -58,6 +60,11 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from PIL import Image
 from generfstudio.generfstudio_utils import central_crop_v2
 import torch.nn.functional as F
+import numpy as np
+from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+from dust3r.image_pairs import make_pairs
+from dust3r.inference import inference
+from dust3r.utils.image import load_images
 
 
 def random_quat_tensor(N):
@@ -134,7 +141,7 @@ class DepthGaussiansModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: DepthGaussiansModel)
     warmup_length: int = 500
     """period of steps where refinement is turned off"""
-    refine_every: int = 100
+    refine_every: int = 1
     """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -198,22 +205,27 @@ class DepthGaussiansModelConfig(ModelConfig):
     """Config of the camera optimizer to use"""
 
     optimize: bool = False
-    checkpoint_path_1: Path = Path("/compute/trinity-2-29/hturki/ldm.ckpt")
-    # checkpoint_path_2: Path = Path("/compute/trinity-2-29/hturki/stage-2.ckpt")
+    checkpoint_path_1: Path = Path("/compute/trinity-2-29/hturki/stage-1.ckpt")
+    checkpoint_path_2: Path = Path("/compute/trinity-2-29/hturki/stage-2.ckpt")
 
-    unet_1_pretrained_path: str = "Intel/ldm3d-4c"  # "DeepFloyd/IF-I-L-v1.0"
-    # unet_2_pretrained_path: str = "DeepFloyd/IF-II-M-v1.0"
+    unet_1_pretrained_path: str = "DeepFloyd/IF-I-L-v1.0"
+    # unet_1_pretrained_path: str = "Intel/ldm3d-4c"  # "DeepFloyd/IF-I-L-v1.0"
+    unet_2_pretrained_path: str = "DeepFloyd/IF-II-M-v1.0"
     image_encoder_pretrained_path: str = "lambdalabs/sd-image-variations-diffusers"
-    beta_schedule: str = "scaled_linear"  # "squaredcos_cap_v2"
+
+    # beta_schedule: str = "scaled_linear"  # "squaredcos_cap_v2"
+    beta_schedule: str = "squaredcos_cap_v2"
     prediction_type: str = "epsilon"
 
-    guidance_scale: float = 2.0
+    guidance_scale: float = 1.0
     inference_steps: int = 50
-    render_batch_size: int = 8
+    render_batch_size: int = 1
 
-    # rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
-    depth_mapping: Literal["scaled", "disparity", "log"] = "disparity"  # "scaled"
+    rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
+    depth_mapping: Literal["scaled", "disparity", "log"] = "scaled"
     rgbd_concat_strategy: Literal["mode", "sample", "mean_std", "downsample"] = "sample"
+
+    depth_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 
 
 class DepthGaussiansModel(Model):
@@ -236,8 +248,41 @@ class DepthGaussiansModel(Model):
         self.points3D_scale = metadata["points3D_scale"]
         self.train_image_filenames = metadata["train_image_filenames"]
         self.test_cameras = deepcopy(metadata["test_cameras"]).to("cuda")
+        self.train_cameras = metadata["train_cameras"].to("cuda")
+        self.train_depths = metadata["train_depths"].to("cuda")
+
+        self.train_w2cs_opencv = torch.eye(4, device="cuda").view(1, 4, 4).repeat(self.train_cameras.shape[0], 1,
+                                                                                  1)
+        R = self.train_cameras.camera_to_worlds[:, :3, :3].clone()
+        R[:, :, 1:3] *= -1  # opengl to opencv
+        R_inv = R.transpose(1, 2)
+        self.train_w2cs_opencv[:, :3, :3] = R_inv
+        T = self.train_cameras.camera_to_worlds[:, :3, 3:]
+        inv_T = -torch.bmm(R_inv, T)
+        self.train_w2cs_opencv[:, :3, 3:] = inv_T
+
         self.remaining_indices = set(range(len(self.test_cameras)))
         self.add_image_fn = metadata["add_image_fn"]
+
+        self.prev_depths = []
+        self.prev_indices = []
+        self.prev_w2cs = []
+
+        self.imgs = metadata["imgs"]
+        self.depth_c2ws_opencv = torch.eye(4, device="cuda").view(1, 4, 4).repeat(self.train_cameras.shape[0], 1,
+                                                                                  1)
+        self.depth_c2ws_opencv[:, :3] = self.train_cameras.camera_to_worlds
+        self.depth_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
+        self.depth_focals = self.train_cameras.fx
+        self.depth_pp = torch.cat([self.train_cameras.cx, self.train_cameras.cy], -1)
+
+        ray_bundle = self.train_cameras.generate_rays(
+            camera_indices=torch.arange(self.train_cameras.shape[0]).view(-1, 1))
+
+        pixel_area = ray_bundle.pixel_area.squeeze(-1).permute(2, 0, 1).view(self.train_cameras.shape[0], -1)
+        directions_norm = ray_bundle.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1).view(
+            self.train_cameras.shape[0], -1)
+        self.depth_scale_mult = (pixel_area * directions_norm).reshape(-1, 1)
 
         super().__init__(*args, **kwargs)
 
@@ -308,9 +353,9 @@ class DepthGaussiansModel(Model):
             self.background_color = get_color(self.config.background_color)
 
         # our stuff
-        self.vae = AutoencoderKL.from_pretrained(self.config.unet_1_pretrained_path, subfolder="vae")
-        self.vae.requires_grad_(False)
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        # self.vae = AutoencoderKL.from_pretrained(self.config.unet_1_pretrained_path, subfolder="vae")
+        # self.vae.requires_grad_(False)
+        # self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
         self.unet_1 = UNet2DConditionModel.from_pretrained(self.config.unet_1_pretrained_path, subfolder="unet",
                                                            in_channels=4 + 5,
@@ -327,72 +372,82 @@ class DepthGaussiansModel(Model):
         ema_prefix = "ema_unet."
         ema_prefix_len = len(ema_prefix)
 
-        # self.image_encoder_state_dict_1 = {}
-        # image_encoder_prefixes = {"_model.image_encoder.", "_model.module.image_encoder."}
+        self.image_encoder_state_dict_1 = {}
+        image_encoder_prefixes = {"_model.image_encoder.", "_model.module.image_encoder."}
 
         for key, val in diffusion_state.items():
             if key.startswith(ema_prefix):
                 ema_state_dict[key[ema_prefix_len:]] = val
-            # for image_encoder_prefix in image_encoder_prefixes:
-            #     if key.startswith(image_encoder_prefix):
-            #         self.image_encoder_state_dict_1[key[len(image_encoder_prefix):]] = val
+            for image_encoder_prefix in image_encoder_prefixes:
+                if key.startswith(image_encoder_prefix):
+                    self.image_encoder_state_dict_1[key[len(image_encoder_prefix):]] = val
 
         ema_unet.load_state_dict(ema_state_dict)
         ema_unet.copy_to(self.unet_1.parameters())
 
-        # self.unet_2 = UNet2DConditionModel.from_pretrained(self.config.unet_2_pretrained_path, subfolder="unet",
-        #                                                    in_channels=4 + 4 + 5,
-        #                                                    out_channels=4,
-        #                                                    low_cpu_mem_usage=False,
-        #                                                    ignore_mismatched_sizes=True)
-        # self.unet_2.enable_xformers_memory_efficient_attention()
-        # self.unet_2.requires_grad_(False)
-        #
-        # ema_unet = EMAModel(self.unet_2.parameters(), model_cls=UNet2DConditionModel, model_config=self.unet_2.config)
-        # diffusion_state = torch.load(self.config.checkpoint_path_2, map_location="cpu")["pipeline"]
-        #
-        # ema_state_dict = {}
-        # self.image_encoder_state_dict_2 = {}
-        #
-        # for key, val in diffusion_state.items():
-        #     if key.startswith(ema_prefix):
-        #         ema_state_dict[key[ema_prefix_len:]] = val
-        #     for image_encoder_prefix in image_encoder_prefixes:
-        #         if key.startswith(image_encoder_prefix):
-        #             self.image_encoder_state_dict_2[key[len(image_encoder_prefix):]] = val
-        #
-        # ema_unet.load_state_dict(ema_state_dict)
-        # ema_unet.copy_to(self.unet_2.parameters())
+        self.unet_2 = UNet2DConditionModel.from_pretrained(self.config.unet_2_pretrained_path, subfolder="unet",
+                                                           in_channels=4 + 4 + 5,
+                                                           out_channels=4,
+                                                           low_cpu_mem_usage=False,
+                                                           ignore_mismatched_sizes=True)
+        self.unet_2.enable_xformers_memory_efficient_attention()
+        self.unet_2.requires_grad_(False)
+
+        ema_unet = EMAModel(self.unet_2.parameters(), model_cls=UNet2DConditionModel, model_config=self.unet_2.config)
+        diffusion_state = torch.load(self.config.checkpoint_path_2, map_location="cpu")["pipeline"]
+
+        ema_state_dict = {}
+        self.image_encoder_state_dict_2 = {}
+
+        for key, val in diffusion_state.items():
+            if key.startswith(ema_prefix):
+                ema_state_dict[key[ema_prefix_len:]] = val
+            for image_encoder_prefix in image_encoder_prefixes:
+                if key.startswith(image_encoder_prefix):
+                    self.image_encoder_state_dict_2[key[len(image_encoder_prefix):]] = val
+
+        ema_unet.load_state_dict(ema_state_dict)
+        ema_unet.copy_to(self.unet_2.parameters())
 
         self.ddim_scheduler = DDIMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
                                                             subfolder="scheduler",
                                                             beta_schedule=self.config.beta_schedule,
                                                             prediction_type=self.config.prediction_type)
-        # self.ddim_scheduler.config["variance_type"] = "fixed_small"
+        self.ddim_scheduler.config["variance_type"] = "fixed_small"
         self.ddim_scheduler.config["prediction_type"] = "sample"
         self.ddim_scheduler = DDIMScheduler.from_config(self.ddim_scheduler.config)
         self.ddim_scheduler.set_timesteps(self.config.inference_steps)
 
         pixels_im = torch.stack(
             torch.meshgrid(
+                torch.arange(64, dtype=torch.float32),
+                torch.arange(64, dtype=torch.float32),
+                indexing="ij")).permute(2, 1, 0)
+        self.register_buffer("pixels_1", pixels_im.reshape(-1, 2), persistent=False)
+
+        pixels_im = torch.stack(
+            torch.meshgrid(
                 torch.arange(256, dtype=torch.float32),
                 torch.arange(256, dtype=torch.float32),
                 indexing="ij")).permute(2, 1, 0)
-        self.register_buffer("pixels", pixels_im.reshape(-1, 2), persistent=False)
+        self.register_buffer("pixels_2", pixels_im.reshape(-1, 2), persistent=False)
+
+        self.depth_model = AsymmetricMASt3R.from_pretrained(self.config.depth_model_name)
+        self.depth_model.requires_grad_(False)
 
         self.clip_embeddings_1 = None
 
     @torch.inference_mode()
     def get_clip_embeddings(self):
         if self.clip_embeddings_1 is not None:
-            return self.clip_embeddings_1  # , self.clip_embeddings_2
+            return self.clip_embeddings_1, self.clip_embeddings_2
 
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            self.config.image_encoder_pretrained_path, subfolder="image_encoder")  # , projection_dim=4096,
-        # ignore_mismatched_sizes=True)
+            self.config.image_encoder_pretrained_path, subfolder="image_encoder", projection_dim=4096,
+            ignore_mismatched_sizes=True)
+        image_encoder.load_state_dict(self.image_encoder_state_dict_1)
+        delattr(self, "image_encoder_state_dict_1")
         image_encoder.requires_grad_(False)
-        # image_encoder.load_state_dict(self.image_encoder_state_dict_1)
-        # delattr(self, "image_encoder_state_dict_1")
 
         image_encoder_resize = transforms.Resize(
             (224, 224),
@@ -412,12 +467,12 @@ class DepthGaussiansModel(Model):
         delattr(self, "clip_embeddings_1")
         self.register_buffer("clip_embeddings_1", c_crossattn.unsqueeze(0), persistent=False)
 
-        # image_encoder.load_state_dict(self.image_encoder_state_dict_2)
-        # delattr(self, "image_encoder_state_dict_2")
-        # c_crossattn = image_encoder.to(self.device)(images).image_embeds
-        # self.register_buffer("clip_embeddings_2", c_crossattn.unsqueeze(0), persistent=False)
+        image_encoder.load_state_dict(self.image_encoder_state_dict_2)
+        delattr(self, "image_encoder_state_dict_2")
+        c_crossattn = image_encoder.to(self.device)(images).image_embeds
+        self.register_buffer("clip_embeddings_2", c_crossattn.unsqueeze(0), persistent=False)
 
-        return self.clip_embeddings_1  # , self.clip_embeddings_2
+        return self.clip_embeddings_1, self.clip_embeddings_2
 
     @property
     def colors(self):
@@ -782,9 +837,9 @@ class DepthGaussiansModel(Model):
 
     @torch.no_grad()
     def generate_view(self, optimizers: Optimizers, step: int):
-        trigger = Path("/scratch/hturki/render_view")
-        if not trigger.exists():
-            return
+        # trigger = Path("/scratch/hturki/render_view")
+        # if not trigger.exists():
+        #     return
         if len(self.remaining_indices) == 0:
             CONSOLE.log("DONE")
             return
@@ -810,48 +865,55 @@ class DepthGaussiansModel(Model):
         CONSOLE.log(f"Rendering {to_render_indices}")
         to_render_indices = torch.LongTensor(to_render_indices).to(self.test_cameras.device)
         renderings = {k: torch.stack(v) for k, v in renderings.items()}
-        c_crossattn_1 = self.get_clip_embeddings().expand(to_render_indices.shape[0], -1, -1)
 
-        # c_crossattn_1, c_crossattn_2 = self.get_clip_embeddings()
+        c_crossattn_1, c_crossattn_2 = self.get_clip_embeddings()
+        c_crossattn_1 = c_crossattn_1.expand(to_render_indices.shape[0], -1, -1)
+        c_crossattn_2 = c_crossattn_2.expand(to_render_indices.shape[0], -1, -1)
+
         depth = renderings[DEPTH]
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(to_render_indices.shape[0], -1))
 
-        # image_dim_1 = 64
-        # rgb_1 = (
-        #     F.interpolate(rendering[RGB].permute(2, 0, 1).unsqueeze(0), image_dim_1, mode="bicubic", antialias=True)
-        #     .permute(0, 2, 3, 1))
-        # depth_1 = F.interpolate(depth.permute(2, 0, 1).unsqueeze(0), image_dim_1, mode="bicubic",
-        #                         antialias=True).permute(0, 2, 3, 1)
-        # encoded_1 = self.encode_rgbd(rgb_1, depth_1, depth_scaling_factor)
-        # acc_1 = F.interpolate(rendering[ACCUMULATION].permute(2, 0, 1).unsqueeze(0), image_dim_1, mode="bicubic",
-        #                       antialias=True)
-        # c_concat_1 = torch.cat([encoded_1, acc_1], 1)
-        # acc_1 = acc_1.permute(0, 2, 3, 1)
-
-        # image_dim_2 = 256
-        # encoded_2 = self.encode_rgbd(rendering[RGB].unsqueeze(0), depth.unsqueeze(0), depth_scaling_factor)
-        # acc_2 = rendering[ACCUMULATION].unsqueeze(0)
-
-        image_dim_1 = 256
-        encoded_1 = self.encode_with_vae(renderings[RGB], depth, depth_scaling_factor)
-        acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), image_dim_1 // self.vae_scale_factor,
-                              mode="bicubic", antialias=True)
+        image_dim_1 = 64
+        rgb_1 = (
+            F.interpolate(renderings[RGB].permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True)
+            .permute(0, 2, 3, 1))
+        depth_1 = F.interpolate(depth.permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True).permute(0, 2, 3,
+                                                                                                                1)
+        encoded_1 = self.encode_rgbd(rgb_1, depth_1, depth_scaling_factor)
+        acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True)
         c_concat_1 = torch.cat([encoded_1, acc_1], 1)
+        acc_1 = acc_1.permute(0, 2, 3, 1)
+
+        image_dim_2 = 256
+        encoded_2 = self.encode_rgbd(renderings[RGB], depth, depth_scaling_factor)
+        acc_2 = renderings[ACCUMULATION]
+
+        # image_dim_1 = 256
+        # encoded_1 = self.encode_with_vae(renderings[RGB], depth, depth_scaling_factor)
+        # acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), image_dim_1 // self.vae_scale_factor,
+        #                       mode="bicubic", antialias=True)
+        # c_concat_1 = torch.cat([encoded_1, acc_1], 1)
 
         if self.config.guidance_scale > 1:
             c_concat_1 = torch.cat([torch.zeros_like(c_concat_1), c_concat_1])
             c_crossattn_1 = torch.cat([torch.zeros_like(c_crossattn_1), c_crossattn_1])
-            # c_crossattn_2 = torch.cat([torch.zeros_like(c_crossattn_2), c_crossattn_2])
+            c_crossattn_2 = torch.cat([torch.zeros_like(c_crossattn_2), c_crossattn_2])
 
         scheduler = self.ddim_scheduler
+        # sample_1 = scheduler.init_noise_sigma * randn_tensor(
+        #     (to_render_indices.shape[0], 4, image_dim_1 // self.vae_scale_factor, image_dim_1 // self.vae_scale_factor),
+        #     device=c_concat_1.device, dtype=c_concat_1.dtype)
         sample_1 = scheduler.init_noise_sigma * randn_tensor(
-            (to_render_indices.shape[0], 4, image_dim_1 // self.vae_scale_factor, image_dim_1 // self.vae_scale_factor),
+            (to_render_indices.shape[0], 4, image_dim_1, image_dim_1),
             device=c_concat_1.device, dtype=c_concat_1.dtype)
 
         target_c2ws_opencv = torch.eye(4, device=c_concat_1.device).view(1, 4, 4).repeat(to_render_indices.shape[0],
                                                                                          1, 1)
-        to_render_cameras = self.test_cameras[to_render_indices]
-        target_c2ws_opencv[:, :3] = to_render_cameras.camera_to_worlds
+        to_render_cameras_2 = self.test_cameras[to_render_indices]
+        to_render_cameras_1 = deepcopy(to_render_cameras_2)
+        to_render_cameras_1.rescale_output_resolution(
+            64 / torch.maximum(to_render_cameras_1.width, to_render_cameras_1.height))
+        target_c2ws_opencv[:, :3] = to_render_cameras_2.camera_to_worlds
         target_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
 
         target_w2cs_opencv = torch.eye(4, device=c_concat_1.device).view(1, 4, 4).repeat(to_render_indices.shape[0], 1,
@@ -862,13 +924,23 @@ class DepthGaussiansModel(Model):
         inv_T = -torch.bmm(R_inv, T)
         target_w2cs_opencv[:, :3, 3:] = inv_T
 
-        focals_for_decode = torch.cat([to_render_cameras.fx, to_render_cameras.fy], -1)
-        pp_for_decode = torch.cat([to_render_cameras.cx, to_render_cameras.cy], -1)
-        ray_bundle = to_render_cameras.generate_rays(camera_indices=torch.arange(len(to_render_cameras)).view(-1, 1))
+        focals_for_decode_1 = torch.cat([to_render_cameras_1.fx, to_render_cameras_1.fy], -1)
+        pp_for_decode_1 = torch.cat([to_render_cameras_1.cx, to_render_cameras_1.cy], -1)
+        ray_bundle_1 = to_render_cameras_1.generate_rays(
+            camera_indices=torch.arange(len(to_render_cameras_1)).view(-1, 1))
 
-        pixel_area = ray_bundle.pixel_area.squeeze(-1).permute(2, 0, 1)
-        directions_norm = ray_bundle.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
-        decode_scale_mult = (pixel_area * directions_norm).view(to_render_cameras.shape[0], -1)
+        pixel_area_1 = ray_bundle_1.pixel_area.squeeze(-1).permute(2, 0, 1)
+        directions_norm_1 = ray_bundle_1.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
+        decode_scale_mult_1 = (pixel_area_1 * directions_norm_1).view(to_render_cameras_1.shape[0], -1)
+
+        focals_for_decode_2 = torch.cat([to_render_cameras_2.fx, to_render_cameras_2.fy], -1)
+        pp_for_decode_2 = torch.cat([to_render_cameras_2.cx, to_render_cameras_2.cy], -1)
+        ray_bundle_2 = to_render_cameras_2.generate_rays(
+            camera_indices=torch.arange(len(to_render_cameras_2)).view(-1, 1))
+
+        pixel_area_2 = ray_bundle_2.pixel_area.squeeze(-1).permute(2, 0, 1)
+        directions_norm_2 = ray_bundle_2.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
+        decode_scale_mult_2 = (pixel_area_2 * directions_norm_2).view(to_render_cameras_2.shape[0], -1)
 
         for t_index, t in enumerate(scheduler.timesteps):
             model_input = torch.cat([sample_1] * 2) if self.config.guidance_scale > 1 else sample_1
@@ -893,87 +965,172 @@ class DepthGaussiansModel(Model):
             else:
                 raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
 
-            model_output = self.project_predictions(target_w2cs_opencv, target_c2ws_opencv,
-                                                    pred_original_sample, self.pixels,
-                                                    focals_for_decode, pp_for_decode,
-                                                    None, depth_scaling_factor,
-                                                    decode_scale_mult, 1)
+            if to_render_indices.shape[0] == 1:
+                pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
 
-            # pred_rgb, pred_depth = self.decode_with_vae(pred_original_sample, depth_scaling_factor)
-            #
-            # blend_weight = rendering[ACCUMULATION].unsqueeze(0).clone()
-            # blend_weight[depth > pred_depth] = 0
-            #
-            # model_output = self.encode_with_vae(
-            #     (1 - blend_weight) * pred_rgb + blend_weight * rendering[RGB],
-            #     (1 - blend_weight) * pred_depth + blend_weight * depth,
-            #     depth_scaling_factor)
-            # model_output = pred_original_sample
+                blend_weight = acc_1.clone()
+                blend_weight[depth_1 > pred_depth] = 0
+
+                model_output = self.encode_rgbd(
+                    (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
+                    (1 - blend_weight) * pred_depth + blend_weight * depth_1,
+                    depth_scaling_factor)
+            else:
+                model_output = self.project_predictions(target_w2cs_opencv, target_c2ws_opencv,
+                                                        pred_original_sample, self.pixels_1,
+                                                        focals_for_decode_1, pp_for_decode_1,
+                                                        None, depth_scaling_factor,
+                                                        decode_scale_mult_1, image_dim_1)
+
             sample_1 = scheduler.step(model_output, t, sample_1, return_dict=False)[0]
 
-        # c_concat_2 = torch.cat([F.interpolate(sample_1, image_dim_2, mode="bicubic", antialias=True), encoded_2,
-        #                         acc_2.permute(0, 3, 1, 2)], 1)
-        # 
-        # if self.config.guidance_scale > 1:
-        #     c_concat_2 = torch.cat([torch.zeros_like(c_concat_2), c_concat_2])
-        # 
-        # sample_2 = self.ddim_scheduler.init_noise_sigma * randn_tensor((1, 4, image_dim_2, image_dim_2),
-        #                                                                device=c_concat_2.device, dtype=c_concat_2.dtype)
-        # for t_index, t in enumerate(self.ddim_scheduler.timesteps):
-        #     model_input = torch.cat([sample_2] * 2) if self.config.guidance_scale > 1 else sample_2
-        #     model_input = self.ddim_scheduler.scale_model_input(model_input, t)
-        #     model_input = torch.cat([model_input, c_concat_2], dim=1)
-        # 
-        #     model_output = \
-        #         self.unet_2(model_input, t, c_crossattn_2, class_labels=torch.tensor([t], device=model_input.device),
-        #                     return_dict=False)[0]
-        # 
-        #     if self.config.guidance_scale > 1:
-        #         model_output_uncond, model_output_cond = model_output.chunk(2)
-        #         model_output = model_output_uncond + self.config.guidance_scale * \
-        #                        (model_output_cond - model_output_uncond)
-        # 
-        #     alpha_prod_t = self.ddim_scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
-        #     beta_prod_t = 1 - alpha_prod_t
-        #     if self.config.prediction_type == "epsilon":
-        #         pred_original_sample = (sample_2 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        #     elif self.config.prediction_type == "sample":
-        #         pred_original_sample = model_output
-        #     elif self.config.prediction_type == "v_prediction":
-        #         pred_original_sample = (alpha_prod_t ** 0.5) * sample_2 - (beta_prod_t ** 0.5) * model_output
-        #     else:
-        #         raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
-        # 
-        #     pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
-        # 
-        #     blend_weight = acc_2.clone()
-        #     blend_weight[depth > pred_depth] = 0
-        # 
-        #     model_output = self.encode_rgbd(
-        #         (1 - blend_weight) * pred_rgb + blend_weight * rendering[RGB],
-        #         (1 - blend_weight) * pred_depth + blend_weight * depth,
-        #         depth_scaling_factor)
-        #     sample_2 = self.ddim_scheduler.step(model_output, t, sample_2, return_dict=False)[0]
+        c_concat_2 = torch.cat([F.interpolate(sample_1, image_dim_2, mode="bicubic", antialias=True), encoded_2,
+                                acc_2.permute(0, 3, 1, 2)], 1)
 
-        pred_rgb, pred_depth = self.decode_with_vae(sample_1, depth_scaling_factor)
+        if self.config.guidance_scale > 1:
+            c_concat_2 = torch.cat([torch.zeros_like(c_concat_2), c_concat_2])
+
+        sample_2 = self.ddim_scheduler.init_noise_sigma * randn_tensor(
+            (to_render_indices.shape[0], 4, image_dim_2, image_dim_2),
+            device=c_concat_2.device, dtype=c_concat_2.dtype)
+
+        for t_index, t in enumerate(self.ddim_scheduler.timesteps):
+            model_input = torch.cat([sample_2] * 2) if self.config.guidance_scale > 1 else sample_2
+            model_input = self.ddim_scheduler.scale_model_input(model_input, t)
+            model_input = torch.cat([model_input, c_concat_2], dim=1)
+
+            model_output = \
+                self.unet_2(model_input, t, c_crossattn_2, class_labels=torch.tensor([t], device=model_input.device),
+                            return_dict=False)[0]
+
+            if self.config.guidance_scale > 1:
+                model_output_uncond, model_output_cond = model_output.chunk(2)
+                model_output = model_output_uncond + self.config.guidance_scale * \
+                               (model_output_cond - model_output_uncond)
+
+            alpha_prod_t = self.ddim_scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
+            beta_prod_t = 1 - alpha_prod_t
+            if self.config.prediction_type == "epsilon":
+                pred_original_sample = (sample_2 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            elif self.config.prediction_type == "sample":
+                pred_original_sample = model_output
+            elif self.config.prediction_type == "v_prediction":
+                pred_original_sample = (alpha_prod_t ** 0.5) * sample_2 - (beta_prod_t ** 0.5) * model_output
+            else:
+                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
+
+            pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
+
+            if to_render_indices.shape[0] == 1:
+                blend_weight = acc_2.clone()
+                blend_weight[depth > pred_depth] = 0
+
+                model_output = self.encode_rgbd(
+                    (1 - blend_weight) * pred_rgb + blend_weight * renderings[RGB],
+                    (1 - blend_weight) * pred_depth + blend_weight * depth,
+                    depth_scaling_factor)
+            else:
+                model_output = self.project_predictions(target_w2cs_opencv, target_c2ws_opencv,
+                                                        pred_original_sample, self.pixels_2,
+                                                        focals_for_decode_2, pp_for_decode_2,
+                                                        None, depth_scaling_factor,
+                                                        decode_scale_mult_2, image_dim_2)
+
+            sample_2 = scheduler.step(model_output, t, sample_2, return_dict=False)[0]
+
+        pred_rgb, pred_depth = self.decode_rgbd(sample_2, depth_scaling_factor)
+        # pred_rgb, pred_depth = self.decode_with_vae(sample_1, depth_scaling_factor)
+
         for i, rgb in enumerate(pred_rgb):
-            self.add_image_fn(rgb, to_render_cameras[i:i + 1])
-        pts3d = self.depth_to_pts3d(depth, target_c2ws_opencv, self.pixels, focals_for_decode, pp_for_decode).reshape(
-            -1, 3)
-        scales = (pred_depth.view(decode_scale_mult.shape) * decode_scale_mult).view(-1, 1)
-        pred_rgb = pred_rgb.reshape(-1, 3)
+            self.add_image_fn(rgb, to_render_cameras_2[i:i + 1])
+
+        # pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
+        #                             pp_for_decode_2).reshape(-1, 3)
+        # train_width = self.train_cameras.width[0].item()
+        # train_height = self.train_cameras.height[0].item()
+        # mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+        #                                         pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
+        #                                         self.train_cameras.fx,
+        #                                         self.train_cameras.fy,
+        #                                         self.train_cameras.cx,
+        #                                         self.train_cameras.cy,
+        #                                         self.train_depths.view(self.train_w2cs_opencv.shape[0], train_height,
+        #                                                                train_width, 1),
+        #                                         train_width,
+        #                                         train_height)
+        # if len(self.prev_depths) > 0:
+        #     prev_cameras = self.test_cameras[torch.cat(self.prev_indices)]
+        #     prev_w2cs = torch.cat(self.prev_w2cs)
+        #     mask = torch.logical_and(self.not_in_existing_predictions(prev_w2cs,
+        #                                             pts3d.unsqueeze(0).expand(prev_w2cs.shape[0], -1, -1),
+        #                                             prev_cameras.fx,
+        #                                             prev_cameras.fy,
+        #                                             prev_cameras.cx,
+        #                                             prev_cameras.cy,
+        #                                             torch.cat(self.prev_depths),
+        #                                             image_dim_2,
+        #                                             image_dim_2), mask)
+        # self.prev_depths.append(torch.where(mask.view(pred_depth.shape), pred_depth, 0))
+        # self.prev_indices.append(to_render_indices)
+        # self.prev_w2cs.append(target_w2cs_opencv)
+
+        # pts3d = pts3d[mask]
+        # scales = (pred_depth.view(decode_scale_mult_2.shape) * decode_scale_mult_2).view(-1, 1)[mask]
+        # pred_rgb = pred_rgb.reshape(-1, 3)[mask]
+
+        for rgb in pred_rgb:
+            idx = len(self.imgs)
+            self.imgs.append({
+                "img": rgb.permute(2, 0, 1).unsqueeze(0) * 2 - 1,
+                "true_shape": np.array([[image_dim_2, image_dim_2]], dtype=np.int32),
+                "idx": idx,
+                "instance": str(idx),
+            })
+        pairs = make_pairs(self.imgs, scene_graph="complete", prefilter=None, symmetrize=True)
+
+        output = inference(pairs, self.depth_model, "cuda", batch_size=1)
+        with torch.enable_grad():
+            scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer,
+                                   optimize_pp=True)
+            self.depth_c2ws_opencv = torch.cat([self.depth_c2ws_opencv, target_c2ws_opencv])
+            scene.preset_pose(self.depth_c2ws_opencv)
+            self.depth_focals = torch.cat([self.depth_focals, to_render_cameras_2.fx])
+            scene.preset_focal(self.depth_focals.cpu())  # Assume fx and fy are almost equal
+            self.depth_pp = torch.cat([self.depth_pp, pp_for_decode_2])
+            scene.preset_principal_point(self.depth_pp.cpu())
+            scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.1)
+        scene.clean_pointcloud()
+        pts3d = torch.cat([x.view(-1, 3) for x in scene.get_pts3d(raw=False)])
+        depth = torch.cat([x.view(-1) for x in scene.get_depthmaps(raw=False)])
+        mask = torch.cat([x.view(-1) for x in scene.im_conf]).to(pts3d.device) >= 1.5
+
+        pts3d = pts3d.view(-1, 3).detach()[mask]
+        pred_rgb = torch.cat([self.imgs[x]["img"].squeeze(0).permute(1, 2, 0).view(-1, 3).to(pts3d.device)
+                              for x in range(len(self.imgs))])[mask] / 2 + 0.5
+        # scales = depth.detach() / train_cameras.fx.view(-1, 1).cuda()
+
+        # mask = torch.cat(confs).view(-1) > self.config.min_conf_thresh
+        self.depth_scale_mult = torch.cat([self.depth_scale_mult.to(pts3d.device), decode_scale_mult_2.view(-1, 1)])
+        scales = (depth.view(-1, 1) * self.depth_scale_mult)[mask]
 
         chunk_size = self.means.shape[0]
         for i in range(0, pts3d.shape[0], chunk_size):
             end = i + chunk_size
+
+            if i == 0:
+                new_opacities = torch.cat([torch.logit(torch.zeros_like(self.opacities) + 1e-5),
+                                           torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
+            else:
+                new_opacities = torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
+
             out = {
                 "means": torch.cat([self.means, pts3d[i:end]]),
                 "features_dc": torch.cat([self.features_dc, torch.logit(pred_rgb[i:end])]),
-                "features_rest": torch.cat([self.features_rest, torch.zeros(scales[i:end].shape[0], *self.features_rest.shape[1:],
-                                                                            device=self.features_rest.device)]),
-                "opacities": torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))]),
-                # "opacities": torch.cat([torch.logit(torch.zeros_like(self.opacities) + 1e-5),
-                #                         torch.logit(torch.full_like(pts3d[..., :1], 1 - 1e-5))]),
+                "features_rest": torch.cat(
+                    [self.features_rest, torch.zeros(scales[i:end].shape[0], *self.features_rest.shape[1:],
+                                                     device=self.features_rest.device)]),
+                # "opacities": torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))]),
+                "opacities": new_opacities,
                 "scales": torch.cat([self.scales, torch.log(scales[i:end]).expand(-1, 3)]),
                 "quats": torch.cat([self.quats, random_quat_tensor(scales[i:end].shape[0]).to(self.quats.device)]),
             }
@@ -991,7 +1148,7 @@ class DepthGaussiansModel(Model):
         self.xys_grad_norm = None
         self.vis_counts = None
         self.max_2Dsize = None
-        trigger.unlink()
+        # trigger.unlink()
         CONSOLE.log(f"Finished rendering {to_render_indices}")
 
     def step_cb(self, step):
@@ -1434,8 +1591,10 @@ class DepthGaussiansModel(Model):
     def project_predictions(self, w2cs: torch.Tensor, c2ws: torch.Tensor, predictions: torch.Tensor,
                             pixels: torch.Tensor, focals: torch.Tensor, pp: torch.Tensor,
                             bg_colors: Optional[torch.Tensor], depth_scaling_factor: torch.Tensor,
-                            decode_scale_mult: torch.Tensor, opacity: float) -> torch.Tensor:
-        rgb, depth = self.decode_with_vae(predictions, depth_scaling_factor)
+                            decode_scale_mult: torch.Tensor, image_dim: int) -> torch.Tensor:
+        rgb, depth = self.decode_rgbd(predictions, depth_scaling_factor)
+
+        # rgb, depth = self.decode_with_vae(predictions, depth_scaling_factor)
         pts3d = self.depth_to_pts3d(depth, c2ws, pixels, focals, pp)
 
         base_rgbs = []
@@ -1491,7 +1650,7 @@ class DepthGaussiansModel(Model):
                        opacities], 1),
             torch.cat([torch.sigmoid(self.features_dc).unsqueeze(0).expand(other_pts3d.shape[0], -1, -1), other_rgbs],
                       1),
-            256,
+            image_dim,
             True,
             1,
             bg_colors,
@@ -1501,8 +1660,58 @@ class DepthGaussiansModel(Model):
         other_depth = rendering[DEPTH]
         blend_weight[other_depth > base_depth] = 0
 
-        return self.encode_with_vae((1 - blend_weight) * base_rgbs + blend_weight * rendering[RGB],
-                                    (1 - blend_weight) * base_depth + blend_weight * other_depth, depth_scaling_factor)
+        return self.encode_rgbd((1 - blend_weight) * base_rgbs + blend_weight * rendering[RGB],
+                                (1 - blend_weight) * base_depth + blend_weight * other_depth, depth_scaling_factor)
+        # return self.encode_with_vae((1 - blend_weight) * base_rgbs + blend_weight * rendering[RGB],
+        #                             (1 - blend_weight) * base_depth + blend_weight * other_depth, depth_scaling_factor)
+
+    def project_pointcloud(self, w2cs: torch.Tensor, pts3d: torch.Tensor, rgb: torch.Tensor, fx: torch.Tensor,
+                           fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                           existing_rgb: Optional[torch.Tensor], existing_depth: Optional[torch.Tensor]) -> Dict[
+        str, torch.Tensor]:
+        image_dim = existing_rgb.shape[1]
+
+        rgb_map = existing_rgb.reshape(-1, 3).clone().type(rgb.dtype)
+        depth_map = existing_depth.view(-1).clone()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            pts3d_cam_render = w2cs @ torch.cat([pts3d, torch.ones_like(pts3d[..., :1])], -1).transpose(1, 2)
+            pts3d_cam_render = pts3d_cam_render.transpose(1, 2)[..., :3]
+            z_pos = pts3d_cam_render[..., 2]
+
+            uv = pts3d_cam_render[:, :, :2] / pts3d_cam_render[:, :, 2:]
+            focal = torch.cat([fx.view(-1, 1), fy.view(-1, 1)], -1)
+            uv *= focal.unsqueeze(1)
+            center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
+            uv += center.unsqueeze(1)
+
+            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim)
+            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim)
+            is_valid_z = z_pos > 0
+            is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
+
+            max_val = torch.finfo(torch.float32).max
+            u = torch.round(uv[..., 0]).long().clamp(0, image_dim - 1)
+            v = torch.round(uv[..., 1]).long().clamp(0, image_dim - 1)
+            z = torch.where(is_valid_point, z_pos, max_val)
+            camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
+
+            indices = (camera_index * image_dim * image_dim + v * image_dim + u).view(-1)
+            _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
+            depth_map = depth_map.view(w2cs.shape[0], image_dim, image_dim, 1)
+
+            rgb_to_fill = min_indices[min_indices <= indices.shape[0] - 1]
+            rgb_map[indices[rgb_to_fill]] = rgb.reshape(-1, 3)[rgb_to_fill]
+            rgb_map = rgb_map.reshape(*depth_map.shape[:-1], 3)  # .permute(0, 3, 1, 2)
+
+            acc_map = depth_map < torch.finfo(torch.float32).max - 1
+            depth_map[torch.logical_not(acc_map)] = 0
+
+            return {
+                RGB: rgb_map,
+                DEPTH: depth_map,
+                ACCUMULATION: acc_map.float(),
+            }
 
     @torch.cuda.amp.autocast(enabled=False)
     def depth_to_pts3d(self, depth: torch.Tensor, c2ws_opencv: torch.Tensor, pixels: torch.Tensor, focals: torch.Tensor,
@@ -1514,3 +1723,37 @@ class DepthGaussiansModel(Model):
             pp)
         pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
         return pts3d.transpose(1, 2)[..., :3]
+
+    def not_in_existing_predictions(self, w2cs: torch.Tensor, pts3d: torch.Tensor, fx: torch.Tensor,
+                                    fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                                    existing_depth: torch.Tensor, image_width: int, image_height: int) -> torch.Tensor:
+        depth_map = existing_depth.view(-1).clone()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            pts3d_cam_render = w2cs @ torch.cat([pts3d, torch.ones_like(pts3d[..., :1])], -1).transpose(1, 2)
+            pts3d_cam_render = pts3d_cam_render.transpose(1, 2)[..., :3]
+            z_pos = pts3d_cam_render[..., 2]
+
+            uv = pts3d_cam_render[:, :, :2] / pts3d_cam_render[:, :, 2:]
+            focal = torch.cat([fx.view(-1, 1), fy.view(-1, 1)], -1)
+            uv *= focal.unsqueeze(1)
+            center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
+            uv += center.unsqueeze(1)
+
+            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_width)
+            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_height)
+            is_valid_z = z_pos > 0
+            is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
+
+            max_val = torch.finfo(torch.float32).max
+            u = torch.round(uv[..., 0]).long().clamp(0, image_width - 1)
+            v = torch.round(uv[..., 1]).long().clamp(0, image_height - 1)
+            z = torch.where(is_valid_point, z_pos, max_val)
+            camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
+            indices = (camera_index * image_height * image_width + v * image_width + u).view(-1)
+            _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
+            invalid_indices = torch.where(min_indices < pts3d.shape[0] * pts3d.shape[1], min_indices % pts3d.shape[1],
+                                          -1)
+            mask = torch.ones_like(pts3d[0, :, 0], dtype=torch.bool)
+            mask[invalid_indices[invalid_indices > 0]] = False
+            return mask

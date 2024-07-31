@@ -12,6 +12,7 @@ from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.image_pairs import make_pairs
 from dust3r.inference import inference
 from dust3r.utils.image import load_images
+from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 from mast3r.model import AsymmetricMASt3R
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.dataparsers.base_dataparser import (
@@ -91,8 +92,10 @@ class DepthProviding(DataParser):
 
             pairs = make_pairs(imgs, scene_graph="complete", prefilter=None, symmetrize=True)
 
-            # scene = sparse_global_alignment(filelist, pairs, self.config.cache_path, model, matching_conf_thr=0)
-            # pts3d, depthmaps, confs = scene.get_dense_pts3d(subsample=1)
+            # scene = sparse_global_alignment([str(x) for x in train_image_filenames], pairs, self.config.cache_path, model, matching_conf_thr=0)
+            # pts3d, depthmaps, confs = scene.get_dense_pts3d(subsample=8)
+            # pts3d = torch.cat(pts3d)
+            # depth = torch.stack(depthmaps)
 
             output = inference(pairs, model, "cuda", batch_size=1)
             scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer,
@@ -118,15 +121,20 @@ class DepthProviding(DataParser):
 
             # scales = depth.detach() / train_cameras.fx.view(-1, 1).cuda()
 
+            # mask = torch.cat(confs).view(-1) > self.config.min_conf_thresh
             mask = torch.stack([x for x in scene.im_conf]).view(-1).to(xyz.device) > self.config.min_conf_thresh
-
+            train_depths = depth.detach().clone()
+            train_depths[torch.logical_not(mask.view(train_depths.shape))] = 0
             metadata = {
+                "train_cameras": train_cameras,
+                "train_depths": train_depths,
                 "test_cameras": self.get_dataparser_outputs("test").cameras,
                 "points3D_xyz": xyz[mask],
                 "points3D_rgb": (rgb[mask.to(rgb.device)] * 255).byte(),
                 "points3D_scale": scales[mask],
                 "train_image_filenames": train_image_filenames,
                 "add_image_fn": self.add_image,
+                "imgs": imgs,
             }
 
             self.base_outputs = DataparserOutputs(image_filenames=train_image_filenames,

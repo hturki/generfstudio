@@ -90,16 +90,39 @@ class DepthProviding(DataParser):
             train_cameras.height = cropped_heights
             train_cameras.width = cropped_widths
 
-            pairs = make_pairs(imgs, scene_graph="complete", prefilter=None, symmetrize=True)
+            # pairs = make_pairs(imgs, scene_graph="complete", prefilter=None, symmetrize=True)
 
             # scene = sparse_global_alignment([str(x) for x in train_image_filenames], pairs, self.config.cache_path, model, matching_conf_thr=0)
             # pts3d, depthmaps, confs = scene.get_dense_pts3d(subsample=8)
             # pts3d = torch.cat(pts3d)
             # depth = torch.stack(depthmaps)
 
-            output = inference(pairs, model, "cuda", batch_size=1)
-            scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer,
-                                   optimize_pp=True)
+            view1 = {"img": [], "idx": [], "instance": []}
+            view2 = {"img": [], "idx": [], "instance": []}
+            for first in range(len(imgs)):
+                for second in range(len(imgs)):
+                    if first == second:
+                        continue
+                    view1["img"].append(imgs[first]["img"])
+                    view2["img"].append(imgs[second]["img"])
+                    view1["idx"].append(first)
+                    view1["instance"].append(str(first))
+                    view2["idx"].append(second)
+                    view2["instance"].append(str(second))
+
+            view1["img"] = torch.cat(view1["img"]).cuda()
+            view2["img"] = torch.cat(view2["img"]).cuda()
+
+            with torch.no_grad():
+                pred1, pred2 = model(view1, view2)
+            output = {
+                "view1": {"idx": view1["idx"], "instance": view1["instance"]},
+                "view2": {"idx": view2["idx"], "instance": view2["instance"]},
+                "pred1": {k: [x for x in v] for k, v in pred1.items()},
+                "pred2": {k: [x for x in v] for k, v in pred2.items()},
+            }
+
+            scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer, optimize_pp=True)
             scene.preset_pose(c2ws_opencv)
             scene.preset_focal(train_cameras.fx)  # Assume fx and fy are almost equal
             scene.preset_principal_point(torch.cat([train_cameras.cx, train_cameras.cy], -1))
@@ -123,26 +146,35 @@ class DepthProviding(DataParser):
 
             # mask = torch.cat(confs).view(-1) > self.config.min_conf_thresh
             mask = torch.stack([x for x in scene.im_conf]).view(-1).to(xyz.device) > self.config.min_conf_thresh
-            train_depths = depth.detach().clone()
-            train_depths[torch.logical_not(mask.view(train_depths.shape))] = 0
+            depth = depth.detach().view(len(train_cameras), cropped_heights[0].item(), cropped_widths[0].item(), 1)
             metadata = {
                 "train_cameras": train_cameras,
-                "train_depths": train_depths,
+                "train_depths": torch.where(mask.view(depth.shape), depth, 0),
+                "train_rgbs": rgb.view(-1, 3),
                 "test_cameras": self.get_dataparser_outputs("test").cameras,
                 "points3D_xyz": xyz[mask],
                 "points3D_rgb": (rgb[mask.to(rgb.device)] * 255).byte(),
                 "points3D_scale": scales[mask],
                 "train_image_filenames": train_image_filenames,
                 "add_image_fn": self.add_image,
-                "imgs": imgs,
+                "depth_outputs": output,
+                "min_conf_thresh": self.config.min_conf_thresh,
             }
 
+            # self.base_outputs = DataparserOutputs(image_filenames=train_image_filenames,
+            #                                       cameras=train_cameras,
+            #                                       alpha_color=inner_outputs.alpha_color,
+            #                                       scene_box=inner_outputs.scene_box,
+            #                                       dataparser_scale=inner_outputs.dataparser_scale,
+            #                                       metadata={})
+            
             self.base_outputs = DataparserOutputs(image_filenames=train_image_filenames,
                                                   cameras=train_cameras,
                                                   alpha_color=inner_outputs.alpha_color,
                                                   scene_box=inner_outputs.scene_box,
                                                   dataparser_scale=inner_outputs.dataparser_scale,
                                                   metadata=metadata)
+
             return self.base_outputs
         else:
             eval_cameras = deepcopy(inner_outputs.cameras)
@@ -190,7 +222,7 @@ class DepthProviding(DataParser):
             metadata=self.base_outputs.metadata,
         )
 
-    def add_image(self, rgb: torch.Tensor, camera: Cameras):
+    def add_image(self, rgb: torch.Tensor, camera: Cameras) -> Path:
         global updated_filenames
         global updated_fx
         global updated_fy
@@ -214,3 +246,5 @@ class DepthProviding(DataParser):
         updated_width.append(camera.width)
         updated_c2w.append(camera.camera_to_worlds)
         updated_camera_type.append(camera.camera_type)
+
+        return save_path

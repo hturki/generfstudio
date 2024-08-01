@@ -246,7 +246,7 @@ class DepthGaussiansModel(Model):
     ):
         self.seed_points = seed_points
         self.points3D_scale = metadata["points3D_scale"]
-        self.train_image_filenames = metadata["train_image_filenames"]
+        self.image_filenames = [x for x in metadata["train_image_filenames"]]
         self.test_cameras = deepcopy(metadata["test_cameras"]).to("cuda")
         self.train_cameras = metadata["train_cameras"].to("cuda")
         self.train_depths = metadata["train_depths"].to("cuda")
@@ -263,18 +263,20 @@ class DepthGaussiansModel(Model):
 
         self.remaining_indices = set(range(len(self.test_cameras)))
         self.add_image_fn = metadata["add_image_fn"]
+        self.min_conf_thresh = metadata["min_conf_thresh"]
 
-        self.prev_depths = []
-        self.prev_indices = []
-        self.prev_w2cs = []
+        self.prev_depths = None
+        self.prev_indices = None
+        self.prev_w2cs = None
 
-        self.imgs = metadata["imgs"]
+        self.depth_outputs = metadata["depth_outputs"]
         self.depth_c2ws_opencv = torch.eye(4, device="cuda").view(1, 4, 4).repeat(self.train_cameras.shape[0], 1,
                                                                                   1)
         self.depth_c2ws_opencv[:, :3] = self.train_cameras.camera_to_worlds
         self.depth_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
         self.depth_focals = self.train_cameras.fx
         self.depth_pp = torch.cat([self.train_cameras.cx, self.train_cameras.cy], -1)
+        self.pred_rgbs = metadata["train_rgbs"].to("cuda")
 
         ray_bundle = self.train_cameras.generate_rays(
             camera_indices=torch.arange(self.train_cameras.shape[0]).view(-1, 1))
@@ -460,7 +462,7 @@ class DepthGaussiansModel(Model):
             [0.26862954, 0.26130258, 0.27577711])
 
         images = torch.stack([torch.FloatTensor(np.asarray(central_crop_v2(Image.open(x))))
-                              for x in self.train_image_filenames]).to(self.device) / 255
+                              for x in self.image_filenames]).to(self.device) / 255
         images = image_encoder_normalize(image_encoder_resize(images.permute(0, 3, 1, 2)))
         c_crossattn = image_encoder.to(self.device)(images).image_embeds
 
@@ -942,6 +944,9 @@ class DepthGaussiansModel(Model):
         directions_norm_2 = ray_bundle_2.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
         decode_scale_mult_2 = (pixel_area_2 * directions_norm_2).view(to_render_cameras_2.shape[0], -1)
 
+        train_width = self.train_cameras.width[0].item()
+        train_height = self.train_cameras.height[0].item()
+
         for t_index, t in enumerate(scheduler.timesteps):
             model_input = torch.cat([sample_1] * 2) if self.config.guidance_scale > 1 else sample_1
             model_input = scheduler.scale_model_input(model_input, t)
@@ -968,8 +973,33 @@ class DepthGaussiansModel(Model):
             if to_render_indices.shape[0] == 1:
                 pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
 
-                blend_weight = acc_1.clone()
-                blend_weight[depth_1 > pred_depth] = 0
+                pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_1, focals_for_decode_1,
+                                            pp_for_decode_1).reshape(-1, 3)
+
+                mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                        pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
+                                                                                  -1),
+                                                        self.train_cameras.fx,
+                                                        self.train_cameras.fy,
+                                                        self.train_cameras.cx,
+                                                        self.train_cameras.cy,
+                                                        self.train_depths,
+                                                        train_width,
+                                                        train_height)
+                if self.prev_depths is not None:
+                    prev_cameras = self.test_cameras[self.prev_indices]
+                    mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                              pts3d.unsqueeze(0).expand(
+                                                                                  self.prev_w2cs.shape[0], -1, -1),
+                                                                              prev_cameras.fx,
+                                                                              prev_cameras.fy,
+                                                                              prev_cameras.cx,
+                                                                              prev_cameras.cy,
+                                                                              self.prev_depths,
+                                                                              image_dim_2,
+                                                                              image_dim_2), mask)
+
+                blend_weight = torch.where(torch.logical_and(depth_1 > pred_depth, mask.view(depth_1.shape)), 0, acc_1)
 
                 model_output = self.encode_rgbd(
                     (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
@@ -1022,8 +1052,32 @@ class DepthGaussiansModel(Model):
             pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
 
             if to_render_indices.shape[0] == 1:
-                blend_weight = acc_2.clone()
-                blend_weight[depth > pred_depth] = 0
+                pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
+                                            pp_for_decode_2).reshape(-1, 3)
+
+                mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                        pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
+                                                                                  -1),
+                                                        self.train_cameras.fx,
+                                                        self.train_cameras.fy,
+                                                        self.train_cameras.cx,
+                                                        self.train_cameras.cy,
+                                                        self.train_depths,
+                                                        train_width,
+                                                        train_height)
+                if self.prev_depths is not None:
+                    mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                              pts3d.unsqueeze(0).expand(
+                                                                                  self.prev_w2cs.shape[0], -1, -1),
+                                                                              prev_cameras.fx,
+                                                                              prev_cameras.fy,
+                                                                              prev_cameras.cx,
+                                                                              prev_cameras.cy,
+                                                                              self.prev_depths,
+                                                                              image_dim_2,
+                                                                              image_dim_2), mask)
+
+                blend_weight = torch.where(torch.logical_and(depth > pred_depth, mask.view(depth.shape)), 0, acc_2)
 
                 model_output = self.encode_rgbd(
                     (1 - blend_weight) * pred_rgb + blend_weight * renderings[RGB],
@@ -1041,115 +1095,204 @@ class DepthGaussiansModel(Model):
         pred_rgb, pred_depth = self.decode_rgbd(sample_2, depth_scaling_factor)
         # pred_rgb, pred_depth = self.decode_with_vae(sample_1, depth_scaling_factor)
 
-        for i, rgb in enumerate(pred_rgb):
-            self.add_image_fn(rgb, to_render_cameras_2[i:i + 1])
+        pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
+                                    pp_for_decode_2).reshape(-1, 3)
 
-        # pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
-        #                             pp_for_decode_2).reshape(-1, 3)
-        # train_width = self.train_cameras.width[0].item()
-        # train_height = self.train_cameras.height[0].item()
-        # mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
-        #                                         pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
-        #                                         self.train_cameras.fx,
-        #                                         self.train_cameras.fy,
-        #                                         self.train_cameras.cx,
-        #                                         self.train_cameras.cy,
-        #                                         self.train_depths.view(self.train_w2cs_opencv.shape[0], train_height,
-        #                                                                train_width, 1),
-        #                                         train_width,
-        #                                         train_height)
-        # if len(self.prev_depths) > 0:
-        #     prev_cameras = self.test_cameras[torch.cat(self.prev_indices)]
-        #     prev_w2cs = torch.cat(self.prev_w2cs)
-        #     mask = torch.logical_and(self.not_in_existing_predictions(prev_w2cs,
-        #                                             pts3d.unsqueeze(0).expand(prev_w2cs.shape[0], -1, -1),
-        #                                             prev_cameras.fx,
-        #                                             prev_cameras.fy,
-        #                                             prev_cameras.cx,
-        #                                             prev_cameras.cy,
-        #                                             torch.cat(self.prev_depths),
-        #                                             image_dim_2,
-        #                                             image_dim_2), mask)
-        # self.prev_depths.append(torch.where(mask.view(pred_depth.shape), pred_depth, 0))
-        # self.prev_indices.append(to_render_indices)
-        # self.prev_w2cs.append(target_w2cs_opencv)
+        should_run_ga = False
+        pred_rgb_chw_m1_1 = pred_rgb.permute(0, 3, 1, 2).unsqueeze(0) * 2 - 1
+        overlapping_indices = self.overlapping_images(self.train_w2cs_opencv,
+                                                      pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
+                                                                                -1),
+                                                      self.train_cameras.fx,
+                                                      self.train_cameras.fy,
+                                                      self.train_cameras.cx,
+                                                      self.train_cameras.cy,
+                                                      self.train_depths.view(self.train_w2cs_opencv.shape[0],
+                                                                             train_height,
+                                                                             train_width, 1),
+                                                      train_width,
+                                                      train_height)
+        if overlapping_indices.shape[0] > 0:
+            loaded_images = self.update_depth_outputs(overlapping_indices, pred_rgb_chw_m1_1, True, False, None)
+            self.update_depth_outputs(overlapping_indices, pred_rgb_chw_m1_1, False, True, loaded_images)
+            should_run_ga = True
 
-        # pts3d = pts3d[mask]
-        # scales = (pred_depth.view(decode_scale_mult_2.shape) * decode_scale_mult_2).view(-1, 1)[mask]
-        # pred_rgb = pred_rgb.reshape(-1, 3)[mask]
+        if self.prev_depths is not None:
+            overlapping_indices = self.train_cameras.shape[0] + self.overlapping_images(self.prev_w2cs,
+                                                                                        pts3d.unsqueeze(0).expand(
+                                                                                            self.prev_w2cs.shape[0],
+                                                                                            -1, -1),
+                                                                                        prev_cameras.fx,
+                                                                                        prev_cameras.fy,
+                                                                                        prev_cameras.cx,
+                                                                                        prev_cameras.cy,
+                                                                                        self.prev_depths,
+                                                                                        image_dim_2,
+                                                                                        image_dim_2)
+            if overlapping_indices.shape[0] > 0:
+                self.update_depth_outputs(overlapping_indices, pred_rgb_chw_m1_1, True, True, None)
+                should_run_ga = True
 
-        for rgb in pred_rgb:
-            idx = len(self.imgs)
-            self.imgs.append({
-                "img": rgb.permute(2, 0, 1).unsqueeze(0) * 2 - 1,
-                "true_shape": np.array([[image_dim_2, image_dim_2]], dtype=np.int32),
-                "idx": idx,
-                "instance": str(idx),
-            })
-        pairs = make_pairs(self.imgs, scene_graph="complete", prefilter=None, symmetrize=True)
+        self.depth_c2ws_opencv = torch.cat([self.depth_c2ws_opencv, target_c2ws_opencv])
+        self.depth_focals = torch.cat([self.depth_focals, to_render_cameras_2.fx])
+        self.depth_pp = torch.cat([self.depth_pp, pp_for_decode_2])
+        self.depth_scale_mult = torch.cat([self.depth_scale_mult, decode_scale_mult_2.view(-1, 1)])
 
-        output = inference(pairs, self.depth_model, "cuda", batch_size=1)
-        with torch.enable_grad():
-            scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer,
-                                   optimize_pp=True)
-            self.depth_c2ws_opencv = torch.cat([self.depth_c2ws_opencv, target_c2ws_opencv])
-            scene.preset_pose(self.depth_c2ws_opencv)
-            self.depth_focals = torch.cat([self.depth_focals, to_render_cameras_2.fx])
-            scene.preset_focal(self.depth_focals.cpu())  # Assume fx and fy are almost equal
-            self.depth_pp = torch.cat([self.depth_pp, pp_for_decode_2])
-            scene.preset_principal_point(self.depth_pp.cpu())
-            scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.1)
-        scene.clean_pointcloud()
-        pts3d = torch.cat([x.view(-1, 3) for x in scene.get_pts3d(raw=False)])
-        depth = torch.cat([x.view(-1) for x in scene.get_depthmaps(raw=False)])
-        mask = torch.cat([x.view(-1) for x in scene.im_conf]).to(pts3d.device) >= 1.5
+        self.prev_indices = torch.cat([self.prev_indices, to_render_indices]) \
+            if self.prev_indices is not None else to_render_indices
+        self.prev_w2cs = torch.cat([self.prev_w2cs, target_w2cs_opencv]) \
+            if self.prev_w2cs is not None else target_w2cs_opencv
 
-        pts3d = pts3d.view(-1, 3).detach()[mask]
-        pred_rgb = torch.cat([self.imgs[x]["img"].squeeze(0).permute(1, 2, 0).view(-1, 3).to(pts3d.device)
-                              for x in range(len(self.imgs))])[mask] / 2 + 0.5
-        # scales = depth.detach() / train_cameras.fx.view(-1, 1).cuda()
+        self.pred_rgbs = torch.cat([self.pred_rgbs, pred_rgb.view(-1, 3)])
 
-        # mask = torch.cat(confs).view(-1) > self.config.min_conf_thresh
-        self.depth_scale_mult = torch.cat([self.depth_scale_mult.to(pts3d.device), decode_scale_mult_2.view(-1, 1)])
-        scales = (depth.view(-1, 1) * self.depth_scale_mult)[mask]
+        if should_run_ga:
+            with torch.enable_grad():
+                scene = global_aligner(self.depth_outputs, device=pred_rgb.device,
+                                       mode=GlobalAlignerMode.PointCloudOptimizer, optimize_pp=True)
+                scene.preset_pose(self.depth_c2ws_opencv)
+                scene.preset_focal(self.depth_focals.cpu())  # Assume fx and fy are almost equal
+                scene.preset_principal_point(self.depth_pp.cpu())
+                scene.compute_global_alignment(init="known_poses", niter=300, schedule="cosine", lr=0.1)
 
-        chunk_size = self.means.shape[0]
-        for i in range(0, pts3d.shape[0], chunk_size):
-            end = i + chunk_size
+            scene.clean_pointcloud()
 
-            if i == 0:
-                new_opacities = torch.cat([torch.logit(torch.zeros_like(self.opacities) + 1e-5),
-                                           torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
-            else:
-                new_opacities = torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
+            depth_maps = scene.get_depthmaps(raw=False)
+            im_conf = [x for x in scene.im_conf]
+            num_train = self.train_depths.shape[0]
+            train_mask = torch.stack(im_conf[:num_train]) > self.min_conf_thresh
+            self.train_depths = torch.where(train_mask, torch.stack(depth_maps[:num_train]), 0).unsqueeze(-1)
+            prev_mask = torch.stack(im_conf[num_train:]) > self.min_conf_thresh
+            self.prev_depths = torch.where(prev_mask, torch.stack(depth_maps[num_train:]), 0).unsqueeze(-1)
+
+            mask = torch.cat([train_mask.view(-1), prev_mask.view(-1)])
+            means = torch.cat([x.view(-1, 3) for x in scene.get_pts3d(raw=False)])[mask]
+            rgb = self.pred_rgbs[mask]
+            scales = torch.cat([self.train_depths.view(-1, 1), self.prev_depths.view(-1, 1)])[mask] * \
+                     self.depth_scale_mult[mask]
 
             out = {
-                "means": torch.cat([self.means, pts3d[i:end]]),
-                "features_dc": torch.cat([self.features_dc, torch.logit(pred_rgb[i:end])]),
+                "means": means,
+                "features_dc": torch.logit(rgb),
+                "features_rest": torch.zeros(rgb.shape[0], *self.features_rest.shape[1:],
+                                             device=self.features_rest.device),
+                "opacities": torch.logit(torch.full_like(means[:, :1], 1 - 1e-5)),
+                "scales": torch.log(scales.expand(-1, 3)),
+                "quats": random_quat_tensor(scales.shape[0]).to(self.quats.device),
+            }
+        else:
+            self.prev_depths = torch.cat([self.prev_depths, pred_depth]) if self.pred_depths is not None else pred_depth
+            scales = pred_depth.view(-1, 1) * decode_scale_mult_1.view(-1, 1)
+            out = {
+                "means": torch.cat([self.means, pts3d]),
+                "features_dc": torch.cat([self.features_dc, torch.logit(pred_rgb.view(-1, 3))]),
                 "features_rest": torch.cat(
-                    [self.features_rest, torch.zeros(scales[i:end].shape[0], *self.features_rest.shape[1:],
+                    [self.features_rest, torch.zeros(scales.shape[0], *self.features_rest.shape[1:],
                                                      device=self.features_rest.device)]),
-                # "opacities": torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))]),
-                "opacities": new_opacities,
-                "scales": torch.cat([self.scales, torch.log(scales[i:end]).expand(-1, 3)]),
-                "quats": torch.cat([self.quats, random_quat_tensor(scales[i:end].shape[0]).to(self.quats.device)]),
+                "opacities": torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[:, :1], 1 - 1e-5))]),
+                "scales": torch.cat([self.scales, torch.log(scales).expand(-1, 3)]),
+                "quats": torch.cat([self.quats, random_quat_tensor(scales.shape[0]).to(self.quats.device)]),
             }
 
-            # TODO this will break if the size of self.means is smaller than what we're adding
-            split_idcs = torch.zeros(self.means.shape[0], dtype=torch.bool, device=scales.device)
-            split_idcs[-scales[i:end].shape[0]:] = True
+        for name, param in self.gauss_params.items():
+            self.gauss_params[name] = torch.nn.Parameter(out[name])
 
-            for name, param in self.gauss_params.items():
-                self.gauss_params[name] = torch.nn.Parameter(out[name])
-            self.dup_in_all_optim(optimizers, split_idcs, 1)
-        # import pdb;
-        # pdb.set_trace()
+        param_groups = self.get_gaussian_param_groups()
+        for group, new_params in param_groups.items():
+            optimizer = optimizers.optimizers[group]
+            param = optimizer.param_groups[0]["params"][0]
+            param_state = optimizer.state[param]
+
+            if "exp_avg" in param_state:
+                param_state["exp_avg"] = torch.zeros(out["means"].shape[0], *param_state["exp_avg"].shape[1:],
+                                                     device=param_state["exp_avg"].device,
+                                                     dtype=param_state["exp_avg"].dtype)
+                param_state["exp_avg_sq"] = torch.zeros(out["means"].shape[0], *param_state["exp_avg_sq"].shape[1:],
+                                                        device=param_state["exp_avg_sq"].device,
+                                                        dtype=param_state["exp_avg_sq"].dtype)
+            del optimizer.state[param]
+            optimizer.state[new_params[0]] = param_state
+            optimizer.param_groups[0]["params"] = new_params
+            del param
+
+        for i, rgb in enumerate(pred_rgb):
+            self.image_filenames.append(self.add_image_fn(rgb, to_render_cameras_2[i:i + 1]))
+
+        # chunk_size = self.means.shape[0]
+        # for i in range(0, pts3d.shape[0], chunk_size):
+        #     end = i + chunk_size
+        #
+        #     if i == 0:
+        #         new_opacities = torch.cat([torch.logit(torch.zeros_like(self.opacities) + 1e-5),
+        #                                    torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
+        #     else:
+        #         new_opacities = torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))])
+        #
+        #     out = {
+        #         "means": torch.cat([self.means, pts3d[i:end]]),
+        #         "features_dc": torch.cat([self.features_dc, torch.logit(pred_rgb[i:end])]),
+        #         "features_rest": torch.cat(
+        #             [self.features_rest, torch.zeros(scales[i:end].shape[0], *self.features_rest.shape[1:],
+        #                                              device=self.features_rest.device)]),
+        #         # "opacities": torch.cat([self.opacities, torch.logit(torch.full_like(pts3d[i:end, :1], 1 - 1e-5))]),
+        #         "opacities": new_opacities,
+        #         "scales": torch.cat([self.scales, torch.log(scales[i:end]).expand(-1, 3)]),
+        #         "quats": torch.cat([self.quats, random_quat_tensor(scales[i:end].shape[0]).to(self.quats.device)]),
+        #     }
+        #
+        #     # TODO this will break if the size of self.means is smaller than what we're adding
+        #     split_idcs = torch.zeros(self.means.shape[0], dtype=torch.bool, device=scales.device)
+        #     split_idcs[-scales[i:end].shape[0]:] = True
+        #
+        #     for name, param in self.gauss_params.items():
+        #         self.gauss_params[name] = torch.nn.Parameter(out[name])
+        #     self.dup_in_all_optim(optimizers, split_idcs, 1)
+        # # import pdb;
+        # # pdb.set_trace()
 
         self.xys_grad_norm = None
         self.vis_counts = None
         self.max_2Dsize = None
         # trigger.unlink()
         CONSOLE.log(f"Finished rendering {to_render_indices}")
+
+    def update_depth_outputs(self, overlapping_indices: torch.Tensor, pred_rgb_chw_m1_1: torch.Tensor,
+                             include_first: bool, include_second: bool, loaded_images: Optional[List]) -> None:
+        view1 = {"img": [], "idx": [], "instance": []}
+        view2 = {"img": [], "idx": [], "instance": []}
+        if loaded_images is None:
+            loaded_images = load_images([str(self.image_filenames[x]) for x in overlapping_indices],
+                                        size=512 if (not include_first or not include_second) else 256)
+        for first, rgb in enumerate(pred_rgb_chw_m1_1):
+            for second, overlapping_index in enumerate(overlapping_indices):
+                first_idx = len(self.image_filenames) + first
+                second_img = loaded_images[second]["img"].to(pred_rgb_chw_m1_1.device)
+
+                if include_first:
+                    view1["img"].append(rgb)
+                    view2["img"].append(second_img)
+                    view1["idx"].append(first_idx)
+                    view1["instance"].append(str(first_idx))
+                    view2["idx"].append(overlapping_index)
+                    view2["instance"].append(str(overlapping_index))
+
+                if include_second:
+                    view2["img"].append(rgb)
+                    view1["img"].append(second_img)
+                    view2["idx"].append(first_idx)
+                    view2["instance"].append(str(first_idx))
+                    view1["idx"].append(overlapping_index)
+                    view1["instance"].append(str(overlapping_index))
+
+        view1["img"] = torch.cat(view1["img"])
+        view2["img"] = torch.cat(view2["img"])
+
+        pred1, pred2 = self.depth_model(view1, view2)
+        new = {"view1": view1, "view2": view2, "pred1": pred1, "pred2": pred2}
+        for key in self.depth_outputs:
+            for subkey in self.depth_outputs[key]:
+                self.depth_outputs[key][subkey] += [x for x in new[key][subkey]]
+
+        return loaded_images
 
     def step_cb(self, step):
         self.step = step
@@ -1665,68 +1808,28 @@ class DepthGaussiansModel(Model):
         # return self.encode_with_vae((1 - blend_weight) * base_rgbs + blend_weight * rendering[RGB],
         #                             (1 - blend_weight) * base_depth + blend_weight * other_depth, depth_scaling_factor)
 
-    def project_pointcloud(self, w2cs: torch.Tensor, pts3d: torch.Tensor, rgb: torch.Tensor, fx: torch.Tensor,
-                           fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
-                           existing_rgb: Optional[torch.Tensor], existing_depth: Optional[torch.Tensor]) -> Dict[
-        str, torch.Tensor]:
-        image_dim = existing_rgb.shape[1]
-
-        rgb_map = existing_rgb.reshape(-1, 3).clone().type(rgb.dtype)
-        depth_map = existing_depth.view(-1).clone()
-
-        with torch.cuda.amp.autocast(enabled=False):
-            pts3d_cam_render = w2cs @ torch.cat([pts3d, torch.ones_like(pts3d[..., :1])], -1).transpose(1, 2)
-            pts3d_cam_render = pts3d_cam_render.transpose(1, 2)[..., :3]
-            z_pos = pts3d_cam_render[..., 2]
-
-            uv = pts3d_cam_render[:, :, :2] / pts3d_cam_render[:, :, 2:]
-            focal = torch.cat([fx.view(-1, 1), fy.view(-1, 1)], -1)
-            uv *= focal.unsqueeze(1)
-            center = torch.cat([cx.view(-1, 1), cy.view(-1, 1)], -1)
-            uv += center.unsqueeze(1)
-
-            is_valid_u = torch.logical_and(0 <= uv[..., 0], uv[..., 0] < image_dim)
-            is_valid_v = torch.logical_and(0 <= uv[..., 1], uv[..., 1] < image_dim)
-            is_valid_z = z_pos > 0
-            is_valid_point = torch.logical_and(torch.logical_and(is_valid_u, is_valid_v), is_valid_z)
-
-            max_val = torch.finfo(torch.float32).max
-            u = torch.round(uv[..., 0]).long().clamp(0, image_dim - 1)
-            v = torch.round(uv[..., 1]).long().clamp(0, image_dim - 1)
-            z = torch.where(is_valid_point, z_pos, max_val)
-            camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
-
-            indices = (camera_index * image_dim * image_dim + v * image_dim + u).view(-1)
-            _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
-            depth_map = depth_map.view(w2cs.shape[0], image_dim, image_dim, 1)
-
-            rgb_to_fill = min_indices[min_indices <= indices.shape[0] - 1]
-            rgb_map[indices[rgb_to_fill]] = rgb.reshape(-1, 3)[rgb_to_fill]
-            rgb_map = rgb_map.reshape(*depth_map.shape[:-1], 3)  # .permute(0, 3, 1, 2)
-
-            acc_map = depth_map < torch.finfo(torch.float32).max - 1
-            depth_map[torch.logical_not(acc_map)] = 0
-
-            return {
-                RGB: rgb_map,
-                DEPTH: depth_map,
-                ACCUMULATION: acc_map.float(),
-            }
-
-    @torch.cuda.amp.autocast(enabled=False)
-    def depth_to_pts3d(self, depth: torch.Tensor, c2ws_opencv: torch.Tensor, pixels: torch.Tensor, focals: torch.Tensor,
-                       pp: torch.Tensor) -> torch.Tensor:
-        pts3d_cam = fast_depthmap_to_pts3d(
-            depth.view(depth.shape[0], -1),
-            pixels,
-            focals,
-            pp)
-        pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
-        return pts3d.transpose(1, 2)[..., :3]
-
     def not_in_existing_predictions(self, w2cs: torch.Tensor, pts3d: torch.Tensor, fx: torch.Tensor,
                                     fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
                                     existing_depth: torch.Tensor, image_width: int, image_height: int) -> torch.Tensor:
+        _, min_indices = self.project_depth_to_other_views(w2cs, pts3d, fx, fy, cx, cy, existing_depth, image_width,
+                                                           image_height)
+        invalid_indices = torch.where(min_indices < pts3d.shape[0] * pts3d.shape[1], min_indices % pts3d.shape[1], -1)
+        mask = torch.ones_like(pts3d[0, :, 0], dtype=torch.bool)
+        mask[invalid_indices[invalid_indices > 0]] = False
+        return mask
+
+    def overlapping_images(self, w2cs: torch.Tensor, pts3d: torch.Tensor, fx: torch.Tensor,
+                           fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                           existing_depth: torch.Tensor, image_width: int, image_height: int) -> torch.Tensor:
+        depth_map, _ = self.project_depth_to_other_views(w2cs, pts3d, fx, fy, cx, cy, existing_depth, image_width,
+                                                         image_height)
+        return torch.arange(existing_depth.shape[0], device=existing_depth.device)[
+            (depth_map <= existing_depth).view(existing_depth.shape[0], -1).any(dim=-1)]
+
+    def project_depth_to_other_views(self, w2cs: torch.Tensor, pts3d: torch.Tensor, fx: torch.Tensor,
+                                     fy: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor,
+                                     existing_depth: torch.Tensor, image_width: int, image_height: int) -> Tuple[
+        torch.Tensor, torch.Tensor]:
         depth_map = existing_depth.view(-1).clone()
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -1752,8 +1855,15 @@ class DepthGaussiansModel(Model):
             camera_index = torch.arange(w2cs.shape[0], device=z.device).view(-1, 1).expand(-1, z.shape[-1])
             indices = (camera_index * image_height * image_width + v * image_width + u).view(-1)
             _, min_indices = scatter_min(z.view(-1), indices, out=depth_map)
-            invalid_indices = torch.where(min_indices < pts3d.shape[0] * pts3d.shape[1], min_indices % pts3d.shape[1],
-                                          -1)
-            mask = torch.ones_like(pts3d[0, :, 0], dtype=torch.bool)
-            mask[invalid_indices[invalid_indices > 0]] = False
-            return mask
+            return depth_map.view(existing_depth.shape), min_indices
+
+    @torch.cuda.amp.autocast(enabled=False)
+    def depth_to_pts3d(self, depth: torch.Tensor, c2ws_opencv: torch.Tensor, pixels: torch.Tensor, focals: torch.Tensor,
+                       pp: torch.Tensor) -> torch.Tensor:
+        pts3d_cam = fast_depthmap_to_pts3d(
+            depth.view(depth.shape[0], -1),
+            pixels,
+            focals,
+            pp)
+        pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
+        return pts3d.transpose(1, 2)[..., :3]

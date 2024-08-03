@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 
@@ -18,24 +17,7 @@ def central_crop_v2(image: Image):
     assert new_image.size == (s, s), (image.size, (s, s), new_image.size)
     return new_image
 
-# @torch.compile
-def get_pixel_aligned_features(latent: torch.Tensor, uv: torch.Tensor, uv_scaling: torch.Tensor) -> torch.Tensor:
-    """
-    Get pixel-aligned image features at 2D image coordinates
-    """
-    uv = uv * uv_scaling - 1.0
-    uv = uv.unsqueeze(2)  # (NS, N, 1, 2)
-    samples = F.grid_sample(
-        latent,
-        uv,
-        align_corners=True,
-        mode="bilinear",
-        padding_mode="border",
-    )
-
-    return samples[:, :, :, 0].transpose(1, 2)  # (B, N, C)
-
-# @torch.compile
+@torch.compile
 def repeat_interleave(input: torch.Tensor, repeats: int) -> torch.Tensor:
     """
     Repeat interleave along axis 0

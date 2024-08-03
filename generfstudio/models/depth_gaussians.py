@@ -26,9 +26,8 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union, Any
 
 import math
-import numpy as np
 import torch
-from diffusers import DDIMScheduler, UNet2DConditionModel, EMAModel, AutoencoderKL
+from diffusers import UNet2DConditionModel, EMAModel, DDPMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
 from mast3r.model import AsymmetricMASt3R
@@ -62,8 +61,6 @@ from generfstudio.generfstudio_utils import central_crop_v2
 import torch.nn.functional as F
 import numpy as np
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-from dust3r.image_pairs import make_pairs
-from dust3r.inference import inference
 from dust3r.utils.image import load_images
 
 
@@ -141,7 +138,7 @@ class DepthGaussiansModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: DepthGaussiansModel)
     warmup_length: int = 500
     """period of steps where refinement is turned off"""
-    refine_every: int = 1
+    refine_every: int = 1000
     """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -218,7 +215,7 @@ class DepthGaussiansModelConfig(ModelConfig):
     prediction_type: str = "epsilon"
 
     guidance_scale: float = 1.0
-    inference_steps: int = 50
+    inference_steps: int = 1000
     render_batch_size: int = 1
 
     rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
@@ -411,13 +408,13 @@ class DepthGaussiansModel(Model):
         ema_unet.load_state_dict(ema_state_dict)
         ema_unet.copy_to(self.unet_2.parameters())
 
-        self.ddim_scheduler = DDIMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
+        self.ddim_scheduler = DDPMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
                                                             subfolder="scheduler",
                                                             beta_schedule=self.config.beta_schedule,
                                                             prediction_type=self.config.prediction_type)
         self.ddim_scheduler.config["variance_type"] = "fixed_small"
         self.ddim_scheduler.config["prediction_type"] = "sample"
-        self.ddim_scheduler = DDIMScheduler.from_config(self.ddim_scheduler.config)
+        self.ddim_scheduler = DDPMScheduler.from_config(self.ddim_scheduler.config)
         self.ddim_scheduler.set_timesteps(self.config.inference_steps)
 
         pixels_im = torch.stack(
@@ -438,6 +435,7 @@ class DepthGaussiansModel(Model):
         self.depth_model.requires_grad_(False)
 
         self.clip_embeddings_1 = None
+        self.has_rendered = False
 
     @torch.inference_mode()
     def get_clip_embeddings(self):
@@ -843,7 +841,14 @@ class DepthGaussiansModel(Model):
         # if not trigger.exists():
         #     return
         if len(self.remaining_indices) == 0:
-            CONSOLE.log("DONE")
+            if not self.has_rendered:
+                result_dir = Path("/scratch/hturki/result")
+                result_dir.mkdir(parents=True, exist_ok=True)
+                for idx in range(len(self.test_cameras)):
+                    rendering = self.get_outputs(self.test_cameras[idx:idx+1])
+                    Image.fromarray((rendering[RGB] * 255).byte().cpu().numpy()).save(result_dir / f"{idx}.png")
+                CONSOLE.log("DONE")
+                self.has_rendered = True
             return
 
         remaining_renders = []
@@ -851,18 +856,24 @@ class DepthGaussiansModel(Model):
             remaining_renders.append(
                 (remaining_index, self.get_outputs(self.test_cameras[remaining_index:remaining_index + 1])))
 
+        if len(remaining_renders) == len(self.test_cameras):
+            baseline_dir = Path("/scratch/hturki/baseline")
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+            for remaining_index, rendering in remaining_renders:
+                Image.fromarray((rendering[RGB] * 255).byte().cpu().numpy()).save(baseline_dir / f"{remaining_index}.png")
+
         sorted_indices = sorted(remaining_renders, key=lambda x: x[1][ACCUMULATION].mean(), reverse=True)
         to_render_indices = []
         renderings = defaultdict(list)
         for sorted_index, sorted_rendering in sorted_indices:
             self.remaining_indices.remove(sorted_index)
-            acc_mean = sorted_rendering[ACCUMULATION].mean()
-            if acc_mean <= 0.75:
-                to_render_indices.append(sorted_index)
-                for key in [RGB, DEPTH, ACCUMULATION]:
-                    renderings[key].append(sorted_rendering[key])
-                if len(to_render_indices) == self.config.render_batch_size:
-                    break
+            # acc_mean = sorted_rendering[ACCUMULATION].mean()
+            # if acc_mean <= 0.75:
+            to_render_indices.append(sorted_index)
+            for key in [RGB, DEPTH, ACCUMULATION]:
+                renderings[key].append(sorted_rendering[key])
+            if len(to_render_indices) == self.config.render_batch_size:
+                break
 
         CONSOLE.log(f"Rendering {to_render_indices}")
         to_render_indices = torch.LongTensor(to_render_indices).to(self.test_cameras.device)
@@ -1161,7 +1172,7 @@ class DepthGaussiansModel(Model):
             num_train = self.train_depths.shape[0]
             train_mask = torch.stack(im_conf[:num_train]) > self.min_conf_thresh
             self.train_depths = torch.where(train_mask, torch.stack(depth_maps[:num_train]), 0).unsqueeze(-1)
-            prev_mask = torch.stack(im_conf[num_train:]) > self.min_conf_thresh
+            prev_mask = torch.stack(im_conf[num_train:]) > 1e-5 #self.min_conf_thresh
             self.prev_depths = torch.where(prev_mask, torch.stack(depth_maps[num_train:]), 0).unsqueeze(-1)
 
             mask = torch.cat([train_mask.view(-1), prev_mask.view(-1)])

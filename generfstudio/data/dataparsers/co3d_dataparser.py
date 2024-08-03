@@ -6,9 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
-from typing import Type, Optional, Tuple
+from typing import Type, Optional
 
-import math
 import torch
 from PIL import Image
 from co3d.dataset.data_types import (
@@ -23,8 +22,7 @@ from nerfstudio.utils.comms import get_world_size, get_rank
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
-    POSENC_SCALE
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE
 from generfstudio.generfstudio_utils import central_crop_v2
 
 PYTORCH_3D_TO_OPEN_CV = torch.diag(torch.FloatTensor([-1, -1, 1, 1]))

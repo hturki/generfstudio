@@ -11,7 +11,6 @@ from generfstudio.data.dataparsers.mipnerf_dataparser import MipNerf360DataParse
 from generfstudio.data.dataparsers.mvimgnet_dataparser import MVImgNetDataParserConfig
 from generfstudio.data.dataparsers.objaverse_xl_dataparser import ObjaverseXLDataParserConfig
 from generfstudio.data.dataparsers.r10k_dataparser import R10KDataParserConfig
-from generfstudio.data.dataparsers.sds_dataparser import SDSDataParserConfig
 
 co3d_dataparser = DataParserSpecification(config=CO3DDataParserConfig())
 depth_providing_dataparser = DataParserSpecification(config=DepthProvidingDataParserConfig())

@@ -9,10 +9,7 @@ from typing import Type, Optional, Dict
 import torch
 from PIL import Image
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-from dust3r.image_pairs import make_pairs
-from dust3r.inference import inference
 from dust3r.utils.image import load_images
-from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 from mast3r.model import AsymmetricMASt3R
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.dataparsers.base_dataparser import (
@@ -21,6 +18,7 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 )
 
 from generfstudio.data.dataparsers.mipnerf_dataparser import MipNerf360DataParserConfig
+from generfstudio.pose_utils import generate_ellipse_path
 
 
 @dataclass
@@ -37,7 +35,7 @@ class DepthProvidingDataParserConfig(DataParserConfig):
 
     update_path: Path = Path("/scratch/hturki/new-images")
 
-    min_conf_thresh: float = 1.5
+    min_conf_thresh: float = 2
     eval_res: int = 256
 
 
@@ -147,11 +145,23 @@ class DepthProviding(DataParser):
             # mask = torch.cat(confs).view(-1) > self.config.min_conf_thresh
             mask = torch.stack([x for x in scene.im_conf]).view(-1).to(xyz.device) > self.config.min_conf_thresh
             depth = depth.detach().view(len(train_cameras), cropped_heights[0].item(), cropped_widths[0].item(), 1)
+            test_cameras = self.get_dataparser_outputs("test").cameras
+            poses = generate_ellipse_path(
+                torch.cat([train_cameras.camera_to_worlds, test_cameras.camera_to_worlds]).numpy(), n_frames=10)
+
             metadata = {
                 "train_cameras": train_cameras,
                 "train_depths": torch.where(mask.view(depth.shape), depth, 0),
                 "train_rgbs": rgb.view(-1, 3),
-                "test_cameras": self.get_dataparser_outputs("test").cameras,
+                "test_cameras": Cameras(
+                    fx=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
+                    fy=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
+                    cx=torch.full((poses.shape[0], 1), self.config.eval_res / 2),
+                    cy=torch.full((poses.shape[0], 1), self.config.eval_res / 2),
+                    height=torch.full((poses.shape[0], 1), self.config.eval_res, dtype=torch.long),
+                    width=torch.full((poses.shape[0], 1), self.config.eval_res, dtype=torch.long),
+                    camera_to_worlds=torch.FloatTensor(poses),
+                ),
                 "points3D_xyz": xyz[mask],
                 "points3D_rgb": (rgb[mask.to(rgb.device)] * 255).byte(),
                 "points3D_scale": scales[mask],
@@ -167,7 +177,7 @@ class DepthProviding(DataParser):
             #                                       scene_box=inner_outputs.scene_box,
             #                                       dataparser_scale=inner_outputs.dataparser_scale,
             #                                       metadata={})
-            
+
             self.base_outputs = DataparserOutputs(image_filenames=train_image_filenames,
                                                   cameras=train_cameras,
                                                   alpha_color=inner_outputs.alpha_color,

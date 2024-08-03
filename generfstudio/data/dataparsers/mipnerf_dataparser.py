@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type, List, Optional, Dict
+from typing import Type, Optional, Dict
 
 import imageio
 import numpy as np
 import torch
-from PIL import Image
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
@@ -21,6 +19,15 @@ from rich.console import Console
 
 CONSOLE = Console(width=120)
 
+def pad_poses(p):
+  """Pad [..., 3, 4] pose matrices with a homogeneous bottom row [0,0,0,1]."""
+  bottom = np.broadcast_to([0, 0, 0, 1.0], p[Ellipsis, :1, :4].shape)
+  return np.concatenate([p[Ellipsis, :3, :4], bottom], axis=-2)
+
+
+def unpad_poses(p):
+  """Remove the homogeneous bottom row from [..., 4, 4] pose matrices."""
+  return p[Ellipsis, :3, :4]
 
 @dataclass
 class MipNerf360DataParserConfig(DataParserConfig):
@@ -47,32 +54,50 @@ class Mipnerf360(DataParser):
     config: MipNerf360DataParserConfig
 
     @classmethod
-    def normalize_orientation(cls, poses: np.ndarray):
-        """Set the _up_ direction to be in the positive Y direction.
+    def transform_poses_pca(cls, poses):
+        """Transforms poses so principal components lie on XYZ axes.
+  
         Args:
-            poses: Numpy array of poses.
+          poses: a (N, 3, 4) array containing the cameras' camera to world transforms.
+  
+        Returns:
+          A tuple (poses, transform), with the transformed poses and the applied
+          camera_to_world transforms.
         """
-        poses_orig = poses.copy()
-        bottom = np.reshape([0, 0, 0, 1.0], [1, 4])
-        center = poses[:, :3, 3].mean(0)
-        vec2 = poses[:, :3, 2].sum(0) / np.linalg.norm(poses[:, :3, 2].sum(0))
-        up = poses[:, :3, 1].sum(0)
-        vec0 = np.cross(up, vec2) / np.linalg.norm(np.cross(up, vec2))
-        vec1 = np.cross(vec2, vec0) / np.linalg.norm(np.cross(vec2, vec0))
-        c2w = np.stack([vec0, vec1, vec2, center], -1)  # [3, 4]
-        c2w = np.concatenate([c2w[:3, :4], bottom], -2)  # [4, 4]
-        bottom = np.tile(np.reshape(bottom, [1, 1, 4]), [poses.shape[0], 1, 1])  # [BS, 1, 4]
-        poses = np.concatenate([poses[:, :3, :4], bottom], -2)  # [BS, 4, 4]
-        poses = np.linalg.inv(c2w) @ poses
-        poses_orig[:, :3, :4] = poses[:, :3, :4]
-        return poses_orig
+        t = poses[:, :3, 3]
+        t_mean = t.mean(axis=0)
+        t = t - t_mean
+
+        eigval, eigvec = np.linalg.eig(t.T @ t)
+        # Sort eigenvectors in order of largest to smallest eigenvalue.
+        inds = np.argsort(eigval)[::-1]
+        eigvec = eigvec[:, inds]
+        rot = eigvec.T
+        if np.linalg.det(rot) < 0:
+            rot = np.diag(np.array([1, 1, -1])) @ rot
+
+        transform = np.concatenate([rot, rot @ -t_mean[:, None]], -1)
+        poses_recentered = unpad_poses(transform @ pad_poses(poses))
+        transform = np.concatenate([transform, np.eye(4)[3:]], axis=0)
+
+        # Flip coordinate system if z component of y-axis is negative
+        if poses_recentered.mean(axis=0)[2, 1] < 0:
+            poses_recentered = np.diag(np.array([1, -1, -1])) @ poses_recentered
+            transform = np.diag(np.array([1, -1, -1, 1])) @ transform
+
+        # Just make sure it's it in the [-1, 1]^3 cube
+        scale_factor = 1.0 / np.max(np.abs(poses_recentered[:, :3, 3]))
+        poses_recentered[:, :3, 3] *= scale_factor
+        transform = np.diag(np.array([scale_factor] * 3 + [1])) @ transform
+
+        return poses_recentered, transform
 
     def get_dataparser_outputs(self, split: str = "train", **kwargs: Optional[Dict]) -> DataparserOutputs:
         fx = []
         fy = []
         cx = []
         cy = []
-        c2ws = []
+        # c2ws = []
         width = []
         height = []
         image_filenames = []
@@ -96,7 +121,6 @@ class Mipnerf360(DataParser):
 
         poses_data = np.load(self.config.data / 'poses_bounds.npy')
         poses = poses_data[:, :-2].reshape([-1, 3, 5]).astype(np.float32)
-        bounds = poses_data[:, -2:].transpose([1, 0])
 
         if num_images != poses.shape[0]:
             raise RuntimeError(f'Different number of images ({num_images}), and poses ({poses.shape[0]})')
@@ -114,35 +138,25 @@ class Mipnerf360(DataParser):
         # Reorder pose to match nerfstudio convention
         poses = np.concatenate([poses[:, :, 1:2], -poses[:, :, 0:1], poses[:, :, 2:]], axis=-1)
 
-        # Center poses and rotate. (Compute up from average of all poses)
-        poses = self.normalize_orientation(poses)
+        poses, _ = self.transform_poses_pca(poses[..., :4])
+        c2ws = torch.FloatTensor(poses)
 
-        # Scale factor used in mipnerf
-        if self.config.auto_scale:
-            scale_factor = 1 / (np.min(bounds) * 0.75)
-            poses[:, :3, 3] *= scale_factor
-            bounds *= scale_factor
-
-        # Center poses
-        poses[:, :3, 3] = poses[:, :3, 3] - np.mean(poses[:, :3, :], axis=0)[:, 3]
-        c2ws.append(torch.from_numpy(poses[:, :3, :4]))
-
-        c2ws = torch.cat(c2ws)
         min_bounds = c2ws[:, :, 3].min(dim=0)[0]
         max_bounds = c2ws[:, :, 3].max(dim=0)[0]
 
-        origin = (max_bounds + min_bounds) * 0.5
-        CONSOLE.log('Calculated origin: {} {} {}'.format(origin, min_bounds, max_bounds))
-
-        pose_scale_factor = ((max_bounds - min_bounds) * 0.5).norm().item()
-        CONSOLE.log('Calculated pose scale factor: {}'.format(pose_scale_factor))
-
-        for c2w in c2ws:
-            c2w[:, 3] = (c2w[:, 3] - origin) / pose_scale_factor
-            assert torch.logical_and(c2w >= -1, c2w <= 1).all(), c2w
+        # origin = (max_bounds + min_bounds) * 0.5
+        # CONSOLE.log('Calculated origin: {} {} {}'.format(origin, min_bounds, max_bounds))
+        #
+        # pose_scale_factor = ((max_bounds - min_bounds) * 0.5).norm().item()
+        # CONSOLE.log('Calculated pose scale factor: {}'.format(pose_scale_factor))
+        #
+        # for c2w in c2ws:
+        #     c2w[:, 3] = (c2w[:, 3] - origin) / pose_scale_factor
+        #     assert torch.logical_and(c2w >= -1, c2w <= 1).all(), c2w
 
         # in x,y,z order
-        scene_box = SceneBox(aabb=((torch.stack([min_bounds, max_bounds]) - origin) / pose_scale_factor).float())
+        scene_box = SceneBox(aabb=torch.stack([min_bounds, max_bounds]))
+        # scene_box = SceneBox(aabb=((torch.stack([min_bounds, max_bounds]) - origin) / pose_scale_factor).float())
 
         train_indices = np.linspace(0, num_images, self.config.train_images, endpoint=False, dtype=np.int32)
 
@@ -175,9 +189,9 @@ class Mipnerf360(DataParser):
             cameras=cameras,
             scene_box=scene_box,
             dataparser_scale=1,
-            metadata={
-                'pose_scale_factor': pose_scale_factor,
-            }
+            # metadata={
+            #     'pose_scale_factor': pose_scale_factor,
+            # }
         )
 
         return dataparser_outputs

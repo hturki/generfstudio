@@ -27,7 +27,7 @@ class R10KDataParserConfig(DataParserConfig):
 
     _target: Type = field(default_factory=lambda: R10K)
     """target class to instantiate"""
-    data: Path = Path("data/acid")
+    data: Path = Path("data/r10k")
     """Directory specifying location of data."""
 
     scene_id: Optional[str] = None  # "train/2ecba9802673be71"

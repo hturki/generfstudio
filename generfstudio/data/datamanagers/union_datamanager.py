@@ -53,7 +53,8 @@ class UnionDatamanagerConfig(DataManagerConfig):
         _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
     ))
 
-    include_oxl: bool = True
+    include_oxl: bool = False
+    include_acid: bool = True
 
     # Making this a config makes startup very slow
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
@@ -65,23 +66,28 @@ class UnionDatamanagerConfig(DataManagerConfig):
     # MVImgNetDataParserConfig()
     # ])
 
-
-DATAPARSERS_NO_OXL = [
-    DL3DVDataParserConfig(use_dust3r_poses=False),
+DATAPARSERS = [
+    DL3DVDataParserConfig(),
     CO3DDataParserConfig(),
-    R10KDataParserConfig(data=Path("data/r10k")),
-    # ObjaverseXLDataParserConfig(),
+    R10KDataParserConfig(),
     MVImgNetDataParserConfig(),
-    # R10KDataParserConfig(),
 ]
 
-DATAPARSERS = [
-    DL3DVDataParserConfig(use_dust3r_poses=False),
+DATAPARSERS_WITH_OXL = [
+    DL3DVDataParserConfig(),
     CO3DDataParserConfig(),
-    R10KDataParserConfig(data=Path("data/r10k")),
-    ObjaverseXLDataParserConfig(),
-    # R10KDataParserConfig(),
+    R10KDataParserConfig(),
     MVImgNetDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+]
+
+DATAPARSERS_WITH_ACID = [
+    DL3DVDataParserConfig(),
+    CO3DDataParserConfig(),
+    R10KDataParserConfig(),
+    ObjaverseXLDataParserConfig(),
+    MVImgNetDataParserConfig(),
+    R10KDataParserConfig(data=Path("data/acid")),
 ]
 
 
@@ -100,7 +106,14 @@ class UnionDatamanager(DataManager):
             **kwargs,
     ):
         self.delegates = []
-        for dataparser in tqdm(DATAPARSERS if config.include_oxl else DATAPARSERS_NO_OXL):
+        if self.config.include_acid:
+            dataparsers = DATAPARSERS_WITH_ACID
+        elif self.config.include_oxl:
+            dataparsers = DATAPARSERS_WITH_OXL
+        else:
+            dataparsers = DATAPARSERS
+
+        for dataparser in tqdm(dataparsers):
             inner = deepcopy(config.inner)
             inner.dataparser = dataparser
             self.delegates.append(

@@ -251,20 +251,11 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
             if to_return.metadata is None:
                 to_return.metadata = {}
 
-        # data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device)
         randomize_result = self.randomize_background(data)
         if randomize_result is not None:
             fg_mask, random_bg = randomize_result
             to_return.metadata[FG_MASK] = fg_mask.to(self.device)
-            # to_return.metadata[NEIGHBOR_FG_MASK] = neighbor_fg_mask.to(self.device)
             to_return.metadata[BG_COLOR] = random_bg.to(self.device)
-
-        # to_return.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
-        # del data[NEIGHBOR_IMAGES]
-
-        # to_return.metadata[NEIGHBOR_CAMERAS] = self.train_cameras[data[NEIGHBOR_INDICES]].to(
-        #     self.device)
-        # del data[NEIGHBOR_INDICES]
 
         if PTS3D in data:
             to_return.metadata[PTS3D] = data[PTS3D].to(self.device)
@@ -299,22 +290,13 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         if camera.metadata is None:
             camera.metadata = {}
 
-        # data[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES].to(self.device).unsqueeze(0)
         randomize_result = self.randomize_background(data)
         if randomize_result is not None:
             fg_mask, random_bg = randomize_result
             camera.metadata[FG_MASK] = fg_mask.to(self.device)
-            # camera.metadata[NEIGHBOR_FG_MASK] = neighbor_fg_mask.to(self.device)
             camera.metadata[BG_COLOR] = random_bg.to(self.device)
 
         camera.metadata["image"] = data["image"]
-        # data["image"] = data["image"].to(self.device).squeeze(0)
-
-        # camera.metadata[NEIGHBOR_IMAGES] = data[NEIGHBOR_IMAGES]
-        # del data[NEIGHBORING_VIEW_IMAGES] keep it to log in wandb
-
-        # camera.metadata[NEIGHBOR_CAMERAS] = self.eval_cameras[data[NEIGHBOR_INDICES].unsqueeze(0)].to(self.device)
-        # del data[NEIGHBOR_INDICES]
 
         if PTS3D in data:
             camera.metadata[PTS3D] = data[PTS3D].to(self.device)
@@ -330,9 +312,6 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
     def randomize_background(data: Dict) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if data["image"].shape[-1] == 4:
             random_bg = torch.rand(data["image"].shape[0], 3, device=data["image"].device)
-            # fg_mask = data["image"][..., 3] > 0
-            # data["image"] = data["image"][..., :3] * data["image"][..., 3:] \
-            #                 + random_bg.view(data["image"].shape[0], 1, 1, 3) * (1 - data["image"][..., 3:])
             fg_mask = data["image"][..., 3] > 0
 
             data["image"] = data["image"][..., :3] * data["image"][..., 3:] \

@@ -1,24 +1,14 @@
-import traceback
 from pathlib import Path
-from typing import Optional, List, Any, Dict
+from pathlib import Path
+from typing import Optional, List, Any
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
-from nerfstudio.utils.comms import get_rank
 
 from generfstudio.generfstudio_utils import central_crop_v2
-
-try:
-    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-    from dust3r.model import AsymmetricCroCo3DStereo
-    from dust3r.image_pairs import make_pairs
-    from dust3r.inference import inference
-    from dust3r.utils.image import load_images
-except:
-    pass
 
 
 def convert_from_inner(inner_outputs: DataparserOutputs, dest: Path, crop: Optional[int]) -> List[Any]:
@@ -110,113 +100,4 @@ def get_xyz_in_camera(inner_outputs: DataparserOutputs, frames: List[Any]):
     is_valid_points = torch.logical_and(torch.logical_and(is_valid_x, is_valid_y), is_valid_z)
 
     return xyz_in_camera, uv, is_valid_points, width, height
-
-
-def create_dust3r_poses(model, dust3r_path: Path, image_path: Path, metadata: Dict,
-                        frame_intersections: Optional[torch.Tensor], use_known_poses: bool, num_neighbors: int = 10,
-                        num_iters: int = 5000, lr: float = 0.01, schedule: str = "linear", batch_size: int = 1000,
-                        chunk_size: Optional[int] = None):
-    rank = get_rank()
-    device = f"cuda:{rank}"
-
-    with torch.no_grad():
-        images = load_images([str(image_path / x["file_path"]) for x in metadata["frames"]], size=224, verbose=False)
-        if frame_intersections is not None:
-            pairs = []
-            for i in range(len(images)):
-                _, closest = torch.sort(frame_intersections[i], descending=True)
-                for neighbor in closest[:num_neighbors]:
-                    if neighbor != i:
-                        pairs.append((images[i], images[neighbor]))
-        else:
-            pairs = []
-            num_neighbors = 1
-            for i in range(len(images) - num_neighbors):
-                for j in range(1, num_neighbors + 1):
-                    pairs.append((images[i], images[i + j]))
-                    pairs.append((images[i + j], images[i]))
-            # pairs = make_pairs(images, scene_graph="complete", prefilter=None, symmetrize=True)
-
-        torch.cuda.empty_cache()
-        output = inference(pairs, model, device, batch_size=batch_size)
-        scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer,
-                               optimize_pp=use_known_poses)
-
-        dust3r_path.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if use_known_poses:
-            c2ws = []
-            fx = []
-            pp = []
-
-            for frame in metadata["frames"]:
-                c2w = torch.eye(4)
-                c2w[:3] = torch.FloatTensor(frame["transform_matrix"])
-                c2w[:, 1:3] *= -1  # opencv to opengl
-                c2ws.append(c2w)
-
-                fx.append(frame["fl_x"] * 224 / frame["w"])
-                pp.append(torch.FloatTensor([frame["cx"], frame["cy"]]) * 224 / frame["w"])
-
-            scene.preset_pose(torch.stack(c2ws))
-            scene.preset_focal(torch.FloatTensor(fx))  # Assume fx and fy are almost equal
-            scene.preset_principal_point(torch.stack(pp))  # Assume cx and cy are almost equal
-            torch.cuda.empty_cache()
-
-            alignment_loss = scene.compute_global_alignment(init="known_poses", niter=num_iters, schedule=schedule,
-                                                            lr=lr, chunk_size=chunk_size)
-        else:
-            alignment_loss = scene.compute_global_alignment(init="mst", niter=num_iters, schedule=schedule, lr=lr, chunk_size=chunk_size)
-    except:
-        traceback.print_exc()
-        (dust3r_path / "FAIL").touch()
-        return
-
-    with torch.no_grad():
-        focals = scene.get_focals()
-        pp = scene.get_principal_points()
-        im_poses = scene.get_im_poses()
-        depth = scene.get_depthmaps(raw=True)
-
-        for frame, depth_map in zip(metadata["frames"], depth):
-            frame_path_png = Path(dust3r_path / frame["file_path"])
-            frame_path_png.parent.mkdir(exist_ok=True, parents=True)
-            frame_path_pt = frame_path_png.parent / f"{frame_path_png.stem}.pt"
-            torch.save(depth_map.cpu().detach().clone(), frame_path_pt)
-            # frame_path_gz = frame_path_png.parent / f"{frame_path_png.stem}.npy.gz"
-            # f = gzip.GzipFile(str(frame_path_gz), "w")
-            # numpy.save(file=f, arr=depth_map.detach().cpu().numpy())
-            # f.close()
-
-        pts3d = scene.get_pts3d(raw=True)
-        min_bounds = pts3d.view(-1, 3).min(dim=0)[0]
-        max_bounds = pts3d.view(-1, 3).max(dim=0)[0]
-
-        torch.save({
-            "focals": focals.cpu().detach().clone(),
-            "pp": pp.cpu().detach().clone(),
-            "poses": im_poses.cpu().detach().clone(),
-            "alignment_loss": alignment_loss,
-            "num_neighbors": num_neighbors,
-            "alignment_iters": num_iters,
-            "alignment_lr": lr,
-            "alignment_schedule": schedule,
-            "near": float(depth.min()),
-            "far": float(depth.max()),
-            "scene_box": torch.stack([min_bounds, max_bounds]).cpu().detach().clone(),
-            # "acc_test": True,
-        }, dust3r_path / "scene.pt")
-
-        # view1 = torch.IntTensor(output["view1"]["idx"])
-        # view2 = torch.IntTensor(output["view2"]["idx"])
-        # pred1_conf = torch.FloatTensor(output["pred1"]["conf"]).view(output["pred1"]["conf"].shape[0], -1, 1)
-        # pred2_conf = torch.FloatTensor(output["pred2"]["conf"]).view(output["pred2"]["conf"].shape[0], -1, 1)
-        # quantiles = torch.FloatTensor([0.1, 0.5, 0.9]).to(pred1_conf.device)
-        # torch.save({
-        #     "view1": view1.cpu().detach().clone(),
-        #     "view2": view2.cpu().detach().clone(),
-        #     "pred1_conf_mean": pred1_conf.mean(dim=-1).cpu().detach().clone(),
-        #     "pred2_conf_mean": pred2_conf.mean(dim=-1).cpu().detach().clone(),
-        # }, dust3r_path / "confs.pt")
 

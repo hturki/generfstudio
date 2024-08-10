@@ -77,5 +77,5 @@ class NeighboringViewsDataset(InputDataset):
     def read_depth(self, image_idx: int) -> torch.Tensor:
         depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., 0]
 
-        depth[depth >= 65504.] = 0
+        # depth[depth >= 65504.] = 0
         return torch.FloatTensor(depth)

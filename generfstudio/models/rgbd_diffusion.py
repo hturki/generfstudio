@@ -206,74 +206,42 @@ class RGBDDiffusion(RGBDDiffusionBase):
     def get_outputs(self, cameras: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         outputs = {}
         images = cameras.metadata["image"]
-        cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
-
         image_dim = cameras.width[0, 0].item()
+        pts3d = cameras.metadata.get(PTS3D, None)
+        depth = cameras.metadata.get(DEPTH, None)
+        # fg_masks = cameras.metadata.get(FG_MASK, None)
         bg_colors = cameras.metadata.get(BG_COLOR, None)
 
-        if PTS3D in cameras.metadata:
+        cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
+
+        if pts3d is not None:
             clip_rgbs = (images[:, 1:] if self.training else images[:, -1:]).permute(0, 1, 4, 2, 3)
-            pts3d = cameras.metadata[PTS3D]
-            depth = cameras.metadata[DEPTH]
-            fg_masks = cameras.metadata.get(FG_MASK, None)
-            rgbs_to_project = images
-            project_dim = image_dim
-            project_scale_factor = 1
+            # if fg_masks is None:
+            fg_masks = torch.ones_like(pts3d[..., :1])
+
+            valid_alignment = torch.ones(cameras.shape[0], dtype=torch.bool, device=cameras.device)
         else:
             rgbs_chw = images.permute(0, 1, 4, 2, 3)
             clip_rgbs = (rgbs_chw[:, 1:] if self.training else rgbs_chw[:, -1:])
-            project_dim = 224
-
-            with torch.inference_mode():
-                rgbs_to_project_chw = self.dust3r_resize(rgbs_chw.flatten(0, 1)).clamp(0, 1)
-                rgbs_to_project_chw = rgbs_to_project_chw.view(cameras.shape[0], -1, *rgbs_to_project_chw.shape[1:])
-
-            rgbs_to_project = rgbs_to_project_chw.permute(0, 1, 3, 4, 2)
-
-            if FG_MASK in cameras.metadata:
-                fg_masks = cameras.metadata[FG_MASK]
-                with torch.inference_mode():
-                    fg_masks = self.dust3r_resize(fg_masks.flatten(0, 1).unsqueeze(1).float()).squeeze(
-                        1).bool()
-                    fg_masks = fg_masks.view(cameras.shape[0], -1, *fg_masks.shape[1:])
-            else:
-                fg_masks = None
 
             c2ws_opencv = torch.eye(4, device=cameras.device).view(1, 1, 4, 4).repeat(cameras.shape[0],
                                                                                       cameras.shape[1], 1, 1)
             c2ws_opencv[:, :, :3] = cameras.camera_to_worlds
             c2ws_opencv[:, :, :, 1:3] *= -1  # opengl to opencv
 
-            project_scale_factor = 224 / image_dim
-            fx = cameras.fx * project_scale_factor
-            fy = cameras.fy * project_scale_factor
-            cx = cameras.cx * project_scale_factor
-            cy = cameras.cy * project_scale_factor
-
-            pts3d, depth, alignment_loss, valid_alignment = self.depth_estimator_field.get_pts3d_and_depth(
-                rgbs_to_project_chw, fg_masks, c2ws_opencv, fx, fy, cx, cy)
-
-            depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_to_project_chw.shape[3:])
-            pts3d = pts3d.view(*cameras.shape[:2], *pts3d.shape[1:])
-
-            if self.training:
-                max_camera_depth = depth[:, 0].flatten(1, 2).max(dim=-1)[0]
-                valid_alignment = torch.logical_and(valid_alignment, max_camera_depth > 0)
-
-                if valid_alignment.any():
-                    cameras = cameras[valid_alignment]
-                    images = images[valid_alignment]
-                    pts3d = pts3d[valid_alignment]
-                    depth = depth[valid_alignment]
-                    rgbs_to_project = rgbs_to_project[valid_alignment]
-                    clip_rgbs = clip_rgbs[valid_alignment]
-
-                    if fg_masks is not None:
-                        fg_masks = fg_masks[valid_alignment]
-                        bg_colors = bg_colors[valid_alignment]
+            fg_masks = torch.ones_like(pts3d[..., :1])
+            pts3d, depth, alignment_loss, valid_alignment, confs = self.depth_estimator_field.get_pts3d_and_depth(
+                rgbs_chw, fg_masks, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
 
             outputs[ALIGNMENT_LOSS] = alignment_loss
             outputs[VALID_ALIGNMENT] = valid_alignment.float().mean()
+
+            depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+
+            fg_masks = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+            # conf_mask = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+            # fg_masks = torch.logical_and(fg_masks, conf_mask) if fg_masks is not None else conf_mask
+            pts3d = pts3d.view(*cameras.shape[:2], *pts3d.shape[1:])
 
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))
 
@@ -285,9 +253,9 @@ class RGBDDiffusion(RGBDDiffusionBase):
 
         to_project = cameras[:, 1:] if self.training else cameras
         if self.config.scale_with_pixel_area:
-            scale_mult = self.get_pixel_area_scale_mult(to_project.flatten(), project_dim).view(*to_project.shape, -1)
+            scale_mult = self.get_pixel_area_scale_mult(to_project.flatten(), image_dim).view(*to_project.shape, -1)
         else:
-            scale_mult = 1 / (to_project.fx * project_scale_factor)
+            scale_mult = 1 / to_project.fx
 
         if self.training:
             timesteps = torch.randint(0, self.ddpm_scheduler.config.num_train_timesteps, (cameras.shape[0],),
@@ -297,17 +265,13 @@ class RGBDDiffusion(RGBDDiffusionBase):
             target_w2cs_opencv = self.c2ws_opengl_to_w2cs_opencv(cameras.camera_to_worlds[:, :1]).squeeze(1)
 
             cond_pts3d = pts3d[:, 1:]
-            scales = depth[:, 1:].flatten(-2, -1) * scale_mult
-            opacity = fg_masks[:, 1:].view(pts3d[..., :1].shape).float() if fg_masks is not None \
-                else torch.ones_like(cond_pts3d[..., :1])
-
             c_concat, _ = self.get_concat(
                 target_w2cs_opencv,
                 cameras[:, 0],
                 cond_pts3d,
-                scales,
-                opacity,
-                rgbs_to_project[:, 1:],
+                depth[:, 1:].flatten(-2, -1) * scale_mult,
+                fg_masks[:, 1:].view(cond_pts3d[..., :1].shape).float(),
+                images[:, 1:],
                 1,
                 bg_colors,
                 depth_scaling_factor
@@ -326,12 +290,7 @@ class RGBDDiffusion(RGBDDiffusionBase):
             # forward call as expected in DDP
             rgb_to_encode = images[:, 0]
             if not self.config.rgb_only:
-                depth_to_encode = depth[:, :1]
-                if depth_to_encode.shape[-1] != image_dim:
-                    with torch.inference_mode():
-                        depth_to_encode = F.interpolate(depth_to_encode, image_dim, mode="bicubic",
-                                                        antialias=True).clamp_min(0)
-                depth_to_encode = depth_to_encode.permute(0, 2, 3, 1)
+                depth_to_encode = depth[:, :1].permute(0, 2, 3, 1)
             else:
                 depth_to_encode = None
 
@@ -412,10 +371,9 @@ class RGBDDiffusion(RGBDDiffusionBase):
             concat_depth = []
             concat_acc = []
             cond_pts3d = pts3d[:, -1:]
-            opacity = fg_masks[:, -1:].view(pts3d[..., -1:].shape).float() if fg_masks is not None \
-                else torch.ones_like(cond_pts3d[..., :1])
-            scales = depth[:, -1:].flatten(-2, -1) * scale_mult[:, -1:]
-            cond_rgbs = rgbs_to_project[:, -1:].view(1, -1, 3)
+            opacity = fg_masks[:, -1:].view(cond_pts3d[..., :1].shape).float()
+            scales = depth[:, -1:].flatten(-2, -1) * scale_mult
+            cond_rgbs = images[:, -1:].view(1, -1, 3)
 
             if self.config.guidance_scale > 1:
                 c_crossattn = torch.cat([torch.zeros_like(c_crossattn), c_crossattn])

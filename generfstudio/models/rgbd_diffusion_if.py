@@ -380,15 +380,15 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
         images = cameras.metadata["image"]
         pts3d = cameras.metadata.get(PTS3D, None)
         depth = cameras.metadata.get(DEPTH, None)
-        fg_masks = cameras.metadata.get(FG_MASK, None)
+        # fg_masks = cameras.metadata.get(FG_MASK, None)
         bg_colors = cameras.metadata.get(BG_COLOR, None)
 
         cameras.metadata = {}  # Should do deepcopy instead if we still need any metadata here
 
         if pts3d is not None:
             clip_rgbs = (images[:, 1:] if self.training else images[:, -1:]).permute(0, 1, 4, 2, 3)
-            if fg_masks is None:
-                fg_masks = torch.ones_like(pts3d[..., :1])
+            # if fg_masks is None:
+            fg_masks = torch.ones_like(pts3d[..., :1])
 
             valid_alignment = torch.ones(cameras.shape[0], dtype=torch.bool, device=cameras.device)
         else:
@@ -401,15 +401,16 @@ class RGBDDiffusionIF(RGBDDiffusionBase):
             c2ws_opencv[:, :, :, 1:3] *= -1  # opengl to opencv
 
             pts3d, depth, alignment_loss, valid_alignment, confs = self.depth_estimator_field.get_pts3d_and_depth(
-                rgbs_chw, fg_masks, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
+                rgbs_chw, None, c2ws_opencv, cameras.fx, cameras.fy, cameras.cx, cameras.cy)
 
             outputs[ALIGNMENT_LOSS] = alignment_loss
             outputs[VALID_ALIGNMENT] = valid_alignment.float().mean()
 
             depth = depth.clamp_min(0).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
 
-            conf_mask = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
-            fg_masks = torch.logical_and(fg_masks, conf_mask) if fg_masks is not None else conf_mask
+            fg_masks = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+            # conf_mask = (confs > self.config.min_conf_thresh).view(*cameras.shape[:2], *rgbs_chw.shape[3:])
+            # fg_masks = torch.logical_and(fg_masks, conf_mask) if fg_masks is not None else conf_mask
             pts3d = pts3d.view(*cameras.shape[:2], *pts3d.shape[1:])
 
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))

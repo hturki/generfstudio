@@ -127,7 +127,6 @@ class GlobalPointCloudOptimizer(nn.Module):
         valid_pairs = valid_scenes.repeat_interleave(pairs_per_scene)
 
         valid_scales = scales[valid_pairs]
-        self.pred_scales_log.data[valid_pairs] = valid_scales.log()
         valid_view1_idx = self.view1_idx[valid_pairs]
 
         self.pts3d_cam.data[valid_view1_idx] = 0

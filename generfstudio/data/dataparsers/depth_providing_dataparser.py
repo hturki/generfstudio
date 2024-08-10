@@ -17,7 +17,8 @@ from nerfstudio.data.dataparsers.base_dataparser import (
     DataParserConfig, DataparserOutputs,
 )
 
-from generfstudio.data.dataparsers.mipnerf_dataparser import MipNerf360DataParserConfig
+from generfstudio.data.dataparsers.dtu_dataparser import DTUDataParserConfig
+from generfstudio.data.dataparsers.llff_dataparser import LLFFDataParserConfig
 from generfstudio.pose_utils import generate_ellipse_path
 
 
@@ -26,7 +27,7 @@ class DepthProvidingDataParserConfig(DataParserConfig):
     _target: Type = field(default_factory=lambda: DepthProviding)
     """target class to instantiate"""
 
-    inner: DataParserConfig = field(default_factory=lambda: MipNerf360DataParserConfig())
+    inner: DataParserConfig = field(default_factory=lambda: LLFFDataParserConfig())
     """inner dataparser"""
 
     depth_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
@@ -36,7 +37,11 @@ class DepthProvidingDataParserConfig(DataParserConfig):
     update_path: Path = Path("/scratch/hturki/new-images")
 
     min_conf_thresh: float = 2
-    eval_res: int = 256
+    # eval_res: int = 256
+    eval_factor: int = 8
+
+    train_images: Optional[int] = None
+    use_dtu: bool = False
 
 
 updated_filenames = []
@@ -56,8 +61,14 @@ class DepthProviding(DataParser):
 
     def __init__(self, config: DepthProvidingDataParserConfig):
         super().__init__(config=config)
+        if self.config.use_dtu:
+            config.inner = DTUDataParserConfig()
+
         if config.data != Path():
             config.inner.data = self.config.data
+
+        if self.config.train_images is not None:
+            config.inner.train_images = self.config.train_images
         self.inner: DataParser = config.inner.setup()
 
         if self.config.update_path.exists():
@@ -88,13 +99,6 @@ class DepthProviding(DataParser):
             train_cameras.height = cropped_heights
             train_cameras.width = cropped_widths
 
-            # pairs = make_pairs(imgs, scene_graph="complete", prefilter=None, symmetrize=True)
-
-            # scene = sparse_global_alignment([str(x) for x in train_image_filenames], pairs, self.config.cache_path, model, matching_conf_thr=0)
-            # pts3d, depthmaps, confs = scene.get_dense_pts3d(subsample=8)
-            # pts3d = torch.cat(pts3d)
-            # depth = torch.stack(depthmaps)
-
             view1 = {"img": [], "idx": [], "instance": []}
             view2 = {"img": [], "idx": [], "instance": []}
             for first in range(len(imgs)):
@@ -116,9 +120,14 @@ class DepthProviding(DataParser):
             output = {
                 "view1": {"idx": view1["idx"], "instance": view1["instance"]},
                 "view2": {"idx": view2["idx"], "instance": view2["instance"]},
-                "pred1": {k: [x for x in v] for k, v in pred1.items()},
-                "pred2": {k: [x for x in v] for k, v in pred2.items()},
+                "pred1": {k: [x for x in pred1[k]] for k in ["pts3d", "conf"]},
+                "pred2": {k: [x for x in pred2[k]] for k in ["pts3d_in_other_view", "conf"]},
             }
+
+            # scene = sparse_global_alignment([str(x) for x in train_image_filenames], pairs, self.config.cache_path, model, matching_conf_thr=0)
+            # pts3d, depthmaps, confs = scene.get_dense_pts3d(subsample=8)
+            # pts3d = torch.cat(pts3d)
+            # depth = torch.stack(depthmaps)
 
             scene = global_aligner(output, device="cuda", mode=GlobalAlignerMode.PointCloudOptimizer, optimize_pp=True)
             scene.preset_pose(c2ws_opencv)
@@ -146,22 +155,23 @@ class DepthProviding(DataParser):
             mask = torch.stack([x for x in scene.im_conf]).view(-1).to(xyz.device) > self.config.min_conf_thresh
             depth = depth.detach().view(len(train_cameras), cropped_heights[0].item(), cropped_widths[0].item(), 1)
             test_cameras = self.get_dataparser_outputs("test").cameras
-            poses = generate_ellipse_path(
-                torch.cat([train_cameras.camera_to_worlds, test_cameras.camera_to_worlds]).numpy(), n_frames=10)
+            # poses = generate_ellipse_path(
+            #     torch.cat([train_cameras.camera_to_worlds, test_cameras.camera_to_worlds]).numpy(), n_frames=10)
 
             metadata = {
                 "train_cameras": train_cameras,
                 "train_depths": torch.where(mask.view(depth.shape), depth, 0),
                 "train_rgbs": rgb.view(-1, 3),
-                "test_cameras": Cameras(
-                    fx=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
-                    fy=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
-                    cx=torch.full((poses.shape[0], 1), self.config.eval_res / 2),
-                    cy=torch.full((poses.shape[0], 1), self.config.eval_res / 2),
-                    height=torch.full((poses.shape[0], 1), self.config.eval_res, dtype=torch.long),
-                    width=torch.full((poses.shape[0], 1), self.config.eval_res, dtype=torch.long),
-                    camera_to_worlds=torch.FloatTensor(poses),
-                ),
+                "ellipse_cameras": test_cameras,
+                # "ellipse_cameras": Cameras(
+                #     fx=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
+                #     fy=test_cameras.fx.mean(dim=0, keepdim=True).expand(poses.shape[0], -1),
+                #     cx=torch.full((poses.shape[0], 1), 128),
+                #     cy=torch.full((poses.shape[0], 1), 128),
+                #     height=torch.full((poses.shape[0], 1), 256, dtype=torch.long),
+                #     width=torch.full((poses.shape[0], 1), 256, dtype=torch.long),
+                #     camera_to_worlds=torch.FloatTensor(poses),
+                # ),
                 "points3D_xyz": xyz[mask],
                 "points3D_rgb": (rgb[mask.to(rgb.device)] * 255).byte(),
                 "points3D_scale": scales[mask],
@@ -188,12 +198,14 @@ class DepthProviding(DataParser):
             return self.base_outputs
         else:
             eval_cameras = deepcopy(inner_outputs.cameras)
-            eval_cameras.rescale_output_resolution(
-                self.config.eval_res / torch.minimum(eval_cameras.width, eval_cameras.height))
-            eval_cameras.cx -= ((eval_cameras.width - self.config.eval_res) / 2)
-            eval_cameras.cy -= ((eval_cameras.height - self.config.eval_res) / 2)
-            eval_cameras.height.fill_(self.config.eval_res)
-            eval_cameras.width.fill_(self.config.eval_res)
+            eval_cameras.rescale_output_resolution(1 / self.config.eval_factor)
+
+            # eval_cameras.rescale_output_resolution(
+            #     self.config.eval_res / torch.minimum(eval_cameras.width, eval_cameras.height))
+            # eval_cameras.cx -= ((eval_cameras.width - self.config.eval_res) / 2)
+            # eval_cameras.cy -= ((eval_cameras.height - self.config.eval_res) / 2)
+            # eval_cameras.height.fill_(self.config.eval_res)
+            # eval_cameras.width.fill_(self.config.eval_res)
             return DataparserOutputs(
                 image_filenames=inner_outputs.image_filenames,
                 cameras=eval_cameras,

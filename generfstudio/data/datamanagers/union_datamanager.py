@@ -54,7 +54,7 @@ class UnionDatamanagerConfig(DataManagerConfig):
     ))
 
     include_oxl: bool = False
-    include_acid: bool = True
+    include_acid: bool = False
 
     # Making this a config makes startup very slow
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [
@@ -106,9 +106,9 @@ class UnionDatamanager(DataManager):
             **kwargs,
     ):
         self.delegates = []
-        if self.config.include_acid:
+        if config.include_acid:
             dataparsers = DATAPARSERS_WITH_ACID
-        elif self.config.include_oxl:
+        elif config.include_oxl:
             dataparsers = DATAPARSERS_WITH_OXL
         else:
             dataparsers = DATAPARSERS

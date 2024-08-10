@@ -25,12 +25,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union, Any
 
-import math
 import torch
-from diffusers import UNet2DConditionModel, EMAModel, DDPMScheduler
+from diffusers import UNet2DConditionModel, EMAModel, DDPMScheduler, DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
 from mast3r.model import AsymmetricMASt3R
+from nerfstudio.models.splatfacto import random_quat_tensor, RGB2SH, SH2RGB, resize_image, get_viewmat
 from torch_scatter import scatter_min
 from torchvision import transforms
 from transformers import CLIPVisionModelWithProjection
@@ -47,14 +47,12 @@ from gsplat.cuda_legacy._wrapper import num_sh_bases
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
-from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from PIL import Image
 from generfstudio.generfstudio_utils import central_crop_v2
@@ -62,75 +60,6 @@ import torch.nn.functional as F
 import numpy as np
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.image import load_images
-
-
-def random_quat_tensor(N):
-    """
-    Defines a random quaternion tensor of shape (N, 4)
-    """
-    u = torch.rand(N)
-    v = torch.rand(N)
-    w = torch.rand(N)
-    return torch.stack(
-        [
-            torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
-            torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
-            torch.sqrt(u) * torch.sin(2 * math.pi * w),
-            torch.sqrt(u) * torch.cos(2 * math.pi * w),
-        ],
-        dim=-1,
-    )
-
-
-def RGB2SH(rgb):
-    """
-    Converts from RGB values [0,1] to the 0th spherical harmonic coefficient
-    """
-    C0 = 0.28209479177387814
-    return (rgb - 0.5) / C0
-
-
-def SH2RGB(sh):
-    """
-    Converts from the 0th spherical harmonic coefficient to RGB values [0,1]
-    """
-    C0 = 0.28209479177387814
-    return sh * C0 + 0.5
-
-
-def resize_image(image: torch.Tensor, d: int):
-    """
-    Downscale images using the same 'area' method in opencv
-
-    :param image shape [H, W, C]
-    :param d downscale factor (must be 2, 4, 8, etc.)
-
-    return downscaled image in shape [H//d, W//d, C]
-    """
-    import torch.nn.functional as tf
-
-    image = image.to(torch.float32)
-    weight = (1.0 / (d * d)) * torch.ones((1, 1, d, d), dtype=torch.float32, device=image.device)
-    return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
-
-
-@torch_compile()
-def get_viewmat(optimized_camera_to_world):
-    """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
-    """
-    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
-    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
-    # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
-    # analytic matrix inverse to get world2camera matrix
-    R_inv = R.transpose(1, 2)
-    T_inv = -torch.bmm(R_inv, T)
-    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
-    viewmat[:, 3, 3] = 1.0  # homogenous
-    viewmat[:, :3, :3] = R_inv
-    viewmat[:, :3, 3:4] = T_inv
-    return viewmat
 
 
 @dataclass
@@ -198,10 +127,7 @@ class DepthGaussiansModelConfig(ModelConfig):
     However, PLY exported with antialiased rasterize mode is not compatible with classic mode. Thus many web viewers that
     were implemented for classic mode can not render antialiased mode PLY properly without modifications.
     """
-    camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
-    """Config of the camera optimizer to use"""
 
-    optimize: bool = False
     checkpoint_path_1: Path = Path("/compute/trinity-2-29/hturki/stage-1.ckpt")
     checkpoint_path_2: Path = Path("/compute/trinity-2-29/hturki/stage-2.ckpt")
 
@@ -215,14 +141,20 @@ class DepthGaussiansModelConfig(ModelConfig):
     prediction_type: str = "epsilon"
 
     guidance_scale: float = 1.0
-    inference_steps: int = 1000
+    use_ddim: bool = True
+    inference_steps: int = 50
     render_batch_size: int = 1
 
     rgb_mapping: Literal["clamp", "sigmoid"] = "clamp"
     depth_mapping: Literal["scaled", "disparity", "log"] = "scaled"
-    rgbd_concat_strategy: Literal["mode", "sample", "mean_std", "downsample"] = "sample"
+    # rgbd_concat_strategy: Literal["mode", "sample", "mean_std", "downsample"] = "sample"
 
     depth_model_name: str = "/data/hturki/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+
+    optimize: bool = True
+    run_autoregression: bool = True
+    autoregression_interval: int = 1000
+    render_with_diffusion: bool = True
 
 
 class DepthGaussiansModel(Model):
@@ -243,47 +175,51 @@ class DepthGaussiansModel(Model):
     ):
         self.seed_points = seed_points
         self.points3D_scale = metadata["points3D_scale"]
+
         self.image_filenames = [x for x in metadata["train_image_filenames"]]
-        self.test_cameras = deepcopy(metadata["test_cameras"]).to("cuda")
+        self.ellipse_cameras = metadata["ellipse_cameras"].to("cuda")
+        padding_w = (64 - self.ellipse_cameras.width % 64) % 64
+        # assert padding_w % 2 == 0, padding_w
+
+        new_width = self.ellipse_cameras.width + padding_w
+        # camera.fx *= (new_width / camera.width)
+        left = padding_w // 2
+        self.ellipse_cameras.cx += left
+        self.ellipse_cameras.width = new_width
+
+        padding_h = (64 - self.ellipse_cameras.height % 64) % 64
+        # assert padding_h % 2 == 0, padding_h
+        new_height = self.ellipse_cameras.height + padding_h
+        # camera.fy *= (new_height / camera.height)
+        top = padding_h // 2
+        self.ellipse_cameras.cy += top
+        self.ellipse_cameras.height = new_height
+
         self.train_cameras = metadata["train_cameras"].to("cuda")
-        self.train_depths = metadata["train_depths"].to("cuda")
-
-        self.train_w2cs_opencv = torch.eye(4, device="cuda").view(1, 4, 4).repeat(self.train_cameras.shape[0], 1,
-                                                                                  1)
-        R = self.train_cameras.camera_to_worlds[:, :3, :3].clone()
-        R[:, :, 1:3] *= -1  # opengl to opencv
-        R_inv = R.transpose(1, 2)
-        self.train_w2cs_opencv[:, :3, :3] = R_inv
-        T = self.train_cameras.camera_to_worlds[:, :3, 3:]
-        inv_T = -torch.bmm(R_inv, T)
-        self.train_w2cs_opencv[:, :3, 3:] = inv_T
-
-        self.remaining_indices = set(range(len(self.test_cameras)))
+        self.train_depths = metadata["train_depths"]
         self.add_image_fn = metadata["add_image_fn"]
         self.min_conf_thresh = metadata["min_conf_thresh"]
-
-        self.prev_depths = None
-        self.prev_indices = None
-        self.prev_w2cs = None
+        self.remaining_indices = set(range(len(self.ellipse_cameras)))
 
         self.depth_outputs = metadata["depth_outputs"]
-        self.depth_c2ws_opencv = torch.eye(4, device="cuda").view(1, 4, 4).repeat(self.train_cameras.shape[0], 1,
-                                                                                  1)
-        self.depth_c2ws_opencv[:, :3] = self.train_cameras.camera_to_worlds
-        self.depth_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
         self.depth_focals = self.train_cameras.fx
         self.depth_pp = torch.cat([self.train_cameras.cx, self.train_cameras.cy], -1)
-        self.pred_rgbs = metadata["train_rgbs"].to("cuda")
+
+        self.depth_c2ws_opencv, self.train_w2cs_opencv = self.c2ws_opengl_to_opencv(self.train_cameras.camera_to_worlds)
 
         ray_bundle = self.train_cameras.generate_rays(
             camera_indices=torch.arange(self.train_cameras.shape[0]).view(-1, 1))
-
         pixel_area = ray_bundle.pixel_area.squeeze(-1).permute(2, 0, 1).view(self.train_cameras.shape[0], -1)
         directions_norm = ray_bundle.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1).view(
             self.train_cameras.shape[0], -1)
         self.depth_scale_mult = (pixel_area * directions_norm).reshape(-1, 1)
 
+        self.prev_depths = None
+        self.prev_indices = None
+        self.prev_w2cs = None
+
         super().__init__(*args, **kwargs)
+        self.register_buffer("pred_rgbs", metadata["train_rgbs"], persistent=False)
 
     def populate_modules(self):
         if self.seed_points is not None and not self.config.random_init:
@@ -294,7 +230,8 @@ class DepthGaussiansModel(Model):
         num_points = means.shape[0]
 
         scales = torch.nn.Parameter(torch.log(self.points3D_scale.repeat(1, 3)))
-        opacities = torch.nn.Parameter(torch.logit(0.99999 * torch.ones(num_points, 1)))
+        delattr(self, "points3D_scale")
+        opacities = torch.nn.Parameter(torch.logit(1 - 1e-5 * torch.ones(num_points, 1)))
 
         self.max_2Dsize = None
         quats = torch.nn.Parameter(random_quat_tensor(num_points))
@@ -330,9 +267,7 @@ class DepthGaussiansModel(Model):
             }
         )
 
-        self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
-        )
+        delattr(self, "seed_points")
 
         # metrics
         from torchmetrics.image import PeakSignalNoiseRatio
@@ -408,28 +343,24 @@ class DepthGaussiansModel(Model):
         ema_unet.load_state_dict(ema_state_dict)
         ema_unet.copy_to(self.unet_2.parameters())
 
-        self.ddim_scheduler = DDPMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
-                                                            subfolder="scheduler",
-                                                            beta_schedule=self.config.beta_schedule,
-                                                            prediction_type=self.config.prediction_type)
-        self.ddim_scheduler.config["variance_type"] = "fixed_small"
-        self.ddim_scheduler.config["prediction_type"] = "sample"
-        self.ddim_scheduler = DDPMScheduler.from_config(self.ddim_scheduler.config)
-        self.ddim_scheduler.set_timesteps(self.config.inference_steps)
+        if self.config.use_ddim:
+            self.scheduler = DDIMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
+                                                           subfolder="scheduler",
+                                                           beta_schedule=self.config.beta_schedule,
+                                                           prediction_type=self.config.prediction_type)
+            self.scheduler.config["variance_type"] = "fixed_small"
+            self.scheduler.config["prediction_type"] = "sample"
+            self.scheduler = DDIMScheduler.from_config(self.scheduler.config)
+        else:
+            self.scheduler = DDPMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
+                                                           subfolder="scheduler",
+                                                           beta_schedule=self.config.beta_schedule,
+                                                           prediction_type=self.config.prediction_type)
+            self.scheduler.config["variance_type"] = "fixed_small"
+            self.scheduler.config["prediction_type"] = "sample"
+            self.scheduler = DDPMScheduler.from_config(self.scheduler.config)
 
-        pixels_im = torch.stack(
-            torch.meshgrid(
-                torch.arange(64, dtype=torch.float32),
-                torch.arange(64, dtype=torch.float32),
-                indexing="ij")).permute(2, 1, 0)
-        self.register_buffer("pixels_1", pixels_im.reshape(-1, 2), persistent=False)
-
-        pixels_im = torch.stack(
-            torch.meshgrid(
-                torch.arange(256, dtype=torch.float32),
-                torch.arange(256, dtype=torch.float32),
-                indexing="ij")).permute(2, 1, 0)
-        self.register_buffer("pixels_2", pixels_im.reshape(-1, 2), persistent=False)
+        self.scheduler.set_timesteps(self.config.inference_steps)
 
         self.depth_model = AsymmetricMASt3R.from_pretrained(self.config.depth_model_name)
         self.depth_model.requires_grad_(False)
@@ -531,26 +462,6 @@ class DepthGaussiansModel(Model):
             new_shape = (newp,) + old_shape[1:]
             self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
         super().load_state_dict(dict, **kwargs)
-
-    def k_nearest_sklearn(self, x: torch.Tensor, k: int):
-        """
-            Find k-nearest neighbors using sklearn's NearestNeighbors.
-        x: The data tensor of shape [num_samples, num_features]
-        k: The number of neighbors to retrieve
-        """
-        # Convert tensor to numpy array
-        x_np = x.cpu().numpy()
-
-        # Build the nearest neighbors model
-        from sklearn.neighbors import NearestNeighbors
-
-        nn_model = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean").fit(x_np)
-
-        # Find the k-nearest neighbors
-        distances, indices = nn_model.kneighbors(x_np)
-
-        # Exclude the point itself from the result and return
-        return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)
 
     def remove_from_optim(self, optimizer, deleted_mask, new_params):
         """removes the deleted_mask from the optimizer provided"""
@@ -830,22 +741,28 @@ class DepthGaussiansModel(Model):
             )
         )
 
-        cbs.append(TrainingCallback([TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.generate_view,
-                                    args=[training_callback_attributes.optimizers]))
+        if self.config.run_autoregression:
+            cbs.append(TrainingCallback([TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.generate_view,
+                                        update_every_num_iters=self.config.autoregression_interval,
+                                        args=[training_callback_attributes.optimizers]))
 
         return cbs
 
     @torch.no_grad()
     def generate_view(self, optimizers: Optimizers, step: int):
+        if step == 0 and self.config.optimize:
+            return
+
         # trigger = Path("/scratch/hturki/render_view")
         # if not trigger.exists():
         #     return
+
         if len(self.remaining_indices) == 0:
             if not self.has_rendered:
                 result_dir = Path("/scratch/hturki/result")
                 result_dir.mkdir(parents=True, exist_ok=True)
-                for idx in range(len(self.test_cameras)):
-                    rendering = self.get_outputs(self.test_cameras[idx:idx+1])
+                for idx in range(len(self.ellipse_cameras)):
+                    rendering = self.get_outputs(self.ellipse_cameras[idx:idx + 1])
                     Image.fromarray((rendering[RGB] * 255).byte().cpu().numpy()).save(result_dir / f"{idx}.png")
                 CONSOLE.log("DONE")
                 self.has_rendered = True
@@ -854,13 +771,14 @@ class DepthGaussiansModel(Model):
         remaining_renders = []
         for remaining_index in self.remaining_indices:
             remaining_renders.append(
-                (remaining_index, self.get_outputs(self.test_cameras[remaining_index:remaining_index + 1])))
+                (remaining_index, self.get_outputs(self.ellipse_cameras[remaining_index:remaining_index + 1])))
 
-        if len(remaining_renders) == len(self.test_cameras):
+        if len(remaining_renders) == len(self.ellipse_cameras):
             baseline_dir = Path("/scratch/hturki/baseline")
             baseline_dir.mkdir(parents=True, exist_ok=True)
             for remaining_index, rendering in remaining_renders:
-                Image.fromarray((rendering[RGB] * 255).byte().cpu().numpy()).save(baseline_dir / f"{remaining_index}.png")
+                Image.fromarray((rendering[RGB] * 255).byte().cpu().numpy()).save(
+                    baseline_dir / f"{remaining_index}.png")
 
         sorted_indices = sorted(remaining_renders, key=lambda x: x[1][ACCUMULATION].mean(), reverse=True)
         to_render_indices = []
@@ -876,238 +794,32 @@ class DepthGaussiansModel(Model):
                 break
 
         CONSOLE.log(f"Rendering {to_render_indices}")
-        to_render_indices = torch.LongTensor(to_render_indices).to(self.test_cameras.device)
+        to_render_indices = torch.LongTensor(to_render_indices).to(self.ellipse_cameras.device)
         renderings = {k: torch.stack(v) for k, v in renderings.items()}
+        cameras = self.ellipse_cameras[to_render_indices]
 
-        c_crossattn_1, c_crossattn_2 = self.get_clip_embeddings()
-        c_crossattn_1 = c_crossattn_1.expand(to_render_indices.shape[0], -1, -1)
-        c_crossattn_2 = c_crossattn_2.expand(to_render_indices.shape[0], -1, -1)
+        pred_rgb, pred_depth = self.get_diffusion_outputs(cameras, renderings)
 
-        depth = renderings[DEPTH]
-        depth_scaling_factor = self.get_depth_scaling_factor(depth.view(to_render_indices.shape[0], -1))
+        focals_for_decode = torch.cat([cameras.fx, cameras.fy], -1)
+        pp_for_decode = torch.cat([cameras.cx, cameras.cy], -1)
+        ray_bundle = cameras.generate_rays(camera_indices=torch.arange(len(cameras)).view(-1, 1))
+        pixel_area_2 = ray_bundle.pixel_area.squeeze(-1).permute(2, 0, 1)
+        directions_norm_2 = ray_bundle.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
+        decode_scale_mult = (pixel_area_2 * directions_norm_2).view(cameras.shape[0], -1)
 
-        image_dim_1 = 64
-        rgb_1 = (
-            F.interpolate(renderings[RGB].permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True)
-            .permute(0, 2, 3, 1))
-        depth_1 = F.interpolate(depth.permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True).permute(0, 2, 3,
-                                                                                                                1)
-        encoded_1 = self.encode_rgbd(rgb_1, depth_1, depth_scaling_factor)
-        acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), image_dim_1, mode="bicubic", antialias=True)
-        c_concat_1 = torch.cat([encoded_1, acc_1], 1)
-        acc_1 = acc_1.permute(0, 2, 3, 1)
+        c2ws_opencv, w2cs_opencv = self.c2ws_opengl_to_opencv(cameras.camera_to_worlds)
 
-        image_dim_2 = 256
-        encoded_2 = self.encode_rgbd(renderings[RGB], depth, depth_scaling_factor)
-        acc_2 = renderings[ACCUMULATION]
-
-        # image_dim_1 = 256
-        # encoded_1 = self.encode_with_vae(renderings[RGB], depth, depth_scaling_factor)
-        # acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), image_dim_1 // self.vae_scale_factor,
-        #                       mode="bicubic", antialias=True)
-        # c_concat_1 = torch.cat([encoded_1, acc_1], 1)
-
-        if self.config.guidance_scale > 1:
-            c_concat_1 = torch.cat([torch.zeros_like(c_concat_1), c_concat_1])
-            c_crossattn_1 = torch.cat([torch.zeros_like(c_crossattn_1), c_crossattn_1])
-            c_crossattn_2 = torch.cat([torch.zeros_like(c_crossattn_2), c_crossattn_2])
-
-        scheduler = self.ddim_scheduler
-        # sample_1 = scheduler.init_noise_sigma * randn_tensor(
-        #     (to_render_indices.shape[0], 4, image_dim_1 // self.vae_scale_factor, image_dim_1 // self.vae_scale_factor),
-        #     device=c_concat_1.device, dtype=c_concat_1.dtype)
-        sample_1 = scheduler.init_noise_sigma * randn_tensor(
-            (to_render_indices.shape[0], 4, image_dim_1, image_dim_1),
-            device=c_concat_1.device, dtype=c_concat_1.dtype)
-
-        target_c2ws_opencv = torch.eye(4, device=c_concat_1.device).view(1, 4, 4).repeat(to_render_indices.shape[0],
-                                                                                         1, 1)
-        to_render_cameras_2 = self.test_cameras[to_render_indices]
-        to_render_cameras_1 = deepcopy(to_render_cameras_2)
-        to_render_cameras_1.rescale_output_resolution(
-            64 / torch.maximum(to_render_cameras_1.width, to_render_cameras_1.height))
-        target_c2ws_opencv[:, :3] = to_render_cameras_2.camera_to_worlds
-        target_c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
-
-        target_w2cs_opencv = torch.eye(4, device=c_concat_1.device).view(1, 4, 4).repeat(to_render_indices.shape[0], 1,
-                                                                                         1)
-        R_inv = target_c2ws_opencv[:, :3, :3].transpose(1, 2)
-        target_w2cs_opencv[:, :3, :3] = R_inv
-        T = target_c2ws_opencv[:, :3, 3:]
-        inv_T = -torch.bmm(R_inv, T)
-        target_w2cs_opencv[:, :3, 3:] = inv_T
-
-        focals_for_decode_1 = torch.cat([to_render_cameras_1.fx, to_render_cameras_1.fy], -1)
-        pp_for_decode_1 = torch.cat([to_render_cameras_1.cx, to_render_cameras_1.cy], -1)
-        ray_bundle_1 = to_render_cameras_1.generate_rays(
-            camera_indices=torch.arange(len(to_render_cameras_1)).view(-1, 1))
-
-        pixel_area_1 = ray_bundle_1.pixel_area.squeeze(-1).permute(2, 0, 1)
-        directions_norm_1 = ray_bundle_1.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
-        decode_scale_mult_1 = (pixel_area_1 * directions_norm_1).view(to_render_cameras_1.shape[0], -1)
-
-        focals_for_decode_2 = torch.cat([to_render_cameras_2.fx, to_render_cameras_2.fy], -1)
-        pp_for_decode_2 = torch.cat([to_render_cameras_2.cx, to_render_cameras_2.cy], -1)
-        ray_bundle_2 = to_render_cameras_2.generate_rays(
-            camera_indices=torch.arange(len(to_render_cameras_2)).view(-1, 1))
-
-        pixel_area_2 = ray_bundle_2.pixel_area.squeeze(-1).permute(2, 0, 1)
-        directions_norm_2 = ray_bundle_2.metadata["directions_norm"].squeeze(-1).permute(2, 0, 1)
-        decode_scale_mult_2 = (pixel_area_2 * directions_norm_2).view(to_render_cameras_2.shape[0], -1)
-
+        image_width = cameras.width[0].item()  # Assume that all camera dims are equal
+        image_height = cameras.height[0].item()
+        pixels_im = torch.stack(
+            torch.meshgrid(
+                torch.arange(image_height, dtype=torch.float32, device=cameras.device),
+                torch.arange(image_width, dtype=torch.float32, device=cameras.device),
+                indexing="ij")).permute(2, 1, 0)
+        pixels = pixels_im.reshape(-1, 2)
+        pts3d = self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels, focals_for_decode, pp_for_decode).reshape(-1, 3)
         train_width = self.train_cameras.width[0].item()
         train_height = self.train_cameras.height[0].item()
-
-        for t_index, t in enumerate(scheduler.timesteps):
-            model_input = torch.cat([sample_1] * 2) if self.config.guidance_scale > 1 else sample_1
-            model_input = scheduler.scale_model_input(model_input, t)
-            model_input = torch.cat([model_input, c_concat_1], dim=1)
-
-            model_output = self.unet_1(model_input, t, c_crossattn_1, return_dict=False)[0]
-
-            if self.config.guidance_scale > 1:
-                model_output_uncond, model_output_cond = model_output.chunk(2)
-                model_output = model_output_uncond + self.config.guidance_scale * \
-                               (model_output_cond - model_output_uncond)
-
-            alpha_prod_t = scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
-            beta_prod_t = 1 - alpha_prod_t
-            if self.config.prediction_type == "epsilon":
-                pred_original_sample = (sample_1 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-            elif self.config.prediction_type == "sample":
-                pred_original_sample = model_output
-            elif self.config.prediction_type == "v_prediction":
-                pred_original_sample = (alpha_prod_t ** 0.5) * sample_1 - (beta_prod_t ** 0.5) * model_output
-            else:
-                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
-
-            if to_render_indices.shape[0] == 1:
-                pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
-
-                pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_1, focals_for_decode_1,
-                                            pp_for_decode_1).reshape(-1, 3)
-
-                mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
-                                                        pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
-                                                                                  -1),
-                                                        self.train_cameras.fx,
-                                                        self.train_cameras.fy,
-                                                        self.train_cameras.cx,
-                                                        self.train_cameras.cy,
-                                                        self.train_depths,
-                                                        train_width,
-                                                        train_height)
-                if self.prev_depths is not None:
-                    prev_cameras = self.test_cameras[self.prev_indices]
-                    mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
-                                                                              pts3d.unsqueeze(0).expand(
-                                                                                  self.prev_w2cs.shape[0], -1, -1),
-                                                                              prev_cameras.fx,
-                                                                              prev_cameras.fy,
-                                                                              prev_cameras.cx,
-                                                                              prev_cameras.cy,
-                                                                              self.prev_depths,
-                                                                              image_dim_2,
-                                                                              image_dim_2), mask)
-
-                blend_weight = torch.where(torch.logical_and(depth_1 > pred_depth, mask.view(depth_1.shape)), 0, acc_1)
-
-                model_output = self.encode_rgbd(
-                    (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
-                    (1 - blend_weight) * pred_depth + blend_weight * depth_1,
-                    depth_scaling_factor)
-            else:
-                model_output = self.project_predictions(target_w2cs_opencv, target_c2ws_opencv,
-                                                        pred_original_sample, self.pixels_1,
-                                                        focals_for_decode_1, pp_for_decode_1,
-                                                        None, depth_scaling_factor,
-                                                        decode_scale_mult_1, image_dim_1)
-
-            sample_1 = scheduler.step(model_output, t, sample_1, return_dict=False)[0]
-
-        c_concat_2 = torch.cat([F.interpolate(sample_1, image_dim_2, mode="bicubic", antialias=True), encoded_2,
-                                acc_2.permute(0, 3, 1, 2)], 1)
-
-        if self.config.guidance_scale > 1:
-            c_concat_2 = torch.cat([torch.zeros_like(c_concat_2), c_concat_2])
-
-        sample_2 = self.ddim_scheduler.init_noise_sigma * randn_tensor(
-            (to_render_indices.shape[0], 4, image_dim_2, image_dim_2),
-            device=c_concat_2.device, dtype=c_concat_2.dtype)
-
-        for t_index, t in enumerate(self.ddim_scheduler.timesteps):
-            model_input = torch.cat([sample_2] * 2) if self.config.guidance_scale > 1 else sample_2
-            model_input = self.ddim_scheduler.scale_model_input(model_input, t)
-            model_input = torch.cat([model_input, c_concat_2], dim=1)
-
-            model_output = \
-                self.unet_2(model_input, t, c_crossattn_2, class_labels=torch.tensor([t], device=model_input.device),
-                            return_dict=False)[0]
-
-            if self.config.guidance_scale > 1:
-                model_output_uncond, model_output_cond = model_output.chunk(2)
-                model_output = model_output_uncond + self.config.guidance_scale * \
-                               (model_output_cond - model_output_uncond)
-
-            alpha_prod_t = self.ddim_scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
-            beta_prod_t = 1 - alpha_prod_t
-            if self.config.prediction_type == "epsilon":
-                pred_original_sample = (sample_2 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-            elif self.config.prediction_type == "sample":
-                pred_original_sample = model_output
-            elif self.config.prediction_type == "v_prediction":
-                pred_original_sample = (alpha_prod_t ** 0.5) * sample_2 - (beta_prod_t ** 0.5) * model_output
-            else:
-                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
-
-            pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
-
-            if to_render_indices.shape[0] == 1:
-                pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
-                                            pp_for_decode_2).reshape(-1, 3)
-
-                mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
-                                                        pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
-                                                                                  -1),
-                                                        self.train_cameras.fx,
-                                                        self.train_cameras.fy,
-                                                        self.train_cameras.cx,
-                                                        self.train_cameras.cy,
-                                                        self.train_depths,
-                                                        train_width,
-                                                        train_height)
-                if self.prev_depths is not None:
-                    mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
-                                                                              pts3d.unsqueeze(0).expand(
-                                                                                  self.prev_w2cs.shape[0], -1, -1),
-                                                                              prev_cameras.fx,
-                                                                              prev_cameras.fy,
-                                                                              prev_cameras.cx,
-                                                                              prev_cameras.cy,
-                                                                              self.prev_depths,
-                                                                              image_dim_2,
-                                                                              image_dim_2), mask)
-
-                blend_weight = torch.where(torch.logical_and(depth > pred_depth, mask.view(depth.shape)), 0, acc_2)
-
-                model_output = self.encode_rgbd(
-                    (1 - blend_weight) * pred_rgb + blend_weight * renderings[RGB],
-                    (1 - blend_weight) * pred_depth + blend_weight * depth,
-                    depth_scaling_factor)
-            else:
-                model_output = self.project_predictions(target_w2cs_opencv, target_c2ws_opencv,
-                                                        pred_original_sample, self.pixels_2,
-                                                        focals_for_decode_2, pp_for_decode_2,
-                                                        None, depth_scaling_factor,
-                                                        decode_scale_mult_2, image_dim_2)
-
-            sample_2 = scheduler.step(model_output, t, sample_2, return_dict=False)[0]
-
-        pred_rgb, pred_depth = self.decode_rgbd(sample_2, depth_scaling_factor)
-        # pred_rgb, pred_depth = self.decode_with_vae(sample_1, depth_scaling_factor)
-
-        pts3d = self.depth_to_pts3d(pred_depth, target_c2ws_opencv, self.pixels_2, focals_for_decode_2,
-                                    pp_for_decode_2).reshape(-1, 3)
 
         should_run_ga = False
         pred_rgb_chw_m1_1 = pred_rgb.permute(0, 3, 1, 2).unsqueeze(0) * 2 - 1
@@ -1129,6 +841,7 @@ class DepthGaussiansModel(Model):
             should_run_ga = True
 
         if self.prev_depths is not None:
+            prev_cameras = self.ellipse_cameras[self.prev_indices]
             overlapping_indices = self.train_cameras.shape[0] + self.overlapping_images(self.prev_w2cs,
                                                                                         pts3d.unsqueeze(0).expand(
                                                                                             self.prev_w2cs.shape[0],
@@ -1138,21 +851,20 @@ class DepthGaussiansModel(Model):
                                                                                         prev_cameras.cx,
                                                                                         prev_cameras.cy,
                                                                                         self.prev_depths,
-                                                                                        image_dim_2,
-                                                                                        image_dim_2)
+                                                                                        image_width,
+                                                                                        image_height)
             if overlapping_indices.shape[0] > 0:
                 self.update_depth_outputs(overlapping_indices, pred_rgb_chw_m1_1, True, True, None)
                 should_run_ga = True
 
-        self.depth_c2ws_opencv = torch.cat([self.depth_c2ws_opencv, target_c2ws_opencv])
-        self.depth_focals = torch.cat([self.depth_focals, to_render_cameras_2.fx])
-        self.depth_pp = torch.cat([self.depth_pp, pp_for_decode_2])
-        self.depth_scale_mult = torch.cat([self.depth_scale_mult, decode_scale_mult_2.view(-1, 1)])
+        self.depth_c2ws_opencv = torch.cat([self.depth_c2ws_opencv, c2ws_opencv])
+        self.depth_focals = torch.cat([self.depth_focals, cameras.fx])
+        self.depth_pp = torch.cat([self.depth_pp, pp_for_decode])
+        self.depth_scale_mult = torch.cat([self.depth_scale_mult, decode_scale_mult.view(-1, 1)])
 
         self.prev_indices = torch.cat([self.prev_indices, to_render_indices]) \
             if self.prev_indices is not None else to_render_indices
-        self.prev_w2cs = torch.cat([self.prev_w2cs, target_w2cs_opencv]) \
-            if self.prev_w2cs is not None else target_w2cs_opencv
+        self.prev_w2cs = torch.cat([self.prev_w2cs, w2cs_opencv]) if self.prev_w2cs is not None else w2cs_opencv
 
         self.pred_rgbs = torch.cat([self.pred_rgbs, pred_rgb.view(-1, 3)])
 
@@ -1172,7 +884,7 @@ class DepthGaussiansModel(Model):
             num_train = self.train_depths.shape[0]
             train_mask = torch.stack(im_conf[:num_train]) > self.min_conf_thresh
             self.train_depths = torch.where(train_mask, torch.stack(depth_maps[:num_train]), 0).unsqueeze(-1)
-            prev_mask = torch.stack(im_conf[num_train:]) > 1e-5 #self.min_conf_thresh
+            prev_mask = torch.stack(im_conf[num_train:]) > 1e-5  # self.min_conf_thresh
             self.prev_depths = torch.where(prev_mask, torch.stack(depth_maps[num_train:]), 0).unsqueeze(-1)
 
             mask = torch.cat([train_mask.view(-1), prev_mask.view(-1)])
@@ -1192,7 +904,7 @@ class DepthGaussiansModel(Model):
             }
         else:
             self.prev_depths = torch.cat([self.prev_depths, pred_depth]) if self.pred_depths is not None else pred_depth
-            scales = pred_depth.view(-1, 1) * decode_scale_mult_1.view(-1, 1)
+            scales = pred_depth.view(-1, 1) * decode_scale_mult.view(-1, 1)
             out = {
                 "means": torch.cat([self.means, pts3d]),
                 "features_dc": torch.cat([self.features_dc, torch.logit(pred_rgb.view(-1, 3))]),
@@ -1226,7 +938,7 @@ class DepthGaussiansModel(Model):
             del param
 
         for i, rgb in enumerate(pred_rgb):
-            self.image_filenames.append(self.add_image_fn(rgb, to_render_cameras_2[i:i + 1]))
+            self.image_filenames.append(self.add_image_fn(rgb, cameras[i:i + 1]))
 
         # chunk_size = self.means.shape[0]
         # for i in range(0, pts3d.shape[0], chunk_size):
@@ -1266,13 +978,220 @@ class DepthGaussiansModel(Model):
         # trigger.unlink()
         CONSOLE.log(f"Finished rendering {to_render_indices}")
 
+    @torch.inference_mode
+    def get_diffusion_outputs(self, cameras: Cameras, renderings: Dict[str, torch.Tensor]):
+        c_crossattn_1, c_crossattn_2 = self.get_clip_embeddings()
+        c_crossattn_1 = c_crossattn_1.expand(cameras.shape[0], -1, -1)
+        c_crossattn_2 = c_crossattn_2.expand(cameras.shape[0], -1, -1)
+
+        depth = renderings[DEPTH]
+        depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))
+
+        cameras_1 = deepcopy(cameras)
+        cameras_1.rescale_output_resolution(0.25)
+        image_width_1 = cameras_1.width[0].item()  # Assume that all camera dims are equal
+        image_height_1 = cameras_1.height[0].item()
+
+        rgb_1 = F.interpolate(renderings[RGB].permute(0, 3, 1, 2), (image_height_1, image_width_1),
+                              mode="bicubic", antialias=True).permute(0, 2, 3, 1)
+        depth_1 = F.interpolate(depth.permute(0, 3, 1, 2), (image_height_1, image_width_1), mode="bicubic",
+                                antialias=True).permute(0, 2, 3, 1)
+        encoded_1 = self.encode_rgbd(rgb_1, depth_1, depth_scaling_factor)
+        acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2), (image_height_1, image_width_1),
+                              mode="bicubic", antialias=True)
+        c_concat_1 = torch.cat([encoded_1, acc_1], 1)
+        acc_1 = acc_1.permute(0, 2, 3, 1)
+
+        if self.config.guidance_scale > 1:
+            c_concat_1 = torch.cat([torch.zeros_like(c_concat_1), c_concat_1])
+            c_crossattn_1 = torch.cat([torch.zeros_like(c_crossattn_1), c_crossattn_1])
+            c_crossattn_2 = torch.cat([torch.zeros_like(c_crossattn_2), c_crossattn_2])
+
+        # image_dim_1 = cameras.width[0].item()
+        # encoded_1 = self.encode_with_vae(renderings[RGB], depth, depth_scaling_factor)
+        # acc_1 = F.interpolate(renderings[ACCUMULATION].permute(0, 3, 1, 2),
+        #                       (image_height_1 // self.vae_scale_factor, image_width_1 // self.vae_scale_factor),
+        #                       mode="bicubic", antialias=True)
+        # c_concat_1 = torch.cat([encoded_1, acc_1], 1)
+
+        focals_for_decode_1 = torch.cat([cameras_1.fx, cameras_1.fy], -1)
+        pp_for_decode_1 = torch.cat([cameras_1.cx, cameras_1.cy], -1)
+
+        pixels_im = torch.stack(
+            torch.meshgrid(
+                torch.arange(image_height_1, dtype=torch.float32, device=cameras.device),
+                torch.arange(image_width_1, dtype=torch.float32, device=cameras.device),
+                indexing="ij")).permute(2, 1, 0)
+        pixels_1 = pixels_im.reshape(-1, 2)
+
+        train_width = self.train_cameras.width[0].item()
+        train_height = self.train_cameras.height[0].item()
+        if self.prev_indices is not None:
+            prev_width = self.ellipse_cameras[self.prev_indices].width[0].item()
+            prev_height = self.ellipse_cameras[self.prev_indices].height[0].item()
+
+        c2ws_opencv, w2cs_opencv = self.c2ws_opengl_to_opencv(cameras.camera_to_worlds)
+        sample_1 = self.scheduler.init_noise_sigma * randn_tensor((cameras.shape[0], 4, image_height_1, image_width_1),
+                                                                  device=c_concat_1.device, dtype=c_concat_1.dtype)
+        # sample_1 = scheduler.init_noise_sigma * randn_tensor(
+        #     (to_render_indices.shape[0], 4, image_height_1 // self.vae_scale_factor, image_width_1 // self.vae_scale_factor),
+        #     device=c_concat_1.device, dtype=c_concat_1.dtype)
+
+        for t_index, t in enumerate(self.scheduler.timesteps):
+            model_input = torch.cat([sample_1] * 2) if self.config.guidance_scale > 1 else sample_1
+            model_input = self.scheduler.scale_model_input(model_input, t)
+            model_input = torch.cat([model_input, c_concat_1], dim=1)
+
+            model_output = self.unet_1(model_input, t, c_crossattn_1, return_dict=False)[0]
+
+            if self.config.guidance_scale > 1:
+                model_output_uncond, model_output_cond = model_output.chunk(2)
+                model_output = model_output_uncond + self.config.guidance_scale * \
+                               (model_output_cond - model_output_uncond)
+
+            alpha_prod_t = self.scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
+            beta_prod_t = 1 - alpha_prod_t
+            if self.config.prediction_type == "epsilon":
+                pred_original_sample = (sample_1 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            elif self.config.prediction_type == "sample":
+                pred_original_sample = model_output
+            elif self.config.prediction_type == "v_prediction":
+                pred_original_sample = (alpha_prod_t ** 0.5) * sample_1 - (beta_prod_t ** 0.5) * model_output
+            else:
+                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
+
+            pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
+
+            pts3d = self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels_1, focals_for_decode_1,
+                                        pp_for_decode_1).reshape(-1, 3)
+
+            mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                    pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
+                                                    self.train_cameras.fx,
+                                                    self.train_cameras.fy,
+                                                    self.train_cameras.cx,
+                                                    self.train_cameras.cy,
+                                                    self.train_depths,
+                                                    train_width,
+                                                    train_height)
+            if self.prev_depths is not None:
+                prev_cameras = self.ellipse_cameras[self.prev_indices]
+                mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                          pts3d.unsqueeze(0).expand(
+                                                                              self.prev_w2cs.shape[0], -1, -1),
+                                                                          prev_cameras.fx,
+                                                                          prev_cameras.fy,
+                                                                          prev_cameras.cx,
+                                                                          prev_cameras.cy,
+                                                                          self.prev_depths,
+                                                                          prev_width,
+                                                                          prev_height), mask)
+
+            blend_weight = torch.where(torch.logical_and(depth_1 > pred_depth, mask.view(depth_1.shape)), 0,
+                                       acc_1)
+
+            model_output = self.encode_rgbd(
+                (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
+                (1 - blend_weight) * pred_depth + blend_weight * depth_1,
+                depth_scaling_factor)
+
+            sample_1 = self.scheduler.step(model_output, t, sample_1, return_dict=False)[0]
+
+        image_width_2 = cameras.width[0].item()  # Assume that all camera dims are equal
+        image_height_2 = cameras.height[0].item()
+        encoded_2 = self.encode_rgbd(renderings[RGB], depth, depth_scaling_factor)
+        acc_2 = renderings[ACCUMULATION]
+
+        focals_for_decode_2 = torch.cat([cameras.fx, cameras.fy], -1)
+        pp_for_decode_2 = torch.cat([cameras.cx, cameras.cy], -1)
+        pixels_im = torch.stack(
+            torch.meshgrid(
+                torch.arange(image_height_2, dtype=torch.float32, device=cameras.device),
+                torch.arange(image_width_2, dtype=torch.float32, device=cameras.device),
+                indexing="ij")).permute(2, 1, 0)
+        pixels_2 = pixels_im.reshape(-1, 2)
+
+        c_concat_2 = torch.cat(
+            [F.interpolate(sample_1, (image_height_2, image_width_2), mode="bicubic", antialias=True), encoded_2,
+             acc_2.permute(0, 3, 1, 2)], 1)
+
+        if self.config.guidance_scale > 1:
+            c_concat_2 = torch.cat([torch.zeros_like(c_concat_2), c_concat_2])
+
+        sample_2 = self.scheduler.init_noise_sigma * randn_tensor(
+            (cameras.shape[0], 4, image_height_2, image_width_2),
+            device=c_concat_2.device, dtype=c_concat_2.dtype)
+
+        for t_index, t in enumerate(self.scheduler.timesteps):
+            model_input = torch.cat([sample_2] * 2) if self.config.guidance_scale > 1 else sample_2
+            model_input = self.scheduler.scale_model_input(model_input, t)
+            model_input = torch.cat([model_input, c_concat_2], dim=1)
+
+            model_output = self.unet_2(model_input, t, c_crossattn_2,
+                                       class_labels=torch.tensor([t], device=model_input.device),
+                                       return_dict=False)[0]
+
+            if self.config.guidance_scale > 1:
+                model_output_uncond, model_output_cond = model_output.chunk(2)
+                model_output = model_output_uncond + self.config.guidance_scale * \
+                               (model_output_cond - model_output_uncond)
+
+            alpha_prod_t = self.scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
+            beta_prod_t = 1 - alpha_prod_t
+            if self.config.prediction_type == "epsilon":
+                pred_original_sample = (sample_2 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            elif self.config.prediction_type == "sample":
+                pred_original_sample = model_output
+            elif self.config.prediction_type == "v_prediction":
+                pred_original_sample = (alpha_prod_t ** 0.5) * sample_2 - (beta_prod_t ** 0.5) * model_output
+            else:
+                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
+
+            pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
+
+            pts3d = (self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels_2, focals_for_decode_2, pp_for_decode_2)
+                     .reshape(-1, 3))
+
+            mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                    pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
+                                                    self.train_cameras.fx,
+                                                    self.train_cameras.fy,
+                                                    self.train_cameras.cx,
+                                                    self.train_cameras.cy,
+                                                    self.train_depths,
+                                                    train_width,
+                                                    train_height)
+            if self.prev_depths is not None:
+                mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                          pts3d.unsqueeze(0).expand(
+                                                                              self.prev_w2cs.shape[0], -1, -1),
+                                                                          prev_cameras.fx,
+                                                                          prev_cameras.fy,
+                                                                          prev_cameras.cx,
+                                                                          prev_cameras.cy,
+                                                                          self.prev_depths,
+                                                                          prev_width,
+                                                                          prev_height), mask)
+
+            blend_weight = torch.where(torch.logical_and(depth > pred_depth, mask.view(depth.shape)), 0, acc_2)
+
+            model_output = self.encode_rgbd(
+                (1 - blend_weight) * pred_rgb + blend_weight * renderings[RGB],
+                (1 - blend_weight) * pred_depth + blend_weight * depth,
+                depth_scaling_factor)
+
+            sample_2 = self.scheduler.step(model_output, t, sample_2, return_dict=False)[0]
+
+        return self.decode_rgbd(sample_2, depth_scaling_factor)
+
     def update_depth_outputs(self, overlapping_indices: torch.Tensor, pred_rgb_chw_m1_1: torch.Tensor,
                              include_first: bool, include_second: bool, loaded_images: Optional[List]) -> None:
         view1 = {"img": [], "idx": [], "instance": []}
         view2 = {"img": [], "idx": [], "instance": []}
         if loaded_images is None:
             loaded_images = load_images([str(self.image_filenames[x]) for x in overlapping_indices],
-                                        size=512 if (not include_first or not include_second) else 256)
+                                        size=512 if (not include_first or not include_second) else max(
+                                            pred_rgb_chw_m1_1.shape[-2:]))
         for first, rgb in enumerate(pred_rgb_chw_m1_1):
             for second, overlapping_index in enumerate(overlapping_indices):
                 first_idx = len(self.image_filenames) + first
@@ -1323,7 +1242,6 @@ class DepthGaussiansModel(Model):
             Mapping of different parameter groups
         """
         gps = self.get_gaussian_param_groups()
-        self.camera_optimizer.get_param_groups(param_groups=gps)
         return gps
 
     def _get_downscale_factor(self):
@@ -1378,11 +1296,26 @@ class DepthGaussiansModel(Model):
             print("Called get_outputs with not a camera")
             return {}
 
-        if self.training:
-            assert camera.shape[0] == 1, "Only one camera at a time"
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds
+        if not self.training and self.config.render_with_diffusion:
+            camera = deepcopy(camera)
+            padding_w = (64 - camera.width % 64) % 64
+            # assert padding_w % 2 == 0, padding_w
+
+            new_width = camera.width + padding_w
+            # camera.fx *= (new_width / camera.width)
+            left = padding_w // 2
+            camera.cx += left
+            camera.width = new_width
+
+            padding_h = (64 - camera.height % 64) % 64
+            # assert padding_h % 2 == 0, padding_h
+            new_height = camera.height + padding_h
+            # camera.fy *= (new_height / camera.height)
+            top = padding_h // 2
+            camera.cy += top
+            camera.height = new_height
+
+        optimized_camera_to_world = camera.camera_to_worlds
 
         # cropping
         if self.crop_box is not None and not self.training:
@@ -1480,12 +1413,23 @@ class DepthGaussiansModel(Model):
         if background is not None and background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-        return {
+        result = {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
-        }  # type: ignore
+        }
+
+        if not self.training and self.config.render_with_diffusion:
+            pred_rgb, pred_depth = self.get_diffusion_outputs(camera, {RGB: rgb, DEPTH: depth_im.unsqueeze(0),
+                                                                       ACCUMULATION: alpha})
+            result["diffusion_rgb"] = pred_rgb.squeeze(0)
+            result["diffusion_depth"] = pred_depth.squeeze(0)
+            for key, val in result.items():
+                if val is not None:
+                    result[key] = val[top:-(padding_h - top), left:-(padding_w - left)]
+
+        return result  # type: ignore
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
@@ -1525,7 +1469,6 @@ class DepthGaussiansModel(Model):
 
         metrics_dict["gaussian_count"] = self.num_points
 
-        self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
@@ -1568,10 +1511,6 @@ class DepthGaussiansModel(Model):
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
         }
-
-        if self.training:
-            # Add loss from camera optimizer
-            self.camera_optimizer.get_loss_dict(loss_dict)
 
         loss_mult = 1 if self.config.optimize else 0
 
@@ -1622,6 +1561,26 @@ class DepthGaussiansModel(Model):
         metrics_dict["lpips"] = float(lpips)
 
         images_dict = {"img": combined_rgb}
+
+        if self.config.render_with_diffusion:
+            gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+
+            predicted_rgb = outputs["diffusion_rgb"]
+            combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+            images_dict["diffusion_img"] = combined_rgb
+
+            # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+            gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+            predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+
+            psnr = self.psnr(gt_rgb, predicted_rgb)
+            ssim = self.ssim(gt_rgb, predicted_rgb)
+            lpips = self.lpips(gt_rgb, predicted_rgb)
+
+            # all of these metrics will be logged as scalars
+            metrics_dict["diffusion_psnr"] = float(psnr.item())
+            metrics_dict["diffusion_ssim"] = float(ssim)
+            metrics_dict["diffusion_lpips"] = float(lpips)
 
         return metrics_dict, images_dict
 
@@ -1878,3 +1837,20 @@ class DepthGaussiansModel(Model):
             pp)
         pts3d = (c2ws_opencv @ torch.cat([pts3d_cam, torch.ones_like(pts3d_cam[..., :1])], -1).transpose(1, 2))
         return pts3d.transpose(1, 2)[..., :3]
+
+    @staticmethod
+    @torch.compile
+    @torch.cuda.amp.autocast(enabled=False)
+    def c2ws_opengl_to_opencv(c2ws_opengl: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        c2ws_opencv = torch.eye(4, device=c2ws_opengl.device).view(1, 4, 4).repeat(c2ws_opengl.shape[0], 1, 1)
+        c2ws_opencv[:, :3] = c2ws_opengl
+        c2ws_opencv[:, :, 1:3] *= -1  # opengl to opencv
+
+        w2cs_opencv = torch.eye(4, device=c2ws_opengl.device).view(1, 4, 4).repeat(c2ws_opengl.shape[0], 1, 1)
+        R_inv = c2ws_opencv[:, :3, :3].transpose(1, 2)
+        w2cs_opencv[:, :3, :3] = R_inv
+        T = c2ws_opengl[:, :3, 3:]
+        inv_T = -torch.bmm(R_inv, T)
+        w2cs_opencv[:, :3, 3:] = inv_T
+
+        return c2ws_opencv, w2cs_opencv

@@ -7,6 +7,7 @@ from typing import Type, Optional, Dict
 import imageio
 import numpy as np
 import torch
+from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
@@ -19,39 +20,34 @@ from rich.console import Console
 
 CONSOLE = Console(width=120)
 
+
 def pad_poses(p):
-  """Pad [..., 3, 4] pose matrices with a homogeneous bottom row [0,0,0,1]."""
-  bottom = np.broadcast_to([0, 0, 0, 1.0], p[Ellipsis, :1, :4].shape)
-  return np.concatenate([p[Ellipsis, :3, :4], bottom], axis=-2)
+    """Pad [..., 3, 4] pose matrices with a homogeneous bottom row [0,0,0,1]."""
+    bottom = np.broadcast_to([0, 0, 0, 1.0], p[Ellipsis, :1, :4].shape)
+    return np.concatenate([p[Ellipsis, :3, :4], bottom], axis=-2)
 
 
 def unpad_poses(p):
-  """Remove the homogeneous bottom row from [..., 4, 4] pose matrices."""
-  return p[Ellipsis, :3, :4]
+    """Remove the homogeneous bottom row from [..., 4, 4] pose matrices."""
+    return p[Ellipsis, :3, :4]
+
 
 @dataclass
-class MipNerf360DataParserConfig(DataParserConfig):
-    """Mipnerf 360 dataset parser config"""
-
-    _target: Type = field(default_factory=lambda: Mipnerf360)
+class LLFFDataParserConfig(DataParserConfig):
+    _target: Type = field(default_factory=lambda: LLFF)
     """target class to instantiate"""
     data: Path = Path("data/mipnerf360/garden")
 
-    """Directory specifying location of data."""
-    auto_scale: bool = True
-
-    """Scale based on pose bounds."""
-    aabb_scale: float = 1
-
     """Scene scale."""
-    train_images: int = 2
+    llffhold = 8
+    train_images: int = 3
 
 
 @dataclass
-class Mipnerf360(DataParser):
-    """MipNeRF 360 Dataset"""
+class LLFF(DataParser):
+    """Compatible with LLFF and MipNeRF 360 datasets"""
 
-    config: MipNerf360DataParserConfig
+    config: LLFFDataParserConfig
 
     @classmethod
     def transform_poses_pca(cls, poses):
@@ -93,18 +89,18 @@ class Mipnerf360(DataParser):
         return poses_recentered, transform
 
     def get_dataparser_outputs(self, split: str = "train", **kwargs: Optional[Dict]) -> DataparserOutputs:
-        fx = []
-        fy = []
-        cx = []
-        cy = []
-        # c2ws = []
-        width = []
-        height = []
         image_filenames = []
 
         camera_params = read_cameras_binary(self.config.data / 'sparse/0/cameras.bin')
-        assert camera_params[1].model == 'PINHOLE'
-        camera_fx, camera_fy, camera_cx, camera_cy = camera_params[1].params
+
+        if camera_params[1].model == "PINHOLE":
+            camera_fx, camera_fy, camera_cx, camera_cy = camera_params[1].params
+            camera_k1 = None
+        elif camera_params[1].model == "SIMPLE_RADIAL":
+            camera_fx, camera_cx, camera_cy, camera_k1 = camera_params[1].params
+            camera_fy = camera_fx
+        else:
+            raise Exception(camera_params[1])
 
         image_dir = self.config.data / "images"
         if not image_dir.exists():
@@ -128,12 +124,14 @@ class Mipnerf360(DataParser):
         img_0 = imageio.imread(image_filenames[-1])
         image_height, image_width = img_0.shape[:2]
 
-        width.append(torch.full((num_images, 1), image_width, dtype=torch.long))
-        height.append(torch.full((num_images, 1), image_height, dtype=torch.long))
-        fx.append(torch.full((num_images, 1), camera_fx))
-        fy.append(torch.full((num_images, 1), camera_fy))
-        cx.append(torch.full((num_images, 1), camera_cx))
-        cy.append(torch.full((num_images, 1), camera_cy))
+        width = torch.full((num_images, 1), image_width, dtype=torch.long)
+        height = torch.full((num_images, 1), image_height, dtype=torch.long)
+        fx = torch.full((num_images, 1), camera_fx)
+        fy = torch.full((num_images, 1), camera_fy)
+        cx = torch.full((num_images, 1), camera_cx)
+        cy = torch.full((num_images, 1), camera_cy)
+        distort = camera_utils.get_distortion_params(k1=camera_k1).unsqueeze(0).expand(num_images, -1) \
+            if camera_k1 is not None else None
 
         # Reorder pose to match nerfstudio convention
         poses = np.concatenate([poses[:, :, 1:2], -poses[:, :, 0:1], poses[:, :, 2:]], axis=-1)
@@ -158,28 +156,31 @@ class Mipnerf360(DataParser):
         scene_box = SceneBox(aabb=torch.stack([min_bounds, max_bounds]))
         # scene_box = SceneBox(aabb=((torch.stack([min_bounds, max_bounds]) - origin) / pose_scale_factor).float())
 
-        train_indices = np.linspace(0, num_images, self.config.train_images, endpoint=False, dtype=np.int32)
+        train_indices = []
+        val_indices = []
+        for i in range(num_images):
+            if i % self.config.llffhold == 0:
+                val_indices.append(i)
+            else:
+                train_indices.append(i)
 
         if split.casefold() == 'train':
             indices = torch.LongTensor(train_indices)
+            chosen = np.linspace(0, len(train_indices), self.config.train_images, endpoint=False, dtype=np.int32)
+            indices = indices[torch.LongTensor(chosen)]
         else:
-            val_indices = []
-            train_indices = set(train_indices)
-            for i in range(len(image_filenames)):
-                if i not in train_indices:
-                    val_indices.append(i)
-
             indices = torch.LongTensor(val_indices)
 
         cameras = Cameras(
             camera_to_worlds=c2ws[indices].float(),
-            fx=torch.cat(fx)[indices],
-            fy=torch.cat(fy)[indices],
-            cx=torch.cat(cx)[indices],
-            cy=torch.cat(cy)[indices],
-            width=torch.cat(width)[indices],
-            height=torch.cat(height)[indices],
+            fx=fx[indices],
+            fy=fy[indices],
+            cx=cx[indices],
+            cy=cy[indices],
+            width=width[indices],
+            height=height[indices],
             camera_type=CameraType.PERSPECTIVE,
+            distortion_params=distort[indices] if distort is not None else None,
         )
 
         CONSOLE.log('Num images in split {}: {}'.format(split, len(indices)))

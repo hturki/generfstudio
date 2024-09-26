@@ -14,13 +14,11 @@ from nerfstudio.utils.comms import get_rank, get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, DEFAULT_SCENE_METADATA, \
-    POSENC_SCALE, DEPTH
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE, DEPTH, IN_HDF5
 
 
 @dataclass
 class ObjaverseXLDataParserConfig(DataParserConfig):
-
     _target: Type = field(default_factory=lambda: ObjaverseXL)
     """target class to instantiate"""
     data: Path = Path("data/oxl")
@@ -37,6 +35,8 @@ class ObjaverseXLDataParserConfig(DataParserConfig):
     scale_near: Optional[float] = None
 
     eval_scene_count: int = 50
+
+    in_hdf5: bool = True
 
 
 @dataclass
@@ -58,10 +58,13 @@ class ObjaverseXL(DataParser):
             scenes = [self.config.scene_id]
         else:
             scenes = []
-            for partition_dir in sorted(self.config.data.iterdir()):
-                for subdir in sorted(partition_dir.iterdir()):
-                    for scene_dir in sorted(subdir.iterdir()):
-                        scenes.append(f"{partition_dir.name}/{subdir.name}/{scene_dir.name}")
+            # for partition_dir in sorted(self.config.data.iterdir()):
+            # for subdir in sorted(partition_dir.iterdir()):
+            for subdir in sorted(self.config.data.iterdir()):
+                for scene_dir in sorted(subdir.iterdir()):
+                    if not self.config.in_hdf5 or (scene_dir / "data.hdf5").exists():
+                        scenes.append(f"{subdir.name}/{scene_dir.name}")
+                    # scenes.append(f"{partition_dir.name}/{subdir.name}/{scene_dir.name}")
 
             if split == "train":
                 scenes = scenes[:-self.config.eval_scene_count]
@@ -89,7 +92,7 @@ class ObjaverseXL(DataParser):
         max_bounds = None
         near = 1e10
         far = -1
-        for scene in tqdm(scenes[:10]):
+        for scene in tqdm(scenes):
             dest = self.config.data / scene
             transforms = dest / "transforms.json"
 
@@ -188,6 +191,7 @@ class ObjaverseXL(DataParser):
             FAR: far,
             POSENC_SCALE: 1 / (max_bounds - min_bounds).max(),
             DEPTH: depth_paths,
+            IN_HDF5: self.config.in_hdf5,
         }
 
         if neighboring_views is not None:

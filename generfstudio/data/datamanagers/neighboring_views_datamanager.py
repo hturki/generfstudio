@@ -82,7 +82,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         is_oxl = isinstance(self.dataparser_config, ObjaverseXLDataParserConfig)
         if world_size > 1 or is_oxl:
             self.load_train_chunk_executor = ThreadPoolExecutor(max_workers=1)
-            chunks = 50 if is_oxl else self.config.train_chunks
+            chunks = 100 if is_oxl else self.config.train_chunks
             self.chunk_index = cycle(range(chunks))
             self.load_train_chunk_future = self.load_train_chunk_executor.submit(
                 self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), chunks)
@@ -103,7 +103,7 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         is_oxl = isinstance(self.dataparser_config, ObjaverseXLDataParserConfig)
         if self.world_size > 1 or is_oxl:
             self.train_dataparser_outputs = self.load_train_chunk_future.result()
-            chunks = 50 if is_oxl else self.config.train_chunks
+            chunks = 100 if is_oxl else self.config.train_chunks
             self.load_train_chunk_future = self.load_train_chunk_executor.submit(
                 self.dataparser._generate_dataparser_outputs, "train", next(self.chunk_index), chunks)
         else:
@@ -299,10 +299,10 @@ class NeighboringViewsDatamanager(DataManager, Generic[TDataset]):
         camera.metadata["image"] = data["image"]
 
         if PTS3D in data:
-            camera.metadata[PTS3D] = data[PTS3D].to(self.device)
+            camera.metadata[PTS3D] = data[PTS3D].unsqueeze(0).to(self.device)
             del data[PTS3D]
 
-            data[DEPTH] = data[DEPTH].to(self.device)
+            data[DEPTH] = data[DEPTH].unsqueeze(0).to(self.device)
             camera.metadata[DEPTH] = data[DEPTH]
 
         return camera, data

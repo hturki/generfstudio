@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, Optional
 
+import h5py
+import numpy as np
 import torch
 from PIL import Image
 from nerfstudio.cameras import camera_utils
@@ -17,7 +19,7 @@ from nerfstudio.utils.comms import get_rank, get_world_size
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm import tqdm
 
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, NEAR, FAR, POSENC_SCALE, IN_HDF5
 from generfstudio.generfstudio_utils import central_crop_v2
 
 
@@ -43,9 +45,11 @@ class R10KDataParserConfig(DataParserConfig):
 
     scale_near: Optional[float] = None
 
-    conversion_threads: int = 16
+    conversion_threads: int = 48
 
     neighbor_window_size: Optional[int] = 100
+
+    in_hdf5: bool = True
 
 
 def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop: Optional[int]) -> bool:
@@ -123,6 +127,27 @@ def convert_scene_metadata(scene: str, source: Path, dest: Path, data, crop: Opt
     return True
 
 
+def convert_to_hdf5(data: Path, scene: str, crop: Optional[int]) -> None:
+    metadata_name = f"{scene}-{crop}.json" if crop is not None else f"{scene}.json"
+    nerfstudio_metadata_path = data / "nerfstudio" / metadata_name
+
+    if not nerfstudio_metadata_path.exists():
+        return
+
+    with nerfstudio_metadata_path.open() as f:
+        frames = json.load(f)["frames"]
+
+    image_base = Path(frames[0]["file_path"]).parent
+    if not (image_base / "data.hdf5").exists():
+        with h5py.File(image_base / "data-tmp.hdf5", "w") as f:
+            for frame in frames:
+                f.create_dataset(Path(frame["file_path"]).name, data=np.asarray(Image.open(frame["file_path"])),
+                                 compression="gzip", compression_opts=9)
+        (image_base / "data-tmp.hdf5").rename(image_base / "data.hdf5")
+        for frame in frames:
+            Path(frame["file_path"]).unlink()
+
+
 @dataclass
 class R10K(DataParser):
     """R10K Dataset"""
@@ -133,7 +158,9 @@ class R10K(DataParser):
         rank = get_rank()
         world_size = get_world_size()
         window_size = self.config.neighbor_window_size
-        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{window_size}-{rank}-{world_size}-{chunk_index}-{num_chunks}.pt"
+        in_hdf5 = self.config.in_hdf5
+
+        cached_path = self.config.data / f"cached-metadata-{split}-{self.config.crop}-{self.config.scale_near}-{window_size}-{rank}-{world_size}-{chunk_index}-{num_chunks}-{in_hdf5}.pt"
         if (not get_default_scene) and self.config.scene_id is None and cached_path.exists():
             return torch.load(cached_path)
 
@@ -189,6 +216,12 @@ class R10K(DataParser):
             for task in tqdm(to_convert):
                 task.result()
 
+            # if in_hdf5:
+            #     for scene in scenes:
+            #         to_convert.append(executor.submit(convert_to_hdf5, self.config.data, scene, self.config.crop))
+            #     for task in tqdm(to_convert):
+            #         task.result()
+
         for scene in tqdm(scenes):
             metadata_name = f"{scene}-{self.config.crop}.json" if self.config.crop is not None else f"{scene}.json"
             nerfstudio_metadata_path = self.config.data / "nerfstudio" / metadata_name
@@ -201,11 +234,10 @@ class R10K(DataParser):
 
             if len(frames) < 4:
                 continue
-
             scene_index_start = len(image_filenames)
             scene_index_end = scene_index_start + len(frames)
             for scene_image_index, frame in enumerate(frames):
-                image_filenames.append(frame["file_path"])
+                image_filenames.append(Path(frame["file_path"]))
                 c2ws.append(torch.FloatTensor(frame["transform_matrix"]))
                 width.append(frame["w"])
                 height.append(frame["h"])
@@ -289,6 +321,7 @@ class R10K(DataParser):
             NEAR: 1 / pose_scale_factor,
             FAR: 200 / pose_scale_factor,
             POSENC_SCALE: pose_scale_factor / 200,
+            IN_HDF5: in_hdf5,
         }
 
         if neighboring_views is not None:

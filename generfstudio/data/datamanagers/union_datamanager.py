@@ -53,8 +53,8 @@ class UnionDatamanagerConfig(DataManagerConfig):
         _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
     ))
 
-    include_oxl: bool = False
-    include_acid: bool = False
+    include_oxl: bool = True
+    include_acid: bool = True
 
     # Making this a config makes startup very slow
     # dataparsers: List[AnnotatedDataParserUnion] = field(default_factory=lambda: [

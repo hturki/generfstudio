@@ -3,21 +3,29 @@ from copy import deepcopy
 from typing import Dict
 
 import numpy as np
+import numpy.typing as npt
 import torch
+from PIL import Image
 from dust3r.utils.geometry import geotrf
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
 
 from generfstudio.fields.batched_pc_optimizer import fast_depthmap_to_pts3d
-from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, DEPTH, PTS3D
+from generfstudio.generfstudio_constants import NEIGHBOR_INDICES, DEPTH, PTS3D, IN_HDF5
+
+try:
+    import h5py
+except ImportError:
+    pass
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
 
 
+
 class NeighboringViewsDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0,
-                 views_size: int = 3, base_image_first: bool = True):
+                 views_size: int = 3, in_hdf5: bool = False, base_image_first: bool = True):
         # super().__init__(dataparser_outputs, scale_factor)
         # Skip the deepcopy to save time
         self._dataparser_outputs = dataparser_outputs
@@ -41,6 +49,31 @@ class NeighboringViewsDataset(InputDataset):
                                indexing="ij")).permute(2, 1, 0)
             self.pixels = pixels_im.reshape(-1, 2)
 
+    def get_numpy_image(self, image_idx: int) -> npt.NDArray[np.uint8]:
+        """Returns the image of shape (H, W, 3 or 4).
+
+        Args:
+            image_idx: The image index in the dataset.
+        """
+        image_filename = self._dataparser_outputs.image_filenames[image_idx]
+        if self.metadata.get(IN_HDF5, False):
+            f = h5py.File(image_filename.parent / "data.hdf5", 'r')
+            pil_image = Image.fromarray(f[image_filename.name][:])
+        else:
+            pil_image = Image.open(image_filename)
+
+        if self.scale_factor != 1.0:
+            width, height = pil_image.size
+            newsize = (int(width * self.scale_factor), int(height * self.scale_factor))
+            pil_image = pil_image.resize(newsize, resample=Image.Resampling.BILINEAR)
+        image = np.array(pil_image, dtype="uint8")  # shape is (h, w) or (h, w, 3 or 4)
+        if len(image.shape) == 2:
+            image = image[:, :, None].repeat(3, axis=2)
+        assert len(image.shape) == 3
+        assert image.dtype == np.uint8
+        assert image.shape[2] in [3, 4], f"Image shape of {image.shape} is in correct."
+        return image
+
     def get_metadata(self, data: Dict) -> Dict:
         metadata = super().get_metadata(data)
 
@@ -57,9 +90,6 @@ class NeighboringViewsDataset(InputDataset):
             data["image"] = torch.stack(neighbor_images + [data["image"]])
             data["image_idx"] = torch.LongTensor(neighbor_indices.tolist() + [image_idx])
 
-        # metadata[NEIGHBOR_IMAGES] = torch.stack([self.get_image_float32(x) for x in neighbor_indices])
-        # metadata[NEIGHBOR_INDICES] = torch.LongTensor(neighbor_indices)
-
         if DEPTH in self.metadata:
             metadata[DEPTH] = torch.stack([self.read_depth(x) for x in data["image_idx"]])
 
@@ -75,7 +105,16 @@ class NeighboringViewsDataset(InputDataset):
         return metadata
 
     def read_depth(self, image_idx: int) -> torch.Tensor:
-        depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., 0]
+        if self.metadata.get(IN_HDF5, False):
+            f = h5py.File(self.metadata[DEPTH][image_idx].parent / "data.hdf5", 'r')
+            depth = f[self.metadata[DEPTH][image_idx].name][:]
+        else:
+            depth = cv2.imread(str(self.metadata[DEPTH][image_idx]), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., 0]
 
-        # depth[depth >= 65504.] = 0
+        valid_depth = depth[depth < 65504.]
+        if valid_depth.size > 0:
+            depth[depth >= 65504.] = valid_depth.max() * 3
+        else:
+            depth = np.zeros_like(depth)
+
         return torch.FloatTensor(depth)

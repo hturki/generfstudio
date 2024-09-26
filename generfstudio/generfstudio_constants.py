@@ -16,3 +16,4 @@ PTS3D = "pts3d"
 DEPTH_GT = "depth_gt"
 
 BG_COLOR = "bg_color"
+IN_HDF5 = "in_hdf5"

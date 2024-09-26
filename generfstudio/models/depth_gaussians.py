@@ -128,6 +128,9 @@ class DepthGaussiansModelConfig(ModelConfig):
     were implemented for classic mode can not render antialiased mode PLY properly without modifications.
     """
 
+    lpips_lambda: float = 0.25
+    """weight of ssim loss"""
+
     checkpoint_path_1: Path = Path("/compute/trinity-2-29/hturki/stage-1.ckpt")
     checkpoint_path_2: Path = Path("/compute/trinity-2-29/hturki/stage-2.ckpt")
 
@@ -155,6 +158,9 @@ class DepthGaussiansModelConfig(ModelConfig):
     run_autoregression: bool = True
     autoregression_interval: int = 1000
     render_with_diffusion: bool = True
+    run_dust3r_global_ba: bool = False
+    blend_with_concat: bool = True
+    mask_with_existing_depth: bool = True
 
 
 class DepthGaussiansModel(Model):
@@ -179,21 +185,10 @@ class DepthGaussiansModel(Model):
         self.image_filenames = [x for x in metadata["train_image_filenames"]]
         self.ellipse_cameras = metadata["ellipse_cameras"].to("cuda")
         padding_w = (64 - self.ellipse_cameras.width % 64) % 64
-        # assert padding_w % 2 == 0, padding_w
-
-        new_width = self.ellipse_cameras.width + padding_w
-        # camera.fx *= (new_width / camera.width)
-        left = padding_w // 2
-        self.ellipse_cameras.cx += left
-        self.ellipse_cameras.width = new_width
+        self.ellipse_cameras.width += padding_w
 
         padding_h = (64 - self.ellipse_cameras.height % 64) % 64
-        # assert padding_h % 2 == 0, padding_h
-        new_height = self.ellipse_cameras.height + padding_h
-        # camera.fy *= (new_height / camera.height)
-        top = padding_h // 2
-        self.ellipse_cameras.cy += top
-        self.ellipse_cameras.height = new_height
+        self.ellipse_cameras.height += padding_h
 
         self.train_cameras = metadata["train_cameras"].to("cuda")
         self.train_depths = metadata["train_depths"]
@@ -349,7 +344,10 @@ class DepthGaussiansModel(Model):
                                                            beta_schedule=self.config.beta_schedule,
                                                            prediction_type=self.config.prediction_type)
             self.scheduler.config["variance_type"] = "fixed_small"
-            self.scheduler.config["prediction_type"] = "sample"
+
+            if self.config.blend_with_concat:
+                self.scheduler.config["prediction_type"] = "sample"
+
             self.scheduler = DDIMScheduler.from_config(self.scheduler.config)
         else:
             self.scheduler = DDPMScheduler.from_pretrained(self.config.unet_1_pretrained_path,
@@ -357,7 +355,10 @@ class DepthGaussiansModel(Model):
                                                            beta_schedule=self.config.beta_schedule,
                                                            prediction_type=self.config.prediction_type)
             self.scheduler.config["variance_type"] = "fixed_small"
-            self.scheduler.config["prediction_type"] = "sample"
+
+            if self.config.blend_with_concat:
+                self.scheduler.config["prediction_type"] = "sample"
+
             self.scheduler = DDPMScheduler.from_config(self.scheduler.config)
 
         self.scheduler.set_timesteps(self.config.inference_steps)
@@ -1049,51 +1050,57 @@ class DepthGaussiansModel(Model):
                 model_output = model_output_uncond + self.config.guidance_scale * \
                                (model_output_cond - model_output_uncond)
 
-            alpha_prod_t = self.scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
-            beta_prod_t = 1 - alpha_prod_t
-            if self.config.prediction_type == "epsilon":
-                pred_original_sample = (sample_1 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-            elif self.config.prediction_type == "sample":
-                pred_original_sample = model_output
-            elif self.config.prediction_type == "v_prediction":
-                pred_original_sample = (alpha_prod_t ** 0.5) * sample_1 - (beta_prod_t ** 0.5) * model_output
-            else:
-                raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
+            if self.config.blend_with_concat:
+                alpha_prod_t = self.scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
+                beta_prod_t = 1 - alpha_prod_t
+                if self.config.prediction_type == "epsilon":
+                    pred_original_sample = (sample_1 - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+                elif self.config.prediction_type == "sample":
+                    pred_original_sample = model_output
+                elif self.config.prediction_type == "v_prediction":
+                    pred_original_sample = (alpha_prod_t ** 0.5) * sample_1 - (beta_prod_t ** 0.5) * model_output
+                else:
+                    raise ValueError(f"Unknown prediction type {self.config.prediction_type}")
 
-            pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
+                pred_rgb, pred_depth = self.decode_rgbd(pred_original_sample, depth_scaling_factor)
 
-            pts3d = self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels_1, focals_for_decode_1,
-                                        pp_for_decode_1).reshape(-1, 3)
+                pts3d = self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels_1, focals_for_decode_1,
+                                            pp_for_decode_1).reshape(-1, 3)
 
-            mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
-                                                    pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
-                                                    self.train_cameras.fx,
-                                                    self.train_cameras.fy,
-                                                    self.train_cameras.cx,
-                                                    self.train_cameras.cy,
-                                                    self.train_depths,
-                                                    train_width,
-                                                    train_height)
-            if self.prev_depths is not None:
-                prev_cameras = self.ellipse_cameras[self.prev_indices]
-                mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
-                                                                          pts3d.unsqueeze(0).expand(
-                                                                              self.prev_w2cs.shape[0], -1, -1),
-                                                                          prev_cameras.fx,
-                                                                          prev_cameras.fy,
-                                                                          prev_cameras.cx,
-                                                                          prev_cameras.cy,
-                                                                          self.prev_depths,
-                                                                          prev_width,
-                                                                          prev_height), mask)
+                mask = depth_1 > pred_depth
+                if self.config.mask_with_existing_depth:
+                    depth_mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                                  pts3d.unsqueeze(0).expand(
+                                                                      self.train_w2cs_opencv.shape[0], -1, -1),
+                                                                  self.train_cameras.fx,
+                                                                  self.train_cameras.fy,
+                                                                  self.train_cameras.cx,
+                                                                  self.train_cameras.cy,
+                                                                  self.train_depths,
+                                                                  train_width,
+                                                                  train_height)
+                    if self.prev_depths is not None:
+                        prev_cameras = self.ellipse_cameras[self.prev_indices]
+                        depth_mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                                        pts3d.unsqueeze(0).expand(
+                                                                                            self.prev_w2cs.shape[0], -1,
+                                                                                            -1),
+                                                                                        prev_cameras.fx,
+                                                                                        prev_cameras.fy,
+                                                                                        prev_cameras.cx,
+                                                                                        prev_cameras.cy,
+                                                                                        self.prev_depths,
+                                                                                        prev_width,
+                                                                                        prev_height), depth_mask)
 
-            blend_weight = torch.where(torch.logical_and(depth_1 > pred_depth, mask.view(depth_1.shape)), 0,
-                                       acc_1)
+                    mask = torch.logical_and(mask, depth_mask)
 
-            model_output = self.encode_rgbd(
-                (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
-                (1 - blend_weight) * pred_depth + blend_weight * depth_1,
-                depth_scaling_factor)
+                blend_weight = torch.where(mask, 0, acc_1)
+
+                model_output = self.encode_rgbd(
+                    (1 - blend_weight) * pred_rgb + blend_weight * rgb_1,
+                    (1 - blend_weight) * pred_depth + blend_weight * depth_1,
+                    depth_scaling_factor)
 
             sample_1 = self.scheduler.step(model_output, t, sample_1, return_dict=False)[0]
 
@@ -1136,6 +1143,8 @@ class DepthGaussiansModel(Model):
                 model_output = model_output_uncond + self.config.guidance_scale * \
                                (model_output_cond - model_output_uncond)
 
+
+            # if self.config.blend_with_concat:
             alpha_prod_t = self.scheduler.alphas_cumprod.to(self.device)[t].view(-1, 1, 1, 1)
             beta_prod_t = 1 - alpha_prod_t
             if self.config.prediction_type == "epsilon":
@@ -1152,28 +1161,29 @@ class DepthGaussiansModel(Model):
             pts3d = (self.depth_to_pts3d(pred_depth, c2ws_opencv, pixels_2, focals_for_decode_2, pp_for_decode_2)
                      .reshape(-1, 3))
 
-            mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
-                                                    pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1, -1),
-                                                    self.train_cameras.fx,
-                                                    self.train_cameras.fy,
-                                                    self.train_cameras.cx,
-                                                    self.train_cameras.cy,
-                                                    self.train_depths,
-                                                    train_width,
-                                                    train_height)
+            depth_mask = self.not_in_existing_predictions(self.train_w2cs_opencv,
+                                                          pts3d.unsqueeze(0).expand(self.train_w2cs_opencv.shape[0], -1,
+                                                                                    -1),
+                                                          self.train_cameras.fx,
+                                                          self.train_cameras.fy,
+                                                          self.train_cameras.cx,
+                                                          self.train_cameras.cy,
+                                                          self.train_depths,
+                                                          train_width,
+                                                          train_height)
             if self.prev_depths is not None:
-                mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
-                                                                          pts3d.unsqueeze(0).expand(
-                                                                              self.prev_w2cs.shape[0], -1, -1),
-                                                                          prev_cameras.fx,
-                                                                          prev_cameras.fy,
-                                                                          prev_cameras.cx,
-                                                                          prev_cameras.cy,
-                                                                          self.prev_depths,
-                                                                          prev_width,
-                                                                          prev_height), mask)
+                depth_mask = torch.logical_and(self.not_in_existing_predictions(self.prev_w2cs,
+                                                                                pts3d.unsqueeze(0).expand(
+                                                                                    self.prev_w2cs.shape[0], -1, -1),
+                                                                                prev_cameras.fx,
+                                                                                prev_cameras.fy,
+                                                                                prev_cameras.cx,
+                                                                                prev_cameras.cy,
+                                                                                self.prev_depths,
+                                                                                prev_width,
+                                                                                prev_height), depth_mask)
 
-            blend_weight = torch.where(torch.logical_and(depth > pred_depth, mask.view(depth.shape)), 0, acc_2)
+            blend_weight = torch.where(torch.logical_and(depth > pred_depth, depth_mask.view(depth.shape)), 0, acc_2)
 
             model_output = self.encode_rgbd(
                 (1 - blend_weight) * pred_rgb + blend_weight * renderings[RGB],
@@ -1299,21 +1309,10 @@ class DepthGaussiansModel(Model):
         if not self.training and self.config.render_with_diffusion:
             camera = deepcopy(camera)
             padding_w = (64 - camera.width % 64) % 64
-            # assert padding_w % 2 == 0, padding_w
-
-            new_width = camera.width + padding_w
-            # camera.fx *= (new_width / camera.width)
-            left = padding_w // 2
-            camera.cx += left
-            camera.width = new_width
+            camera.width += padding_w
 
             padding_h = (64 - camera.height % 64) % 64
-            # assert padding_h % 2 == 0, padding_h
-            new_height = camera.height + padding_h
-            # camera.fy *= (new_height / camera.height)
-            top = padding_h // 2
-            camera.cy += top
-            camera.height = new_height
+            camera.height += padding_h
 
         optimized_camera_to_world = camera.camera_to_worlds
 
@@ -1427,7 +1426,7 @@ class DepthGaussiansModel(Model):
             result["diffusion_depth"] = pred_depth.squeeze(0)
             for key, val in result.items():
                 if val is not None:
-                    result[key] = val[top:-(padding_h - top), left:-(padding_w - left)]
+                    result[key] = val[:-padding_h, :-padding_w]
 
         return result  # type: ignore
 
@@ -1493,7 +1492,11 @@ class DepthGaussiansModel(Model):
             pred_img = pred_img * mask
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
-        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        gt_chw = gt_img.permute(2, 0, 1)[None, ...]
+        pred_chw = pred_img.permute(2, 0, 1)[None, ...]
+        ssim_loss = 1 - self.ssim(gt_chw, pred_chw)
+        lpips_loss = self.lpips(gt_chw, pred_chw)
+
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
@@ -1508,7 +1511,7 @@ class DepthGaussiansModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "main_loss": Ll1 + self.config.ssim_lambda * ssim_loss + self.config.lpips_lambda * lpips_loss,
             "scale_reg": scale_reg,
         }
 

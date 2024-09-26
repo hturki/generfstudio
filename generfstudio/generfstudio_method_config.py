@@ -293,14 +293,14 @@ rgbd_diffusion_if_union_ddp_method = MethodSpecification(
         mixed_precision=True,
         log_gradients=False,
         gradient_accumulation_steps={
-            "fields": 4
+            "fields": 8
         },
         pipeline=VanillaPipelineConfig(
             datamanager=UnionDatamanagerConfig(
                 inner=NeighboringViewsDatamanagerConfig(
                     _target=NeighboringViewsDatamanager[NeighboringViewsDataset],
                     views_size_train=1,
-                    batch_size=64,
+                    batch_size=32,
                 ),
             ),
             model=RGBDDiffusionIFConfig(),

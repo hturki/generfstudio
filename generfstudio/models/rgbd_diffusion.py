@@ -245,6 +245,22 @@ class RGBDDiffusion(RGBDDiffusionBase):
 
         depth_scaling_factor = self.get_depth_scaling_factor(depth.view(cameras.shape[0], -1))
 
+        if self.training:
+            valid_alignment = torch.logical_and(valid_alignment,
+                                                depth_scaling_factor.view(cameras.shape[0], -1).max(dim=-1)[0] > 0)
+
+            if valid_alignment.any():
+                cameras = cameras[valid_alignment]
+                images = images[valid_alignment]
+                pts3d = pts3d[valid_alignment]
+                depth = depth[valid_alignment]
+                clip_rgbs = clip_rgbs[valid_alignment]
+                fg_masks = fg_masks[valid_alignment]
+                depth_scaling_factor = depth_scaling_factor[valid_alignment]
+
+                if bg_colors is not None:
+                    bg_colors = bg_colors[valid_alignment]
+
         with torch.inference_mode():
             # Get CLIP embeddings for cross attention
             c_crossattn = self.image_encoder(
